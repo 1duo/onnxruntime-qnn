@@ -424,7 +424,7 @@ def generate_build_tree(
                 add_default_definition(
                     cmake_extra_defines,
                     "CMAKE_MSVC_DEBUG_INFORMATION_FORMAT",
-                    "$<$<CONFIG:Debug,RelWithDebInfo>:Embedded>",
+                    "$<$<CONFIG:Debug,Release,RelWithDebInfo>:Embedded>",
                 )
             else:
                 # Always enable debug info even in release build. The debug information is in separated *.pdb files that
@@ -1109,6 +1109,17 @@ def main():
                 args.archive_name_suffix,
                 args.version_suffix,
                 use_ninja=(args.cmake_generator == "Ninja"),
+                target_arch=(
+                    "arm64ec"
+                    if getattr(args, "arm64ec", False)
+                    else "arm64"
+                    if getattr(args, "arm64", False)
+                    else "arm"
+                    if getattr(args, "arm", False)
+                    else "x86"
+                    if getattr(args, "x86", False)
+                    else None
+                ),
             )
 
     if args.gen_doc:

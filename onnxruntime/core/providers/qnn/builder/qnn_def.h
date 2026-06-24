@@ -95,9 +95,13 @@ typedef struct PerThreadHtpPowerConfigs {
 
 enum class ContextPriority : uint8_t {
   LOW = 0,
+  NORMAL_LOW,
   NORMAL,
   NORMAL_HIGH,
   HIGH,
+  HIGH_PLUS,
+  CRITICAL,
+  CRITICAL_PLUS,
   UNDEFINED
 };
 

@@ -401,6 +401,7 @@ ort.unregister_execution_provider_library(ep_registration_name)
 |ai.onnx:GroupNormalization||
 |ai.onnx:HardSigmoid||
 |ai.onnx:HardSwish||
+|ai.onnx:If|Single output per branch with identical shape+dtype; cond must be scalar bool; both branches are always executed (lowered to Where/Select)|
 |ai.onnx:Identity||
 |ai.onnx:InstanceNormalization||
 |ai.onnx:Inverse||

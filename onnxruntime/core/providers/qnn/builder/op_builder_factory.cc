@@ -32,6 +32,7 @@ OpBuilderRegistrations::OpBuilderRegistrations() {
   CreateGroupQueryAttentionOpBuilder("GroupQueryAttention", *this);
   CreateGRUOpBuilder("GRU", *this);
   CreateIdentityOpBuilder("Identity", *this);
+  CreateIfOpBuilder("If", *this);
   CreateInstanceNormalizationOpBuilder("InstanceNormalization", *this);
   CreateInverseOpBuilder("Inverse", *this);
   CreateIsInfOpBuilder("IsInf", *this);

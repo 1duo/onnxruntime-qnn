@@ -246,16 +246,16 @@ Ort::Status MatMulOpBuilder::ProcessInputs(QnnModelWrapper& qnn_model_wrapper, c
                                            bool do_op_validation) const {
   const auto& inputs = node_unit.Inputs();
 
-  // Block-quantized weight: translate to a QNN MatMul with a BW_FLOAT_BLOCK weight.
-  if (IsBQWeight(qnn_model_wrapper, inputs[1])) {
-    return ProcessInputsForBQMatMul(qnn_model_wrapper, node_unit, logger, input_names, do_op_validation);
-  }
-
   TensorInfo input_info_0{};
   TensorInfo input_info_1{};
   bool use_fully_connected = false;
   RETURN_IF_ERROR(
       CheckInputs(qnn_model_wrapper, inputs[0], inputs[1], input_info_0, input_info_1, use_fully_connected));
+
+  // Block-quantized weight: translate to a QNN MatMul with a BW_FLOAT_BLOCK weight.
+  if (IsBQWeight(qnn_model_wrapper, inputs[1]) && !input_info_1.quant_param.IsLPBQ()) {
+    return ProcessInputsForBQMatMul(qnn_model_wrapper, node_unit, logger, input_names, do_op_validation);
+  }
 
   if (use_fully_connected) {
     return ProcessInputsForQnnFullyConnected(qnn_model_wrapper,

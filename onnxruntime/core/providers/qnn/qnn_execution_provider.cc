@@ -466,7 +466,8 @@ void QnnEp::ParsePerSocHtpConfigs() {
     qnn::HtpGraphConfigs_t config{vtcm_size_in_mb_per_soc[idx],
                                   htp_graph_configs_.htp_graph_finalization_opt_mode,
                                   htp_graph_configs_.enable_htp_fp16_precision,
-                                  htp_graph_configs_.enable_htp_monolithic_lstm};
+                                  htp_graph_configs_.enable_htp_monolithic_lstm,
+                                  htp_graph_configs_.enable_htp_fp16_clamp_overflow};
     htp_graph_configs_per_soc_.push_back(std::move(config));
   }
 
@@ -929,6 +930,25 @@ QnnEp::QnnEp(QnnEpFactory& factory,
                                                                   false,
                                                                   logger_);
   model_settings_.enable_htp_monolithic_lstm = htp_graph_configs_.enable_htp_monolithic_lstm;
+
+  // HTP fp16 clamp overflow. Default false. On HTP Arch v79+ (e.g. Glymur/v81),
+  // fp16 Conv accumulator overflow becomes NaN and propagates to the output
+  // (pre-v79 kept it finite). When true, saturate such overflow to the fp16 max
+  // value instead of NaN. Requires QAIRT SDK >= 2.49.
+  static constexpr const char* kEnableHtpFp16ClampOverflow = "enable_htp_fp16_clamp_overflow";
+  htp_graph_configs_.enable_htp_fp16_clamp_overflow = ParseBoolOption(ort_api,
+                                                                      session_options_,
+                                                                      FormatEPConfigKey(kEnableHtpFp16ClampOverflow),
+                                                                      false,
+                                                                      logger_);
+#ifndef QNN_HTP_FP16_CLAMP_OVERFLOW_AVAILABLE
+  // Warn once at parse time (not per graph) if the option was requested but the SDK lacks support.
+  if (htp_graph_configs_.enable_htp_fp16_clamp_overflow) {
+    ORT_CXX_LOG(logger_, ORT_LOGGING_LEVEL_WARNING,
+                "enable_htp_fp16_clamp_overflow was requested but the QNN HTP SDK in use does "
+                "not support it (requires QAIRT >= 2.49). Ignoring.");
+  }
+#endif
 
   // Try to parse multi-SoC HTP options first. If not multi-SoC htp_arch/soc_model is given, fallback to normal parsing.
   ParsePerSocHtpConfigs();
@@ -1737,6 +1757,18 @@ void QnnEp::InitQnnHtpGraphConfigs(
       gsl::not_null<QnnGraph_Config_t*> graph_config = configs_builder.PushConfig();
       graph_config->option = QNN_GRAPH_CONFIG_OPTION_CUSTOM;
       graph_config->customConfig = htp_graph_monolithic_lstm_config;
+    }
+
+    if (configs.enable_htp_fp16_clamp_overflow) {
+#ifdef QNN_HTP_FP16_CLAMP_OVERFLOW_AVAILABLE
+      gsl::not_null<QnnHtpGraph_CustomConfig_t*> htp_fp16_clamp_config = configs_builder.PushCustomConfig();
+      htp_fp16_clamp_config->option = QNN_HTP_GRAPH_CONFIG_OPTION_FP16_CLAMP_OVERFLOW;
+      htp_fp16_clamp_config->fp16ClampOverflow = true;
+
+      gsl::not_null<QnnGraph_Config_t*> graph_config = configs_builder.PushConfig();
+      graph_config->option = QNN_GRAPH_CONFIG_OPTION_CUSTOM;
+      graph_config->customConfig = htp_fp16_clamp_config;
+#endif
     }
   }
 }

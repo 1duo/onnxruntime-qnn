@@ -3020,6 +3020,16 @@ OrtStatus* ORT_API_CALL QnnEp::ShouldConvertDataLayoutForOpImpl(_In_ OrtEp* this
     *should_convert = 1;
   }
 
+  if (std::string(domain) == kOnnxDomain && std::string(op_type) == "QLinearConv") {
+    // QLinearConv's activation is a bare quantized integer graph input whose quant params live in
+    // the x_scale/x_zero_point op inputs, not as tensor metadata. If ORT's layout transformer were
+    // allowed to insert a Transpose on that activation, the Transpose would be a plain uint8/int8
+    // node with no quant params, which HTP rejects. So suppress ORT's layout transform here; the
+    // QLinearConv builder performs the NCHW<->NHWC transposition internally with quant params
+    // attached to every tensor (same strategy as DQConvIntegerFusion for ConvInteger).
+    *should_convert = 0;
+  }
+
   if (std::string(domain) == kOnnxDomain && std::string(op_type) == "ConvInteger") {
     // DQConvIntegerFusion handles NCHW->NHWC transposition internally via QNN Transpose ops.
     // Suppress ORT's layout transformer so it does not rewrite ConvInteger to kMSInternalNHWCDomain,

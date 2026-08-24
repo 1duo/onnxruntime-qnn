@@ -303,7 +303,7 @@ void QnnBackendManager::SetQnnBackendType(uint32_t backend_id) {
 }
 
 Ort::Status QnnBackendManager::LoadBackend() {
-  if (backend_lib_handle_) {
+  if (backend_lib_loaded_) {
     // Backend already loaded
     return Ort::Status();
   }
@@ -358,6 +358,7 @@ Ort::Status QnnBackendManager::LoadBackend() {
       << " backend id: " << backend_id_;
   ORT_CXX_LOG_PTR(logger_ptr_, ORT_LOGGING_LEVEL_INFO, oss.str().c_str());
 
+  backend_lib_loaded_ = true;
   return Ort::Status();
 }
 
@@ -2499,6 +2500,7 @@ void QnnBackendManager::ReleaseResources() {
     validator_backend_lib_handle_ = nullptr;
   }
 
+  backend_lib_loaded_ = false;
   backend_partial_setup_completed_ = false;
   backend_setup_completed_ = false;
 }

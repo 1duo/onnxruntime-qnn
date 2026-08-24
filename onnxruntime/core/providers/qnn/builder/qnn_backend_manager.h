@@ -425,6 +425,9 @@ class QnnBackendManager : public std::enable_shared_from_this<QnnBackendManager>
     logger_ptr_ = &logger;
   }
 
+  // Release the current QNN context handles (frees HW resources).
+  // Idempotent — safe to call even if no context is active.
+  Ort::Status ReleaseContext();
   bool IsDx12SharedMemoryAllocatorSupported();
 
   power::HtpPowerConfigManager& GetHtpPowerConfigManager() {
@@ -509,8 +512,6 @@ class QnnBackendManager : public std::enable_shared_from_this<QnnBackendManager>
                                                      std::unordered_map<std::string,
                                                                         std::unique_ptr<std::vector<std::string>>>& context_bin_map);
 #endif
-
-  Ort::Status ReleaseContext();
 
   // Shared implementation for InitializeQnnLog / InitializeQnnValidatorLog.
   Ort::Status InitializeQnnLogCommon(const QNN_INTERFACE_VER_TYPE& interface,

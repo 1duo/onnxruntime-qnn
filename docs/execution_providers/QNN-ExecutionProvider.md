@@ -333,6 +333,31 @@ For more information, see the [Parallel Graph Preparation](#parallel-graph-prepa
 |'0'|Default. Disabled.|
 |'1'|Compile the model and save the QNN context binary, but skip inference. `OnRunStart`, `OnRunEnd`, `CreateState`, and `SetDynamicOptions` are all no-ops. Useful for a compile-once/run-later workflow. Requires `ep.context_enable=1`; silently disabled with a warning if context cache is not enabled.|
 
+|`"enable_htp_prepare_and_load"`|Description|
+|---|---|
+|'0'|Default. Disabled.|
+|'1'|Compile the model and reload the context binary in the same session, enabling multi-PD inference without requiring a second session.|
+
+The `enable_htp_prepare_and_load` option performs AOT compilation and context loading within a single ORT session. This allows large models to bypass the single process-domain (PD) memory limit imposed by the JIT flow without requiring two separate sessions.
+
+**Behavior matrix:**
+
+|`ep.context_enable`|`enable_htp_prepare_and_load`|Behavior|
+|---|---|---|
+|0|0|Existing JIT flow (unchanged)|
+|1|0|Existing AOT flow (unchanged)|
+|0|1|**Path A:** Compile → reload from memory → infer. No artifact persisted.|
+|1|1|**Path B:** Compile → write `_ctx.onnx` + `.bin` to disk → reload → infer. Artifact persists for future reuse.|
+
+**Path A Provider Option:** `-C "ep.qnnexecutionprovider.enable_htp_prepare_and_load|1"`
+
+**Path B Provider Option:** `-C "ep.context_enable|1 ep.context_file_path|model_ctx.onnx ep.qnnexecutionprovider.enable_htp_prepare_and_load|1"`
+
+**Constraints:**
+- Mutually exclusive with `enable_htp_prepare_only`. Setting both to `'1'` raises an error.
+- Setting `enable_htp_prepare_and_load=1` with `ep.context_enable=0` AND an explicit `ep.context_file_path` raises an error (contradictory: "don't persist" + "here's where to persist").
+- If the input model is already a pre-compiled context model (`_ctx.onnx`), `enable_htp_prepare_and_load` is silently ignored with a warning — the model loads directly via the existing AOT path.
+
 |`"enable_htp_graph_splitting"`|Description|
 |---|---|
 |'0'|Default. Disabled.|

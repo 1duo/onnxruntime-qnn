@@ -3,12 +3,14 @@
 
 #include <algorithm>
 #include <cassert>
+#include <cstring>
 #include <optional>
 #include <string>
 #include <vector>
 
 #include "core/providers/qnn/builder/op_builder_factory.h"
 #include "core/providers/qnn/builder/opbuilder/base_op_builder.h"
+#include "core/providers/qnn/builder/opbuilder/qdq_constant_folding.h"
 #include "core/providers/qnn/builder/qnn_model_wrapper.h"
 #include "core/providers/qnn/builder/qnn_utils.h"
 
@@ -33,6 +35,65 @@ std::optional<std::vector<uint32_t>> TrySqueezeLeadingOnesTo(const std::vector<u
     return std::nullopt;
   }
   return std::vector<uint32_t>(shape.begin() + num_leading_dims, shape.end());
+}
+
+// HTP RmsNorm rejects SFIXED_POINT_16 gamma tensors with a nonzero offset, while accepting the
+// equivalent UFIXED_POINT_16 encoding. For a signed code q_s, convert to q_u = q_s + 32768 and
+// offset_u = offset_s - 32768 so that (q_s + offset_s) * scale is unchanged.
+Ort::Status AddUnsignedInt16ScaleForRmsNorm(QnnModelWrapper& qnn_model_wrapper,
+                                            const TensorInfo& scale_info,
+                                            const std::string& scale_name,
+                                            const std::vector<uint32_t>& target_shape,
+                                            bool& converted,
+                                            std::string& converted_scale_name) {
+  converted = false;
+  converted_scale_name = scale_name;
+
+  if (scale_info.qnn_data_type != QNN_DATATYPE_SFIXED_POINT_16 ||
+      !scale_info.quant_param.IsPerTensor()) {
+    return Ort::Status();
+  }
+
+  float quant_scale = 0.0f;
+  int32_t quant_offset = 0;
+  RETURN_IF_ERROR(scale_info.quant_param.GetPerTensorScaleOffset(quant_scale, quant_offset));
+  if (quant_offset == 0) {
+    return Ort::Status();
+  }
+
+  // The re-encoding changes static bytes only. A dynamic gamma needs a QNN conversion op that
+  // preserves its quantization semantics, which QNN does not provide for this case.
+  RETURN_IF_NOT(qnn_model_wrapper.IsEffectivelyConstantInput(scale_name),
+                "QNN RMSNorm requires a static SFIXED_POINT_16 scale when its offset is nonzero");
+  RETURN_IF(quant_offset < -32767 || quant_offset > 32768,
+            "QNN RMSNorm scale offset is outside the valid INT16 range");
+
+  std::vector<uint8_t> signed_bytes;
+  RETURN_IF_ERROR(GetEffectivelyConstantTensorBytes(qnn_model_wrapper, scale_name, signed_bytes));
+  RETURN_IF(signed_bytes.size() % sizeof(int16_t) != 0,
+            "QNN RMSNorm INT16 scale data has an invalid byte size");
+
+  std::vector<uint8_t> unsigned_bytes(signed_bytes.size());
+  for (size_t i = 0; i < signed_bytes.size(); i += sizeof(int16_t)) {
+    int16_t signed_value = 0;
+    std::memcpy(&signed_value, signed_bytes.data() + i, sizeof(signed_value));
+
+    const uint16_t unsigned_value = static_cast<uint16_t>(static_cast<int32_t>(signed_value) + 32768);
+    std::memcpy(unsigned_bytes.data() + i, &unsigned_value, sizeof(unsigned_value));
+  }
+
+  converted_scale_name = utils::UniqueNameGenerator().New(scale_name, "_u16");
+  QnnTensorWrapper unsigned_scale(converted_scale_name,
+                                  QNN_TENSOR_TYPE_STATIC,
+                                  QNN_DATATYPE_UFIXED_POINT_16,
+                                  QnnQuantParamsWrapper::PerTensor(quant_scale, quant_offset - 32768),
+                                  std::vector<uint32_t>(target_shape),
+                                  std::move(unsigned_bytes));
+  RETURN_IF_NOT(qnn_model_wrapper.AddTensorWrapper(std::move(unsigned_scale)),
+                "Failed to add converted RMSNorm scale tensor.");
+
+  converted = true;
+  return Ort::Status();
 }
 
 }  // namespace
@@ -144,11 +205,24 @@ Ort::Status RMSNormalizationOpBuilder::ProcessInputs(QnnModelWrapper& qnn_model_
                 "QNN RMSNorm requires the scale rank to equal the number of normalized axes; this scale has "
                 "non-1 leading dimensions and cannot be squeezed to match.");
 
-  if (squeezed_shape->size() == scale_info.shape.size()) {
+  const std::string& scale_name = inputs[SCALE_IDX].name;
+  bool scale_was_converted = false;
+  std::string qnn_scale_name;
+  if (IsNpuBackend(qnn_model_wrapper.GetQnnBackendType())) {
+    RETURN_IF_ERROR(AddUnsignedInt16ScaleForRmsNorm(qnn_model_wrapper,
+                                                    scale_info,
+                                                    scale_name,
+                                                    *squeezed_shape,
+                                                    scale_was_converted,
+                                                    qnn_scale_name));
+  }
+
+  if (scale_was_converted) {
+    input_names.push_back(qnn_scale_name);
+    scale_info.shape = *squeezed_shape;
+  } else if (squeezed_shape->size() == scale_info.shape.size()) {
     RETURN_IF_ERROR(ProcessInput(qnn_model_wrapper, inputs[SCALE_IDX], logger, input_names));
   } else {
-    const std::string& scale_name = inputs[SCALE_IDX].name;
-
     // Any axis-bearing or per-block encoding describes the pre-squeeze rank, and there is no helper to
     // remap one for a rank reduction. Such a gamma has no known producer, so reject it rather than
     // silently emitting a misaligned encoding.

@@ -1984,7 +1984,7 @@ Ort::Status QnnBackendManager::SetupBackend(
     bool enable_htp_graph_splitting) {
   std::lock_guard<std::recursive_mutex> lock(logger_recursive_mutex_);
   if (backend_setup_completed_) {
-    ORT_CXX_LOG_PTR(logger_ptr_, ORT_LOGGING_LEVEL_VERBOSE, "Backend setup already!");
+    ORT_CXX_LOG_PTR(logger_ptr_, ORT_LOGGING_LEVEL_INFO, "Backend setup already!");
 
     // Shared manager: file_mapped_weights_enabled_ was latched by an earlier session and
     // wouldn't otherwise see this session's read callback.

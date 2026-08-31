@@ -500,11 +500,13 @@ bool QnnModelWrapper::CreateQnnNode(const std::string& qnn_node_name,
                                          std::move(output_tensors),
                                          std::move(params));
 
-    using namespace onnxruntime::qnn::utils;
+    if (logger_.GetLoggingSeverityLevel() == ORT_LOGGING_LEVEL_VERBOSE) {
+      using namespace onnxruntime::qnn::utils;
 
-    std::ostringstream oss;
-    oss << op_config_wrapper;
-    ORT_CXX_LOG(logger_, ORT_LOGGING_LEVEL_VERBOSE, oss.str().c_str());
+      std::ostringstream oss;
+      oss << op_config_wrapper;
+      ORT_CXX_LOG(logger_, ORT_LOGGING_LEVEL_VERBOSE, oss.str().c_str());
+    }
 
     std::string error_msg;
     Ort::Status validation_status = ValidateQnnNode(op_config_wrapper, error_msg);
@@ -710,11 +712,13 @@ bool QnnModelWrapper::ComposeQnnGraph(bool build_json_qnn_graph) {
                                          std::move(output_tensors),
                                          std::move(params));
 
-    using namespace onnxruntime::qnn::utils;
+    if (logger_.GetLoggingSeverityLevel() == ORT_LOGGING_LEVEL_VERBOSE) {
+      using namespace onnxruntime::qnn::utils;
 
-    std::ostringstream oss;
-    oss << op_config_wrapper;
-    ORT_CXX_LOG(logger_, ORT_LOGGING_LEVEL_VERBOSE, oss.str().c_str());
+      std::ostringstream oss;
+      oss << op_config_wrapper;
+      ORT_CXX_LOG(logger_, ORT_LOGGING_LEVEL_VERBOSE, oss.str().c_str());
+    }
 
     std::string error_msg;
     bool rt = op_config_wrapper.CreateQnnGraphOp(qnn_interface_, graph_, error_msg);

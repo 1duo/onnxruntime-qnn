@@ -1583,6 +1583,12 @@ const char* ORT_API_CALL QnnEp::GetNameImpl(const OrtEp* this_ptr) noexcept {
 static void LogNodeSupport(const Ort::Logger& logger,
                            const qnn::IQnnNodeGroup& qnn_node_group,
                            const Ort::Status& support_status) {
+  const OrtLoggingLevel log_level = support_status.IsOK() ? ORT_LOGGING_LEVEL_VERBOSE
+                                                          : ORT_LOGGING_LEVEL_INFO;
+  if (logger.GetLoggingSeverityLevel() > log_level) {
+    return;
+  }
+
   size_t num_nodes = 0;
   std::ostringstream oss;
   for (const OrtNodeUnit* node_unit : qnn_node_group.GetNodeUnits()) {
@@ -1607,7 +1613,7 @@ static void LogNodeSupport(const Ort::Logger& logger,
                     " nodes in " + std::string(qnn_node_group.Type()) +
                     " (" + qnn_node_group.GetTargetNodeUnit()->OpType() + ") :\n" +
                     oss.str();
-  ORT_CXX_LOG(logger, ORT_LOGGING_LEVEL_VERBOSE, msg.c_str());
+  ORT_CXX_LOG(logger, log_level, msg.c_str());
 }
 
 OrtStatus* QnnEp::GetSupportedNodes(const OrtGraph* graph,

@@ -1079,6 +1079,26 @@ Ort::Status ProcessBiasForQuantizedOp(QnnModelWrapper& qnn_model_wrapper,
                                       const QnnQuantParamsWrapper& weight_quant_param,
                                       std::vector<std::string>& input_names,
                                       bool& was_handled);
+// Strictly parses an integer without throwing or modifying `out` on failure.
+// std::from_chars rejects leading whitespace and reports overflow for the target type.
+template <typename T>
+bool TryParseInteger(std::string_view value, T& out) {
+  // All current option values are non-negative, so reject explicit signs consistently for signed and unsigned T.
+  if (value.empty() || value.front() == '+' || value.front() == '-') {
+    return false;
+  }
+
+  T parsed{};
+  const char* begin = value.data();
+  const char* end = begin + value.size();
+  auto [ptr, ec] = std::from_chars(begin, end, parsed);
+  if (ec != std::errc{} || ptr != end) {
+    return false;
+  }
+
+  out = parsed;
+  return true;
+}
 
 }  // namespace utils
 }  // namespace qnn

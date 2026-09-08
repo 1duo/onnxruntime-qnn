@@ -185,6 +185,11 @@ class EpStubContext : public OrtApiStubContext {
       return nullptr;
     };
 
+    // Default backend selection uses the NPU device supplied by MakeEp.
+    stub_ort_api.HardwareDevice_Type = [](const OrtHardwareDevice*) noexcept {
+      return OrtHardwareDeviceType_NPU;
+    };
+
     // Memory info (needed by QnnEpFactory ctor).
     stub_ort_api.CreateMemoryInfo_V2 =
         [](const char*, OrtMemoryInfoDeviceType, uint32_t, int32_t,
@@ -262,8 +267,9 @@ static std::unique_ptr<QnnEp> MakeEp(QnnEpFactory& factory, EpStubContext& ctx) 
   UseGlobalEpStubs use(ctx);
   auto* fake_session_opts = reinterpret_cast<OrtSessionOptions*>(kFakeToken);
   auto* fake_logger = reinterpret_cast<OrtLogger*>(kFakeToken);
+  const std::vector<const OrtHardwareDevice*> devices{reinterpret_cast<const OrtHardwareDevice*>(kFakeToken)};
   return std::make_unique<QnnEp>(factory, "QNNExecutionProvider",
-                                 *fake_session_opts, fake_logger);
+                                 *fake_session_opts, devices, fake_logger);
 }
 
 // Asserts that ctx.log_records contains at least one entry at the given

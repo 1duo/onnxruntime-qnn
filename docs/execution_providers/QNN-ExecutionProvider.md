@@ -184,11 +184,11 @@ Alternatively to setting profiling_level at compile time, profiling can be enabl
 
 |`"soc_model"`|Description|
 |---|---|
-|Model number (string)|The SoC model to target. Accepts a **numeric model ID** (e.g. `"69"`) or a **chip-family name string** (e.g. `"SM8750"`, case-insensitive) for a subset of well-known chips — note this list is not exhaustive and chips not recognised by name must use the numeric ID. Refer to the [QAIRT SDK documentation](https://docs.qualcomm.com/doc/80-63442-10/topic/QNN_general_overview.html#supported-snapdragon-devices) for valid numeric values. Defaults to `"0"` (unknown). Accepts a comma-separated list (e.g. `"43,69"`) to enable [Flexible Context Binary (FCB) / multi-SoC](#flexible-context-binary-fcb--multi-soc-ep-context) compilation, where one EPContext model is produced that targets every listed SoC.|
+|Model number (string)|The SoC model to target. This is the preferred identifier than htp_arch. Accepts a **numeric model ID** (e.g. `"69"`) or a **chip-family name string** (e.g. `"SM8750"`, case-insensitive) for a subset of well-known chips — note this list is not exhaustive and chips not recognised by name must use the numeric ID. Refer to the [QAIRT SDK documentation](https://docs.qualcomm.com/doc/80-63442-10/topic/QNN_general_overview.html#supported-snapdragon-devices) for valid numeric values. Defaults to `"0"` (unknown). If both `soc_model` and `htp_arch` are given but do not matched, `soc_model` takes priority. Accepts a comma-separated list (e.g. `"60,88"`) to enable [Flexible Context Binary (FCB) / multi-SoC](#flexible-context-binary-fcb--multi-soc-ep-context) compilation, where one EPContext model is produced that targets every listed SoC.|
 
 |`"htp_arch"`|Description|
 |---|---|
-|'0'|Default. No architecture specified.|
+|'0'|Default. No architecture specified. It is optional if `soc_model` already specified. Nevertheless, providing it along with `soc_model` during offline preparation can enable more accurate context binary compatibility check later at inference time. |
 |'68'|HTP v68.|
 |'69'|HTP v69.|
 |'73'|HTP v73.|

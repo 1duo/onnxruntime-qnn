@@ -4,13 +4,11 @@
 #include "core/providers/qnn/builder/qnn_node_group/reshape_transpose_rank5_to_rank4.h"
 
 #include <gsl/gsl>
-#include <cassert>
-#include <optional>
-#include <stdexcept>
-#include <utility>
-#include <string>
 #include <array>
 #include <memory>
+#include <optional>
+#include <stdexcept>
+#include <string>
 #include <unordered_map>
 #include <vector>
 
@@ -21,6 +19,7 @@
 #include "core/providers/qnn/builder/qnn_model_wrapper.h"
 #include "core/providers/qnn/builder/opbuilder/base_op_builder.h"
 #include "core/providers/qnn/common/inlined_containers.h"
+#include "core/providers/qnn/common/qnn_safeint.h"
 
 namespace onnxruntime {
 namespace qnn {
@@ -69,6 +68,22 @@ std::optional<size_t> FindAdjacentMergeIndex(const std::vector<int64_t>& perm_ra
   return std::nullopt;
 }
 
+// A valid rank-5 perm is a permutation of [0,5). ORT validation should reject anything else,
+// but check explicitly so a malformed perm can never produce an out-of-range merge index.
+bool IsValidRank5Perm(const std::vector<int64_t>& perm) {
+  if (perm.size() != kRank5) {
+    return false;
+  }
+  bool seen[kRank5] = {};
+  for (int64_t v : perm) {
+    if (v < 0 || v >= static_cast<int64_t>(kRank5) || seen[static_cast<size_t>(v)]) {
+      return false;
+    }
+    seen[static_cast<size_t>(v)] = true;
+  }
+  return true;
+}
+
 std::optional<size_t> ValidatePatternConditions(
     const OrtNodeUnit* reshape1,
     const OrtNodeUnit* transpose,
@@ -76,6 +91,12 @@ std::optional<size_t> ValidatePatternConditions(
     const QnnModelWrapper& qnn_model_wrapper,
     [[maybe_unused]] const Ort::Logger& logger) {
   const OrtApi& ort_api = qnn_model_wrapper.GetOrtApi();
+
+  if (reshape1->Inputs().size() < 2 || reshape2->Inputs().size() < 2 ||
+      transpose->Inputs().empty() ||
+      reshape1->Outputs().empty() || transpose->Outputs().empty() || reshape2->Outputs().empty()) {
+    return std::nullopt;
+  }
 
   // Check if reshape shape inputs are constants
   const OrtNodeUnitIODef& reshape1_input_1 = reshape1->Inputs()[1];
@@ -110,6 +131,11 @@ std::optional<size_t> ValidatePatternConditions(
   std::vector<const OrtValueInfo*> reshape2_outputs(num_reshape2_outputs);
   RETURN_DEFAULT_IF_API_FAIL(ort_api.Node_GetOutputs(&reshape2->GetNode(), reshape2_outputs.data(), reshape2_outputs.size()), ort_api, std::nullopt);
 
+  if (reshape1_inputs.empty() || reshape1_outputs.empty() ||
+      transpose_outputs.empty() || reshape2_outputs.empty()) {
+    return std::nullopt;
+  }
+
   auto t0_shape = GetTensorShape(ort_api, reshape1_inputs[0]);
   auto t1_shape = GetTensorShape(ort_api, reshape1_outputs[0]);
   auto t2_shape = GetTensorShape(ort_api, transpose_outputs[0]);
@@ -125,10 +151,10 @@ std::optional<size_t> ValidatePatternConditions(
     return std::nullopt;
   }
 
-  // Condition 2: Transpose perm must be rank-5.
+  // Condition 2: Transpose perm must be a valid rank-5 permutation.
   OrtNodeAttrHelper transpose_helper(*transpose);
   std::vector<int64_t> perm = transpose_helper.Get(kAttrTransposePerm, std::vector<int64_t>{});
-  if (perm.size() != kRank5) {
+  if (!IsValidRank5Perm(perm)) {
     return std::nullopt;
   }
 
@@ -139,7 +165,15 @@ std::optional<size_t> ValidatePatternConditions(
     return std::nullopt;
   }
 
-  // Condition 4: Reject per-axis / per-channel / blockwise QDQ on any rebuilt tensor.
+  // Condition 4: Rebuilt intermediates must stay internal. GetChildNodeUnitAllowQdq already rejects
+  // graph-output intermediates, but guard explicitly so a future helper change cannot silently
+  // rewrite a 5D graph output as 4D.
+  if (qnn_model_wrapper.IsGraphOutput(reshape1->Outputs()[0].name) ||
+      qnn_model_wrapper.IsGraphOutput(transpose->Outputs()[0].name)) {
+    return std::nullopt;
+  }
+
+  // Condition 5: Reject per-axis / per-channel / blockwise QDQ on any rebuilt tensor.
   // Rank collapse would require remapping (or invalidating) the quantization axis: if the axis
   // sits after the merged dims it must shift down, and if it is one of the merged dims the
   // per-channel encoding may be unrepresentable on the rank-4 tensor. Per-tensor (and unquantized)
@@ -170,15 +204,30 @@ Ort::Status CreateOrValidateOnQnn(
     size_t merge_perm_index,
     bool validate,
     const Ort::Logger& logger) {
+  if (node_units.size() != 3 || node_units[0] == nullptr ||
+      node_units[1] == nullptr || node_units[2] == nullptr) {
+    return Ort::Status("Invalid Rank5ToRank4 pattern", OrtErrorCode::ORT_FAIL);
+  }
   const OrtNodeUnit* reshape1 = node_units[0];
   const OrtNodeUnit* transpose = node_units[1];
   const OrtNodeUnit* reshape2 = node_units[2];
+
+  if (reshape1->Inputs().empty() || reshape1->Outputs().empty() ||
+      transpose->Outputs().empty() || reshape2->Outputs().empty()) {
+    return Ort::Status("Invalid Rank5ToRank4 pattern", OrtErrorCode::ORT_FAIL);
+  }
 
   // Get input and output definitions
   const OrtNodeUnitIODef& reshape1_input = reshape1->Inputs()[0];
   const OrtNodeUnitIODef& reshape1_output = reshape1->Outputs()[0];
   const OrtNodeUnitIODef& transpose_output = transpose->Outputs()[0];
   const OrtNodeUnitIODef& reshape2_output = reshape2->Outputs()[0];
+
+  // Intermediates must stay internal: rewriting a 5D graph output as 4D corrupts the contract.
+  if (qnn_model_wrapper.IsGraphOutput(reshape1_output.name) ||
+      qnn_model_wrapper.IsGraphOutput(transpose_output.name)) {
+    return Ort::Status("Rank5ToRank4 intermediates must not be graph outputs", OrtErrorCode::ORT_FAIL);
+  }
 
   // Get original rank-5 shapes
   std::vector<uint32_t> t1_rank5_dims;
@@ -189,10 +238,14 @@ Ort::Status CreateOrValidateOnQnn(
   RETURN_IF_NOT(qnn_model_wrapper.GetOnnxShape(transpose_output.shape, t2_rank5_dims),
                 ("Cannot get shape for " + transpose_output.name).c_str());
 
+  if (t1_rank5_dims.size() != kRank5 || t2_rank5_dims.size() != kRank5) {
+    return Ort::Status("Expected rank-5 intermediate shapes", OrtErrorCode::ORT_FAIL);
+  }
+
   // Get the rank-5 perm.
   OrtNodeAttrHelper transpose_helper(*transpose);
   std::vector<int64_t> perm_rank5 = transpose_helper.Get(kAttrTransposePerm, std::vector<int64_t>{});
-  if (perm_rank5.size() != kRank5 || merge_perm_index + 1 >= perm_rank5.size()) {
+  if (!IsValidRank5Perm(perm_rank5) || merge_perm_index + 1 >= kRank5) {
     return Ort::Status("Invalid rank-5 perm or merge index", OrtErrorCode::ORT_FAIL);
   }
 
@@ -200,9 +253,10 @@ Ort::Status CreateOrValidateOnQnn(
   // (which are consecutive input indices because perm[p+1] == perm[p] + 1).
   const int64_t merge_input_idx_a = perm_rank5[merge_perm_index];
   const int64_t merge_input_idx_b = perm_rank5[merge_perm_index + 1];
-  // Invariant guaranteed by FindAdjacentMergeIndex (called in ValidatePatternConditions):
-  // it returns merge_perm_index only when perm[merge_perm_index + 1] == perm[merge_perm_index] + 1.
-  assert(merge_input_idx_b == merge_input_idx_a + 1);
+  if (merge_input_idx_b != merge_input_idx_a + 1 ||
+      merge_input_idx_a < 0 || merge_input_idx_b >= static_cast<int64_t>(kRank5)) {
+    return Ort::Status("Invalid rank-5 merge indices", OrtErrorCode::ORT_FAIL);
+  }
 
   // Build the rank-4 t1 shape by merging t1_rank5[merge_input_idx_a] and t1_rank5[merge_input_idx_b].
   std::vector<uint32_t> t1_rank4_dims;
@@ -244,7 +298,13 @@ Ort::Status CreateOrValidateOnQnn(
   // Build the rank-4 t2 shape by applying perm_rank4 to t1_rank4_dims.
   std::vector<uint32_t> t2_rank4_dims;
   t2_rank4_dims.reserve(kRank4);
+  if (t1_rank4_dims.size() != kRank4 || perm_rank4.size() != kRank4) {
+    return Ort::Status("Invalid rank-4 fusion shapes", OrtErrorCode::ORT_FAIL);
+  }
   for (uint32_t p : perm_rank4) {
+    if (p >= t1_rank4_dims.size()) {
+      return Ort::Status("Invalid rank-4 perm", OrtErrorCode::ORT_FAIL);
+    }
     t2_rank4_dims.push_back(t1_rank4_dims[p]);
   }
 

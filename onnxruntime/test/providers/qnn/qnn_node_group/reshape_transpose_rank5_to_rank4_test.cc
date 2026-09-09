@@ -87,6 +87,9 @@ TEST_F(QnnHTPBackendTests, Rank5ToRank4Fusion_Float_DocstringExample) {
   // one after the Transpose). The fusion does not change op counts in the QNN graph, only ranks.
   AssertOpInQnnGraph(json_qnn_graph_dir, "Transpose", 1);
   AssertOpInQnnGraph(json_qnn_graph_dir, "Reshape", 2);
+  // Merged dims 3,4 (4*8=32): t1 [3,4,3,4,8] -> [3,4,3,32], perm [0,2,1,3,4] -> [0,2,1,3].
+  AssertTensorShapeInQnnGraph(json_qnn_graph_dir, "reshape1_out", {3, 4, 3, 32});
+  AssertTensorShapeInQnnGraph(json_qnn_graph_dir, "transpose_out", {3, 3, 4, 32});
 }
 
 // Positive: consecutive pair at the beginning of perm.
@@ -115,6 +118,9 @@ TEST_F(QnnHTPBackendTests, Rank5ToRank4Fusion_Float_MergeAtStart) {
 
   AssertOpInQnnGraph(json_qnn_graph_dir, "Transpose", 1);
   AssertOpInQnnGraph(json_qnn_graph_dir, "Reshape", 2);
+  // Merged dims 2,3 (4*5=20): t1 [2,3,4,5,6] -> [2,3,20,6], perm [2,3,0,1,4] -> [2,0,1,3].
+  AssertTensorShapeInQnnGraph(json_qnn_graph_dir, "reshape1_out", {2, 3, 20, 6});
+  AssertTensorShapeInQnnGraph(json_qnn_graph_dir, "transpose_out", {20, 2, 3, 6});
 }
 
 // Positive: consecutive pair at perm position 0 with values that exercise the value-shift branch.
@@ -143,6 +149,40 @@ TEST_F(QnnHTPBackendTests, Rank5ToRank4Fusion_Float_MergeWithValueShift) {
 
   AssertOpInQnnGraph(json_qnn_graph_dir, "Transpose", 1);
   AssertOpInQnnGraph(json_qnn_graph_dir, "Reshape", 2);
+  // Same merge as above, but perm value 4 shifts to 3: perm [2,3,4,0,1] -> [2,3,0,1].
+  AssertTensorShapeInQnnGraph(json_qnn_graph_dir, "reshape1_out", {2, 3, 20, 6});
+  AssertTensorShapeInQnnGraph(json_qnn_graph_dir, "transpose_out", {20, 6, 2, 3});
+}
+
+// Negative: rank-5 intermediates but no adjacent consecutive pair in perm.
+// perm=[0,2,4,1,3] has no p with perm[p+1]==perm[p]+1, so no dims can merge.
+// The model still runs on QNN EP via the standalone op builders with 5D tensors intact.
+TEST_F(QnnHTPBackendTests, Rank5ToRank4Fusion_Float_NoAdjacentPair_NoFusion) {
+  SKIP_HTP_TEST_ON_ARCH_LESS_THAN_OR_EQUAL_TO(QNN_HTP_DEVICE_ARCH_V68);
+  const std::filesystem::path json_qnn_graph_dir = "Rank5ToRank4Fusion_Float_NoAdjacentPair_NoFusion";
+  std::filesystem::remove_all(json_qnn_graph_dir);
+  ASSERT_TRUE(std::filesystem::create_directory(json_qnn_graph_dir));
+  auto cleanup = gsl::finally([&json_qnn_graph_dir]() { std::filesystem::remove_all(json_qnn_graph_dir); });
+
+  ProviderOptions provider_options = GetProviderOptions();
+  provider_options["dump_json_qnn_graph"] = "1";
+  provider_options["json_qnn_graph_dir"] = json_qnn_graph_dir.string();
+
+  RunQnnModelTest(BuildRank5ToRank4FloatTestCase(
+                      /*input_shape=*/{6, 4, 5, 6},
+                      /*reshape1_shape=*/{2, 3, 4, 5, 6},
+                      /*perm=*/{0, 2, 4, 1, 3},
+                      /*reshape2_shape=*/{6, 4, 5, 6}),
+                  provider_options,
+                  /*opset_version=*/13,
+                  /*expected_ep_assignment=*/ExpectedEPNodeAssignment::All,
+                  /*fp32_abs_err=*/1e-2f);
+
+  // Fusion did not fire: intermediates stay rank-5.
+  AssertOpInQnnGraph(json_qnn_graph_dir, "Transpose", 1);
+  AssertOpInQnnGraph(json_qnn_graph_dir, "Reshape", 2);
+  AssertTensorShapeInQnnGraph(json_qnn_graph_dir, "reshape1_out", {2, 3, 4, 5, 6});
+  AssertTensorShapeInQnnGraph(json_qnn_graph_dir, "transpose_out", {2, 4, 6, 3, 5});
 }
 
 // Negative: rank-4 intermediate tensors. The fusion requires Rank(t1) == Rank(t2) == 5,

@@ -671,6 +671,7 @@ ort.unregister_execution_provider_library(ep_registration_name)
 |ai.onnx:Squeeze||
 |ai.onnx:Sub||
 |ai.onnx:Sum||
+|ai.onnx:Swish||
 |ai.onnx:Tan||
 |ai.onnx:Tanh||
 |ai.onnx:ThresholdedRelu||

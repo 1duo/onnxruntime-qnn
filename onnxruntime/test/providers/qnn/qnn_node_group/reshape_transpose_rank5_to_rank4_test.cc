@@ -58,10 +58,11 @@ ProviderOptions GetProviderOptions() {
 
 }  // namespace
 
-// Positive: docstring example pattern.
-// Input [1, 12, 12, 8] -> Reshape [3, 4, 3, 4, 8] -> Transpose perm=[0, 2, 1, 3, 4] -> Reshape.
-// perm has the consecutive pair (perm[3]=3, perm[4]=4) at positions 3,4, so input dims 3 and 4
-// (sizes 4 and 8) merge into a single dim of size 32, dropping the rank from 5 to 4.
+// Positive: MobileSAM encoder pattern (scaled down for test speed).
+// Exact perf pattern is [1,133,133,128] -> Reshape [19,7,19,7,128] -> Transpose [0,2,1,3,4].
+// This test mirrors it as [1,12,12,8] -> [3,4,3,4,8] with the same perm/merge (p=3, dims 3,4):
+// 12=3*4 plays 133=19*7, 8 plays 128. Fused shapes below match the same rewrite
+// ([19,7,19,896]/[19,19,7,896] in full scale).
 TEST_F(QnnHTPBackendTests, Rank5ToRank4Fusion_Float_DocstringExample) {
   SKIP_HTP_TEST_ON_ARCH_LESS_THAN_OR_EQUAL_TO(QNN_HTP_DEVICE_ARCH_V68);
   const std::filesystem::path json_qnn_graph_dir = "Rank5ToRank4Fusion_Float_DocstringExample";

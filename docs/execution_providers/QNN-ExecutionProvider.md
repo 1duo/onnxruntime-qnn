@@ -147,6 +147,10 @@ Alternatively to setting profiling_level at compile time, profiling can be enabl
 |'0'|Default. Disabled.|
 |'1'|Enable VTCM backup buffer sharing across sessions. Requires QNN API version >= 2.26. Conflicts with `ep.context_embed_mode`.|
 
+|`"htp_reused_io_limit_mb"`|Description|
+|---|---|
+|Size in MB (string)|Tells QNN HTP the maximum I/O your app actually keeps registered at any one time, instead of assuming every graph's I/O is live at once. Used for memory estimation and DSP PD placement when loading a context binary; a tighter value can avoid PD placement failures (QNN error 1002). See [Reused IO Limit](#reused-io-limit) below for how to choose a value (it differs between the per-context and group paths). Defaults to "0" (QNN estimates using the total I/O size of all graphs in the context). Requires QAIRT 2.45 or later (QNN API >= 2.34).|
+
 |`"htp_performance_mode"`|Description|
 |---|---|
 |'burst'|Burst performance mode.|
@@ -397,6 +401,43 @@ The `op_affinity` option points at a JSON config file that pins ONNX op types to
 - A value may be a string or a single-element array (`["HTP"]`). **Arrays of length > 1 are rejected** — heterogeneous execution (one op split across multiple backends) is not supported.
 - Pinning an op type to a backend other than the one the session is running on fails session creation, since heterogeneous execution is not supported — except a `"cpu"` pin, which is a legitimate way to opt an op out of QNN EP (falls back to the CPU EP without failing the session).
 - On the command line (e.g. `onnxruntime_perf_test`), pass it with the `key|value` form: `op_affinity|./affinity_config.json`. This applies to the legacy built-in QNN EP path (`-e qnn -i ...`); when registering QNN EP via the plugin-EP path (`--plugin_eps`/`--plugin_ep_options`), provider options are passed through generically and are not subject to the built-in QNN EP's key allowlist.
+
+#### Reused IO Limit
+
+`htp_reused_io_limit_mb` tells QNN HTP the maximum I/O your app actually keeps registered at any one time throughout the context lifecycle (init / execute / deinit). QNN HTP uses this value for memory estimation and DSP PD placement decisions when it loads a context binary.
+
+Turned off by default (`0`), the runtime assumes no I/O reuse and estimates the context's memory using the total I/O size of all **QNN graphs** in the context. If you actually share (reuse) one or more I/O buffers across multiple QNN graphs in a context, or across multiple contexts, that default estimate can overshoot what the context really needs.
+
+This overestimation matters because HTP loads each context into one of several process domains (PDs), each with a limited memory budget. An inflated estimate can cause a context to be placed in its own PD instead of sharing one with others (which is slower, since contexts on different PDs pay extra cost to talk to each other) — or it can cause the context to fail to load at all (QNN error 1002, "Failed to find available PD") even though it would actually fit. By explicitly specifying the reused I/O size, you let QNN HTP use a smaller, more accurate estimate instead.
+
+**Choosing a value**: the value represents the maximum I/O your app actually keeps registered at any one time across the lifecycle (init / execute / deinit). It depends entirely on how your app uses the I/O buffers:
+
+- If your app maps the I/O of only one QNN graph at a time and unmaps the rest (e.g. graph switching), the peak is `max(each QNN graph's I/O)`.
+- If your app keeps all QNN graphs' I/O mapped at once, the peak is `sum(each concurrently mapped QNN graph's I/O)`.
+
+To find each QNN graph's I/O size, enable VERBOSE session logging and look for the per-QNN-graph estimate the HTP backend emits at context load, for example:
+
+```
+... estimated PD size ~3491.61MB, including nonSharedWeight 1908408320 B I/O 1662533632 B runlist 59602944 B spillfill 22282240 B
+```
+
+When loading a context binary, QNN EP also emits the total number of QNN graphs in that context at VERBOSE level:
+
+```
+... Graph count from QNN context: 4
+```
+
+The per-QNN-graph estimates show the I/O sizes; the `I/O` field is that QNN graph's I/O size. Sum or take the max over the QNN graphs your app uses concurrently, per the rules above.
+
+**Per-context vs. group scope** — choose the value based on whether `htp_share_resource_optimization` is enabled:
+
+For example, consider 4 contexts, each containing 1 QNN graph with 100 MB I/O. If the app maps the I/O for only 1 QNN graph at a time across all 4 contexts, its actual peak is 100 MB.
+
+- **Default (`htp_share_resource_optimization` disabled):** QNN adds up the limits configured on independently loaded contexts. The app knows this context count from the context binaries / EP-context models it loads. Set `25` on each context in the example above so QNN totals 100 MB. Contexts with different I/O sizes or mapping lifetimes do not need equal values.
+
+- **`htp_share_resource_optimization=1`:** the value is a single group-level property shared by all contexts, so set it to the peak directly → `100` for the same example.
+
+**Warning**: this value is a *hint* for memory estimation, not an enforced limit. QNN does not stop you from using more I/O at runtime than you configured, but exceeding it may cause undefined behavior (e.g. a `memRegister` failure due to running out of space). Set it to a value your actual runtime I/O will not exceed. When using this option purely to work around a context load failure (rather than from a known buffer budget), the safe value is model-dependent and has not been validated across all models; a value verified safe for one model is not guaranteed safe for another. Verify empirically for your model before relying on a specific value in production.
 
 ### Flexible Context Binary (FCB) / multi-SoC EP context
 

@@ -1690,6 +1690,61 @@ TEST_F(QnnHTPBackendTests, QnnContextBinaryCacheNonEmbedModeTest) {
   ASSERT_EQ(std::remove(qnn_ctx_bin.c_str()), 0);
 }
 
+// htp_reused_io_limit_mb: a valid numeric value is accepted when preparing and loading an AOT context.
+TEST_F(QnnHTPBackendTests, QnnContextBinary_HtpReusedIoLimitMbValid_LoadsSucceeds) {
+#if QNN_API_VERSION_MAJOR < 2 || \
+    (QNN_API_VERSION_MAJOR == 2 && QNN_API_VERSION_MINOR < 34)
+  GTEST_SKIP() << "htp_reused_io_limit_mb requires QAIRT 2.45 or later (QNN API >= 2.34).";
+#elif defined(__linux__) && !defined(__aarch64__)
+  GTEST_SKIP() << "htp_reused_io_limit_mb is not supported by the x86_64 HTP emulator.";
+#endif
+  SKIP_HTP_TEST_ON_ARCH_LESS_THAN_OR_EQUAL_TO(QNN_HTP_DEVICE_ARCH_V68);
+  ProviderOptions provider_options;
+  provider_options["backend_type"] = "htp";
+  provider_options["offload_graph_io_quantization"] = "0";
+  provider_options["htp_reused_io_limit_mb"] = "128";
+
+  std::unordered_map<std::string, std::string> session_option_pairs;
+  session_option_pairs.emplace("ep.qnnexecutionprovider.enable_htp_prepare_and_load", "1");
+
+  const TestInputDef<float> input_def({1, 2, 3}, false, -10.0f, 10.0f);
+  const std::string op_type = "Atan";
+
+  // prepare_and_load creates and reloads the QNN context in this session.
+  TestQDQModelAccuracy(BuildOpTestCase<float>(op_type + "_node", op_type, {input_def}, {}, {}),
+                       BuildQDQOpTestCase<uint8_t>(op_type + "_node", op_type, {input_def}, {}, {}),
+                       provider_options,
+                       14,
+                       ExpectedEPNodeAssignment::All,
+                       QDQTolerance(),
+                       OrtLoggingLevel::ORT_LOGGING_LEVEL_ERROR,
+                       "",
+                       session_option_pairs);
+}
+
+// htp_reused_io_limit_mb: malformed values (negative / non-numeric / non-integer) are logged as
+// errors and ignored rather than failing session creation.
+TEST_F(QnnHTPBackendTests, QnnContextBinary_HtpReusedIoLimitMbMalformed_LoadsSucceeds) {
+#if defined(__linux__) && !defined(__aarch64__)
+  GTEST_SKIP() << "htp_reused_io_limit_mb is not supported by the x86_64 HTP emulator.";
+#else
+  SKIP_HTP_TEST_ON_ARCH_LESS_THAN_OR_EQUAL_TO(QNN_HTP_DEVICE_ARCH_V68);
+  for (const char* bad_value : {"-1", "1.1", "10abc"}) {
+    ProviderOptions provider_options;
+    provider_options["backend_type"] = "htp";
+    provider_options["offload_graph_io_quantization"] = "0";
+    provider_options["htp_reused_io_limit_mb"] = bad_value;
+
+    auto input_defs = {TestInputDef<float>({1, 3, 4, 4}, false, -10.0f, 10.0f),
+                       TestInputDef<float>({1, 3, 4, 4}, false, -10.0f, 10.0f)};
+    RunQnnModelTest(BuildOpTestCase<float>("Add_node", "Add", input_defs, {}, {}, kOnnxDomain),
+                    provider_options,
+                    13,
+                    EPVerificationParams{ExpectedEPNodeAssignment::All, ElementwiseAbsoluteVerifier(0.008f)});
+  }
+#endif
+}
+
 // Run QDQ model on HTP 2 times
 // 1st run will generate the Onnx skeleton file + Qnn context cache binary file
 // Then delete the context bin file to make the 2nd sesssion.Initialize() return the status with code INVALID_GRAPH
@@ -2386,18 +2441,14 @@ TEST_F(QnnHTPBackendTests, DISABLED_VTCMBackupBufferSharing) {
 #endif
 }
 
-TEST_F(QnnHTPBackendTests, FileMapping_Off) {
-#if (defined(__aarch64__) || defined(_M_ARM64)) && \
-    !(QNN_API_VERSION_MAJOR > 2 || (QNN_API_VERSION_MAJOR == 2 && QNN_API_VERSION_MINOR >= 34))
-  GTEST_SKIP() << "HTP weight sharing on ARM64 requires QNN API version >= 2.34.";
-#elif defined(__ANDROID__)
-  GTEST_SKIP() << "Weight sharing on Android devices is disabled";
-#else
-
+static void RunSharedContextWithFileMappingDisabledTest(const char* htp_reused_io_limit_mb = nullptr) {
   ProviderOptions provider_options;
   provider_options["backend_type"] = "htp";
   provider_options["offload_graph_io_quantization"] = "0";
   provider_options["disable_file_mapped_weights"] = "1";
+  if (htp_reused_io_limit_mb != nullptr) {
+    provider_options["htp_reused_io_limit_mb"] = htp_reused_io_limit_mb;
+  }
 
 #if defined(_WIN32) && (defined(__aarch64__) || defined(_M_ARM64))
   // By default, 8 is used, which will impact time to run all
@@ -2507,6 +2558,31 @@ TEST_F(QnnHTPBackendTests, FileMapping_Off) {
     std::remove(ctx_model_path.c_str());
   }
   std::remove(qnn_ctx_binary_file_name1.c_str());
+}
+
+TEST_F(QnnHTPBackendTests, FileMapping_Off) {
+#if (defined(__aarch64__) || defined(_M_ARM64)) && \
+    !(QNN_API_VERSION_MAJOR > 2 || (QNN_API_VERSION_MAJOR == 2 && QNN_API_VERSION_MINOR >= 34))
+  GTEST_SKIP() << "HTP weight sharing on ARM64 requires QNN API version >= 2.34.";
+#elif defined(__ANDROID__)
+  GTEST_SKIP() << "Weight sharing on Android devices is disabled";
+#else
+  RunSharedContextWithFileMappingDisabledTest();
+#endif
+}
+
+// Verifies that htp_reused_io_limit_mb is accepted as a group-level config when
+// htp_share_resource_optimization loads contexts with contextCreateFromBinaryListAsync.
+TEST_F(QnnHTPBackendTests, HtpSharedResourceOptimization_HtpReusedIoLimitMb_LoadsSucceeds) {
+#if QNN_API_VERSION_MAJOR < 2 || \
+    (QNN_API_VERSION_MAJOR == 2 && QNN_API_VERSION_MINOR < 34)
+  GTEST_SKIP() << "htp_reused_io_limit_mb requires QAIRT 2.45 or later (QNN API >= 2.34).";
+#elif !defined(__aarch64__) && !defined(_M_ARM64)
+  GTEST_SKIP() << "contextCreateFromBinaryListAsync execution requires a real ARM64 HTP device.";
+#elif defined(__ANDROID__)
+  GTEST_SKIP() << "Weight sharing on Android devices is disabled";
+#else
+  RunSharedContextWithFileMappingDisabledTest("128");
 #endif
 }
 

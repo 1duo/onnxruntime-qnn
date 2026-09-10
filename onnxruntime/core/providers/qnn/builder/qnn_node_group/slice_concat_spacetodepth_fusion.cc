@@ -466,15 +466,33 @@ std::unique_ptr<IQnnNodeGroup> SliceConcatSpaceToDepthFusion::TryFusion(
       return nullptr;
     }
   }
-  if (!(height_slice_for_width[0] == height_slice_for_width[2] &&
-        height_slice_for_width[1] == height_slice_for_width[3] &&
-        height_slice_for_width[0] != height_slice_for_width[1])) {
+  // The two H slices split the four W slices 2+2; positions are order-free here,
+  // exact Concat order is enforced later via the DCR phase permutation.
+  const OrtNodeUnit* height_slice_a = height_slice_for_width[0];
+  const OrtNodeUnit* height_slice_b = nullptr;
+  for (size_t i = 1; i < height_slice_for_width.size(); ++i) {
+    if (height_slice_for_width[i] != height_slice_a) {
+      height_slice_b = height_slice_for_width[i];
+      break;
+    }
+  }
+  if (height_slice_b == nullptr) {
     return nullptr;
   }
-  if (!HasExactlyConsumers(*height_slice_for_width[0],
-                           {&width_slices[0]->GetNode(), &width_slices[2]->GetNode()}) ||
-      !HasExactlyConsumers(*height_slice_for_width[1],
-                           {&width_slices[1]->GetNode(), &width_slices[3]->GetNode()})) {
+  std::vector<const OrtNodeUnit*> height_a_consumers;
+  std::vector<const OrtNodeUnit*> height_b_consumers;
+  for (size_t i = 0; i < height_slice_for_width.size(); ++i) {
+    if (height_slice_for_width[i] == height_slice_a) {
+      height_a_consumers.push_back(width_slices[i]);
+    } else if (height_slice_for_width[i] == height_slice_b) {
+      height_b_consumers.push_back(width_slices[i]);
+    } else {
+      return nullptr;
+    }
+  }
+  if (height_a_consumers.size() != 2 || height_b_consumers.size() != 2 ||
+      !HasExactlyUnitConsumers(*height_slice_a, height_a_consumers, node_to_unit) ||
+      !HasExactlyUnitConsumers(*height_slice_b, height_b_consumers, node_to_unit)) {
     return nullptr;
   }
 

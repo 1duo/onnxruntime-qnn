@@ -81,8 +81,7 @@ TEST_F(QnnHTPBackendTests, Rank5ToRank4Fusion_Float_DocstringExample) {
                       /*reshape2_shape=*/{1, 12, 12, 8}),
                   provider_options,
                   /*opset_version=*/13,
-                  /*expected_ep_assignment=*/ExpectedEPNodeAssignment::All,
-                  /*fp32_abs_err=*/1e-2f);
+                  EPVerificationParams{ExpectedEPNodeAssignment::All, ElementwiseAbsoluteVerifier(1e-2f)});
 
   // After fusion the Transpose runs on rank-4 tensors. The two Reshapes survive (one before and
   // one after the Transpose). The fusion does not change op counts in the QNN graph, only ranks.
@@ -114,8 +113,7 @@ TEST_F(QnnHTPBackendTests, Rank5ToRank4Fusion_Float_MergeAtStart) {
                       /*reshape2_shape=*/{4, 5, 6, 6}),
                   provider_options,
                   /*opset_version=*/13,
-                  /*expected_ep_assignment=*/ExpectedEPNodeAssignment::All,
-                  /*fp32_abs_err=*/1e-2f);
+                  EPVerificationParams{ExpectedEPNodeAssignment::All, ElementwiseAbsoluteVerifier(1e-2f)});
 
   AssertOpInQnnGraph(json_qnn_graph_dir, "Transpose", 1);
   AssertOpInQnnGraph(json_qnn_graph_dir, "Reshape", 2);
@@ -145,8 +143,7 @@ TEST_F(QnnHTPBackendTests, Rank5ToRank4Fusion_Float_MergeWithValueShift) {
                       /*reshape2_shape=*/{4, 5, 6, 6}),
                   provider_options,
                   /*opset_version=*/13,
-                  /*expected_ep_assignment=*/ExpectedEPNodeAssignment::All,
-                  /*fp32_abs_err=*/1e-2f);
+                  EPVerificationParams{ExpectedEPNodeAssignment::All, ElementwiseAbsoluteVerifier(1e-2f)});
 
   AssertOpInQnnGraph(json_qnn_graph_dir, "Transpose", 1);
   AssertOpInQnnGraph(json_qnn_graph_dir, "Reshape", 2);
@@ -176,8 +173,7 @@ TEST_F(QnnHTPBackendTests, Rank5ToRank4Fusion_Float_NoAdjacentPair_NoFusion) {
                       /*reshape2_shape=*/{6, 4, 5, 6}),
                   provider_options,
                   /*opset_version=*/13,
-                  /*expected_ep_assignment=*/ExpectedEPNodeAssignment::All,
-                  /*fp32_abs_err=*/1e-2f);
+                  EPVerificationParams{ExpectedEPNodeAssignment::All, ElementwiseAbsoluteVerifier(1e-2f)});
 
   // Fusion did not fire: intermediates stay rank-5.
   AssertOpInQnnGraph(json_qnn_graph_dir, "Transpose", 1);
@@ -227,8 +223,7 @@ TEST_F(QnnHTPBackendTests, Rank5ToRank4Fusion_Float_Rank4Intermediate_NoFusion) 
 
   RunQnnModelTest(build_rank4, provider_options,
                   /*opset_version=*/13,
-                  /*expected_ep_assignment=*/ExpectedEPNodeAssignment::All,
-                  /*fp32_abs_err=*/1e-2f);
+                  EPVerificationParams{ExpectedEPNodeAssignment::All, ElementwiseAbsoluteVerifier(1e-2f)});
 
   // Rank5ToRank4Fusion did not fire; the rank-4 Transpose remains.
   AssertOpInQnnGraph(json_qnn_graph_dir, "Transpose", 1);

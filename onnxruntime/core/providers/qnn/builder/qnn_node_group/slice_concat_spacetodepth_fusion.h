@@ -3,7 +3,7 @@
 
 #pragma once
 
-#include <gsl/gsl>
+#include <array>
 #include <cstdint>
 #include <memory>
 #include <string_view>
@@ -18,8 +18,11 @@ namespace qnn {
 
 class QnnModelWrapper;
 
-// YOLOX Focus (2 H-Slice + 4 W-Slice + Concat) fused to QNN SpaceToDepth CRD.
-// Focus order h0w0,h1w0,h0w1,h1w1 equals S2D CRD for block=2; other orders are rejected.
+// YOLOX Focus stem (2 H-Slice + 4 W-Slice + Concat) fused to
+// QNN SpaceToDepth (DCR) + channel Gather. Mirrors upstream ORT
+// SliceConcatToSpaceToDepthFusion: canonical DCR order needs no Gather,
+// any other phase order (e.g. Focus h0w0,h1w0,h0w1,h1w1) is restored
+// with a Gather over the 4C channels. Bare S2D alone is wrong here.
 class SliceConcatSpaceToDepthFusion : public IQnnNodeGroup {
  public:
   static constexpr uint32_t kBlockHeight = 2;
@@ -27,7 +30,10 @@ class SliceConcatSpaceToDepthFusion : public IQnnNodeGroup {
   // Order: H(start0), H(start1), W(h0w0), W(h1w0), W(h0w1), W(h1w1), Concat.
   static constexpr size_t kGroupSize = 7;
 
-  explicit SliceConcatSpaceToDepthFusion(gsl::span<const OrtNodeUnit* const> focus_node_units) {
+  SliceConcatSpaceToDepthFusion(gsl::span<const OrtNodeUnit* const> focus_node_units,
+                                std::array<int64_t, 4> dcr_phase_permutation,
+                                uint32_t focus_channels)
+      : phase_permutation_(dcr_phase_permutation), channel_count_(focus_channels) {
     node_units_.reserve(focus_node_units.size());
     for (const OrtNodeUnit* node_unit : focus_node_units) {
       node_units_.push_back(node_unit);
@@ -52,6 +58,9 @@ class SliceConcatSpaceToDepthFusion : public IQnnNodeGroup {
  private:
   std::vector<const OrtNodeUnit*> node_units_;
   const OrtNodeUnit* concat_node_unit_ = nullptr;
+  // Canonical DCR phase index per Concat input; {0,1,2,3} needs no Gather.
+  std::array<int64_t, 4> phase_permutation_{0, 1, 2, 3};
+  uint32_t channel_count_ = 0;
 };
 
 }  // namespace qnn

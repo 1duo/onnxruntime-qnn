@@ -6,6 +6,7 @@
 #include <algorithm>
 #include <array>
 #include <cstdint>
+#include <cstring>
 #include <memory>
 #include <optional>
 #include <string>
@@ -23,13 +24,22 @@ namespace qnn {
 namespace {
 
 constexpr size_t kNchwRank = 4;
+constexpr int64_t kChannelAxis = 1;
 constexpr int64_t kHeightAxis = 2;
 constexpr int64_t kWidthAxis = 3;
-constexpr int64_t kChannelAxis = 1;
 constexpr int64_t kSliceStepTwo = 2;
 
 using NodeToUnitMap = std::unordered_map<const OrtNode*, const OrtNodeUnit*>;
 using UnitToGroupMap = std::unordered_map<const OrtNodeUnit*, const IQnnNodeGroup*>;
+
+struct SlicePhase {
+  int64_t height_offset = -1;
+  int64_t width_offset = -1;
+};
+
+// Canonical ONNX SpaceToDepth (DCR) block order.
+constexpr std::array<SlicePhase, 4> kCanonicalDcrPhases = {
+    SlicePhase{0, 0}, SlicePhase{0, 1}, SlicePhase{1, 0}, SlicePhase{1, 1}};
 
 [[nodiscard]] bool IsSliceUnit(const OrtNodeUnit* node_unit) {
   return node_unit != nullptr && node_unit->OpType() == "Slice";
@@ -141,6 +151,52 @@ struct StepTwoSlice {
   return IsSliceUnit(parent) ? parent : nullptr;
 }
 
+// Each fused intermediate must have no consumers outside the group; otherwise lowering
+// to S2D would silently drop that edge's tensor.
+[[nodiscard]] bool HasExactlyConsumers(const OrtNodeUnit& producer_unit,
+                                       std::vector<const OrtNode*> expected_consumers) {
+  const Ort::ConstNode producer_node(&producer_unit.GetNode());
+  const std::vector<Ort::ConstValueInfo> producer_outputs = producer_node.GetOutputs();
+  if (producer_outputs.size() != 1 || producer_outputs[0].IsGraphOutput()) {
+    return false;
+  }
+  const std::vector<Ort::ValueInfoConsumerProducerInfo> consumers = producer_outputs[0].GetConsumers();
+  if (consumers.size() != expected_consumers.size()) {
+    return false;
+  }
+  for (const OrtNode* expected : expected_consumers) {
+    const bool found = std::any_of(consumers.begin(), consumers.end(),
+                                   [expected](const Ort::ValueInfoConsumerProducerInfo& consumer) {
+                                     return consumer.node == expected;
+                                   });
+    if (!found) {
+      return false;
+    }
+  }
+  return true;
+}
+
+[[nodiscard]] bool TryGetDcrPhasePermutation(const std::array<SlicePhase, 4>& actual_phases,
+                                             std::array<int64_t, 4>& permutation) {
+  std::array<bool, 4> used{false, false, false, false};
+  for (size_t i = 0; i < actual_phases.size(); ++i) {
+    bool matched = false;
+    for (size_t j = 0; j < kCanonicalDcrPhases.size(); ++j) {
+      if (!used[j] && actual_phases[i].height_offset == kCanonicalDcrPhases[j].height_offset &&
+          actual_phases[i].width_offset == kCanonicalDcrPhases[j].width_offset) {
+        permutation[i] = static_cast<int64_t>(j);
+        used[j] = true;
+        matched = true;
+        break;
+      }
+    }
+    if (!matched) {
+      return false;
+    }
+  }
+  return true;
+}
+
 struct PerTensorQuant {
   bool quantized = false;
   float scale = 1.0f;
@@ -175,11 +231,31 @@ struct PerTensorQuant {
   return !lhs.quantized || (lhs.scale == rhs.scale && lhs.offset == rhs.offset);
 }
 
+// Channel indices restoring Concat block order from canonical DCR output.
+[[nodiscard]] std::vector<int32_t> BuildDcrGatherIndices(const std::array<int64_t, 4>& dcr_permutation,
+                                                         uint32_t channel_count) {
+  std::vector<int32_t> gather_indices;
+  gather_indices.reserve(static_cast<size_t>(4 * channel_count));
+  for (const int64_t source_block : dcr_permutation) {
+    for (uint32_t channel = 0; channel < channel_count; ++channel) {
+      gather_indices.push_back(static_cast<int32_t>(source_block * channel_count + channel));
+    }
+  }
+  return gather_indices;
+}
+
 Ort::Status AddLayoutTranspose(QnnModelWrapper& model_wrapper, const OrtNodeUnit& concat_unit,
                                const std::string& transpose_name, const std::string& input_name,
-                               const std::string& output_name, std::vector<uint32_t> perm) {
+                               const std::string& output_name, std::vector<uint32_t> perm, bool validate,
+                               const std::vector<Qnn_Tensor_t>& validated_inputs,
+                               const std::vector<Qnn_Tensor_t>& validated_outputs) {
   QnnParamWrapper perm_param(concat_unit.Index(), transpose_name, QNN_OP_TRANSPOSE_PARAM_PERM,
                              {static_cast<uint32_t>(perm.size())}, std::move(perm));
+  if (validate) {
+    std::vector<Qnn_Param_t> params{perm_param.GetQnnParam()};
+    return model_wrapper.ValidateQnnNode(transpose_name, QNN_OP_PACKAGE_NAME_QTI_AISW, QNN_OP_TRANSPOSE,
+                                         validated_inputs, validated_outputs, std::move(params));
+  }
   const std::string perm_param_name = perm_param.GetParamTensorName();
   RETURN_IF_NOT(model_wrapper.AddParamWrapper(std::move(perm_param)), "Failed to add transpose perm.");
   RETURN_IF_NOT(model_wrapper.CreateQnnNode(transpose_name, QNN_OP_PACKAGE_NAME_QTI_AISW, QNN_OP_TRANSPOSE,
@@ -189,9 +265,79 @@ Ort::Status AddLayoutTranspose(QnnModelWrapper& model_wrapper, const OrtNodeUnit
   return Ort::Status();
 }
 
-Ort::Status AddCrdSpaceToDepth(QnnModelWrapper& model_wrapper, const OrtNodeUnit& concat_unit,
-                               const std::string& s2d_name, const std::string& input_name,
-                               const std::string& output_name) {
+// Lowering shared by IsSupported (validate=true) and AddToModelBuilder (validate=false):
+// PreT(NCHW->NHWC) + S2D(DCR) + [Gather channel reorder] + PostT(NHWC->NCHW).
+Ort::Status CreateOrValidateFocusGraph(QnnModelWrapper& model_wrapper, const OrtNodeUnit& common_input_owner,
+                                       const OrtNodeUnit& concat_unit,
+                                       const std::array<int64_t, 4>& dcr_permutation, uint32_t channel_count,
+                                       bool validate, const Ort::Logger& logger) {
+  ORT_UNUSED_PARAMETER(logger);
+  const OrtNodeUnitIODef& focus_input_def = common_input_owner.Inputs()[0];
+  const OrtNodeUnitIODef& focus_output_def = concat_unit.Outputs()[0];
+
+  QnnTensorWrapper focus_input_tensor, focus_output_tensor;
+  RETURN_IF_ERROR(model_wrapper.MakeTensorWrapper(focus_input_def, focus_input_tensor));
+  RETURN_IF_ERROR(model_wrapper.MakeTensorWrapper(focus_output_def, focus_output_tensor));
+
+  TensorInfo focus_input_info = {}, focus_output_info = {};
+  RETURN_IF_ERROR(model_wrapper.GetTensorInfo(focus_input_def, focus_input_info));
+  RETURN_IF_ERROR(model_wrapper.GetTensorInfo(focus_output_def, focus_output_info));
+
+  std::vector<uint32_t> input_shape, output_shape;
+  RETURN_IF_NOT(QnnModelWrapper::GetOnnxShape(focus_input_def.shape, input_shape),
+                "SliceConcatS2D: bad input shape.");
+  RETURN_IF_NOT(QnnModelWrapper::GetOnnxShape(focus_output_def.shape, output_shape),
+                "SliceConcatS2D: bad output shape.");
+
+  const std::string base_name = utils::UniqueNameGenerator().New(concat_unit, "_focus_s2d");
+  const std::string nhwc_input_name = base_name + "_in";
+  const std::string nhwc_output_name = base_name + "_s2d_out";
+  const std::string pre_name = base_name + "_pre";
+  const std::string s2d_name = base_name + "_s2d";
+  const std::string post_name = base_name + "_post";
+
+  QnnTensorWrapper nhwc_input_tensor(
+      nhwc_input_name, QNN_TENSOR_TYPE_NATIVE, focus_input_info.qnn_data_type,
+      focus_input_info.quant_param.Copy(),
+      std::vector<uint32_t>{input_shape[0], input_shape[2], input_shape[3], input_shape[1]});
+  QnnTensorWrapper nhwc_output_tensor(
+      nhwc_output_name, QNN_TENSOR_TYPE_NATIVE, focus_output_info.qnn_data_type,
+      focus_output_info.quant_param.Copy(),
+      std::vector<uint32_t>{output_shape[0], output_shape[2], output_shape[3], output_shape[1]});
+
+  const bool needs_gather = dcr_permutation != std::array<int64_t, 4>{0, 1, 2, 3};
+  const std::string gather_input_name = needs_gather ? base_name + "_gather_in" : nhwc_output_name;
+  // Gather runs on NCHW channels after PostT (mirrors upstream S2D-then-Gather order).
+  const std::string nchw_s2d_name = needs_gather ? gather_input_name : focus_output_def.name;
+
+  QnnTensorWrapper nchw_s2d_tensor(
+      nchw_s2d_name, QNN_TENSOR_TYPE_NATIVE, focus_output_info.qnn_data_type,
+      focus_output_info.quant_param.Copy(),
+      std::vector<uint32_t>(output_shape));
+
+  std::vector<int32_t> gather_indices;
+  if (needs_gather) {
+    gather_indices = BuildDcrGatherIndices(dcr_permutation, channel_count);
+  }
+  std::vector<uint8_t> gather_indices_bytes;
+  if (needs_gather) {
+    gather_indices_bytes.resize(gather_indices.size() * sizeof(int32_t));
+    std::memcpy(gather_indices_bytes.data(), gather_indices.data(), gather_indices_bytes.size());
+  }
+  // Static int32 indices (QNN Gather has no int64 static path); built only when reordering.
+  std::optional<QnnTensorWrapper> gather_indices_tensor;
+  if (needs_gather) {
+    gather_indices_tensor.emplace(
+        base_name + "_gather_idx", QNN_TENSOR_TYPE_STATIC, QNN_DATATYPE_INT_32, QnnQuantParamsWrapper(),
+        std::vector<uint32_t>{static_cast<uint32_t>(gather_indices.size())}, std::move(gather_indices_bytes));
+  }
+
+  Qnn_Scalar_t gather_axis_scalar = QNN_SCALAR_INIT;
+  gather_axis_scalar.dataType = QNN_DATATYPE_INT_32;
+  gather_axis_scalar.int32Value = 1;
+  QnnParamWrapper gather_axis_param(concat_unit.Index(), base_name + "_gather",
+                                    QNN_OP_GATHER_PARAM_AXIS, gather_axis_scalar);
+
   std::vector<uint32_t> block_shape{2};
   std::vector<uint32_t> block_data{SliceConcatSpaceToDepthFusion::kBlockHeight,
                                    SliceConcatSpaceToDepthFusion::kBlockWidth};
@@ -199,16 +345,77 @@ Ort::Status AddCrdSpaceToDepth(QnnModelWrapper& model_wrapper, const OrtNodeUnit
                               std::move(block_shape), std::move(block_data));
   Qnn_Scalar_t mode_scalar = QNN_SCALAR_INIT;
   mode_scalar.dataType = QNN_DATATYPE_UINT_32;
-  mode_scalar.uint32Value = QNN_OP_SPACE_TO_DEPTH_MODE_CRD;
+  mode_scalar.uint32Value = QNN_OP_SPACE_TO_DEPTH_MODE_DCR;
   QnnParamWrapper mode_param(concat_unit.Index(), s2d_name, QNN_OP_SPACE_TO_DEPTH_PARAM_MODE, mode_scalar);
-  const std::string block_name = block_param.GetParamTensorName();
-  const std::string mode_name = mode_param.GetParamTensorName();
-  RETURN_IF_NOT(model_wrapper.AddParamWrapper(std::move(block_param)), "Failed to add S2D block param.");
-  RETURN_IF_NOT(model_wrapper.AddParamWrapper(std::move(mode_param)), "Failed to add S2D mode param.");
-  RETURN_IF_NOT(model_wrapper.CreateQnnNode(s2d_name, QNN_OP_PACKAGE_NAME_QTI_AISW, QNN_OP_SPACE_TO_DEPTH,
-                                            {input_name}, {output_name}, {block_name, mode_name},
-                                            /*validate*/ false),
-                "Failed to add SpaceToDepth.");
+
+  if (validate) {
+    RETURN_IF_ERROR(AddLayoutTranspose(model_wrapper, concat_unit, pre_name, focus_input_def.name,
+                                       nhwc_input_name, {0, 2, 3, 1}, /*validate*/ true,
+                                       {focus_input_tensor.GetQnnTensor()},
+                                       {nhwc_input_tensor.GetQnnTensor()}));
+    {
+      std::vector<Qnn_Param_t> params{block_param.GetQnnParam(), mode_param.GetQnnParam()};
+      RETURN_IF_ERROR(model_wrapper.ValidateQnnNode(s2d_name, QNN_OP_PACKAGE_NAME_QTI_AISW,
+                                                    QNN_OP_SPACE_TO_DEPTH,
+                                                    {nhwc_input_tensor.GetQnnTensor()},
+                                                    {nhwc_output_tensor.GetQnnTensor()}, std::move(params)));
+    }
+    RETURN_IF_ERROR(AddLayoutTranspose(model_wrapper, concat_unit, post_name, nhwc_output_name,
+                                       nchw_s2d_name, {0, 3, 1, 2}, /*validate*/ true,
+                                       {nhwc_output_tensor.GetQnnTensor()},
+                                       {nchw_s2d_tensor.GetQnnTensor()}));
+    if (needs_gather) {
+      std::vector<Qnn_Param_t> params{gather_axis_param.GetQnnParam()};
+      RETURN_IF_ERROR(model_wrapper.ValidateQnnNode(base_name + "_gather", QNN_OP_PACKAGE_NAME_QTI_AISW,
+                                                    QNN_OP_GATHER,
+                                                    {nchw_s2d_tensor.GetQnnTensor(),
+                                                     gather_indices_tensor->GetQnnTensor()},
+                                                    {focus_output_tensor.GetQnnTensor()}, std::move(params)));
+    }
+    return Ort::Status();
+  }
+
+  auto add_tensor_once = [&](QnnTensorWrapper&& tensor, const std::string& tensor_name,
+                             const char* error_message) -> Ort::Status {
+    if (model_wrapper.IsQnnTensorWrapperExist(tensor_name)) {
+      return Ort::Status();
+    }
+    RETURN_IF_NOT(model_wrapper.AddTensorWrapper(std::move(tensor)), error_message);
+    return Ort::Status();
+  };
+  RETURN_IF_ERROR(add_tensor_once(std::move(focus_input_tensor), focus_input_def.name, "Bad focus input."));
+  RETURN_IF_ERROR(add_tensor_once(std::move(focus_output_tensor), focus_output_def.name, "Bad focus output."));
+  RETURN_IF_NOT(model_wrapper.AddTensorWrapper(std::move(nhwc_input_tensor)), "Bad NHWC input.");
+  RETURN_IF_NOT(model_wrapper.AddTensorWrapper(std::move(nhwc_output_tensor)), "Bad NHWC S2D output.");
+  RETURN_IF_NOT(model_wrapper.AddTensorWrapper(std::move(nchw_s2d_tensor)), "Bad NCHW S2D output.");
+  if (needs_gather) {
+    RETURN_IF_NOT(model_wrapper.AddTensorWrapper(std::move(*gather_indices_tensor)), "Bad Gather indices.");
+  }
+
+  RETURN_IF_ERROR(AddLayoutTranspose(model_wrapper, concat_unit, pre_name, focus_input_def.name,
+                                     nhwc_input_name, {0, 2, 3, 1}, /*validate*/ false, {}, {}));
+  {
+    const std::string block_name = block_param.GetParamTensorName();
+    const std::string mode_name = mode_param.GetParamTensorName();
+    RETURN_IF_NOT(model_wrapper.AddParamWrapper(std::move(block_param)), "Failed to add S2D block param.");
+    RETURN_IF_NOT(model_wrapper.AddParamWrapper(std::move(mode_param)), "Failed to add S2D mode param.");
+    RETURN_IF_NOT(model_wrapper.CreateQnnNode(s2d_name, QNN_OP_PACKAGE_NAME_QTI_AISW, QNN_OP_SPACE_TO_DEPTH,
+                                              {nhwc_input_name}, {nhwc_output_name}, {block_name, mode_name},
+                                              /*validate*/ false),
+                  "Failed to add SpaceToDepth.");
+  }
+  RETURN_IF_ERROR(AddLayoutTranspose(model_wrapper, concat_unit, post_name, nhwc_output_name, nchw_s2d_name,
+                                     {0, 3, 1, 2}, /*validate*/ false, {}, {}));
+
+  if (needs_gather) {
+    const std::string gather_name = base_name + "_gather";
+    const std::string axis_name = gather_axis_param.GetParamTensorName();
+    RETURN_IF_NOT(model_wrapper.AddParamWrapper(std::move(gather_axis_param)), "Failed to add Gather axis.");
+    RETURN_IF_NOT(model_wrapper.CreateQnnNode(gather_name, QNN_OP_PACKAGE_NAME_QTI_AISW, QNN_OP_GATHER,
+                                              {nchw_s2d_name, base_name + "_gather_idx"},
+                                              {focus_output_def.name}, {axis_name}, /*validate*/ false),
+                  "Failed to add channel Gather.");
+  }
   return Ort::Status();
 }
 
@@ -237,7 +444,8 @@ std::unique_ptr<IQnnNodeGroup> SliceConcatSpaceToDepthFusion::TryFusion(
   for (size_t i = 0; i < width_slices.size(); ++i) {
     width_slices[i] =
         GetParentSliceOrNull(model_wrapper, concat_unit, concat_unit.Inputs()[i], node_to_unit, unit_to_group);
-    if (width_slices[i] == nullptr) {
+    if (width_slices[i] == nullptr ||
+        !HasExactlyConsumers(*width_slices[i], {&concat_unit.GetNode()})) {
       return nullptr;
     }
   }
@@ -253,6 +461,12 @@ std::unique_ptr<IQnnNodeGroup> SliceConcatSpaceToDepthFusion::TryFusion(
   if (!(height_slice_for_width[0] == height_slice_for_width[2] &&
         height_slice_for_width[1] == height_slice_for_width[3] &&
         height_slice_for_width[0] != height_slice_for_width[1])) {
+    return nullptr;
+  }
+  if (!HasExactlyConsumers(*height_slice_for_width[0],
+                           {&width_slices[0]->GetNode(), &width_slices[2]->GetNode()}) ||
+      !HasExactlyConsumers(*height_slice_for_width[1],
+                           {&width_slices[1]->GetNode(), &width_slices[3]->GetNode()})) {
     return nullptr;
   }
 
@@ -310,12 +524,10 @@ std::unique_ptr<IQnnNodeGroup> SliceConcatSpaceToDepthFusion::TryFusion(
         (height_spec_a->start == 1 && height_spec_b->start == 0))) {
     return nullptr;
   }
-  const OrtNodeUnit* height_start_zero = (height_spec_a->start == 0) ? height_slice_a : height_slice_b;
-  const OrtNodeUnit* height_start_one = (height_spec_a->start == 0) ? height_slice_b : height_slice_a;
-  if (!(height_slice_for_width[0] == height_start_zero && height_slice_for_width[1] == height_start_one &&
-        height_slice_for_width[2] == height_start_zero && height_slice_for_width[3] == height_start_one)) {
-    return nullptr;
-  }
+
+  // Effective (h, w) phase per Concat input; any permutation of the four is accepted,
+  // with the Gather restoring exact Concat order downstream.
+  std::array<SlicePhase, 4> actual_phases{};
   for (size_t i = 0; i < width_slices.size(); ++i) {
     std::vector<uint32_t> parent_height_shape;
     if (!QnnModelWrapper::GetOnnxShape(height_slice_for_width[i]->Outputs()[0].shape, parent_height_shape)) {
@@ -325,18 +537,21 @@ std::unique_ptr<IQnnNodeGroup> SliceConcatSpaceToDepthFusion::TryFusion(
     if (!width_spec.has_value() || width_spec->axis != kWidthAxis) {
       return nullptr;
     }
-    if (width_spec->start != ((i == 0 || i == 1) ? 0 : 1)) {
-      return nullptr;
-    }
+    const int64_t parent_h_start = (height_slice_for_width[i] == height_slice_a) ? height_spec_a->start
+                                                                                 : height_spec_b->start;
+    actual_phases[i] = SlicePhase{parent_h_start, width_spec->start};
+  }
+  std::array<int64_t, 4> dcr_permutation{0, 1, 2, 3};
+  if (!TryGetDcrPhasePermutation(actual_phases, dcr_permutation)) {
+    return nullptr;
   }
 
-  // Every boundary tensor (stem in, both H outs, all 4 W outs, concat out) shares one
-  // per-tensor quant. Slices only rearrange, so any intermediate requant would be
-  // skipped by S2D and change numerics.
+  // Every boundary tensor shares one per-tensor quant; S2D+Gather only rearrange,
+  // so any intermediate requant would be skipped and change numerics.
   const OrtNodeUnitIODef* boundary_defs[] = {
-      &height_start_zero->Inputs()[0],
-      &height_start_zero->Outputs()[0],
-      &height_start_one->Outputs()[0],
+      &height_slice_a->Inputs()[0],
+      &height_slice_a->Outputs()[0],
+      &height_slice_b->Outputs()[0],
       &width_slices[0]->Outputs()[0],
       &width_slices[1]->Outputs()[0],
       &width_slices[2]->Outputs()[0],
@@ -357,15 +572,15 @@ std::unique_ptr<IQnnNodeGroup> SliceConcatSpaceToDepthFusion::TryFusion(
   }
 
   const std::array<const OrtNodeUnit*, kGroupSize> focus_group = {
-      height_start_zero, height_start_one, width_slices[0], width_slices[1],
+      height_slice_a, height_slice_b, width_slices[0], width_slices[1],
       width_slices[2], width_slices[3], &concat_unit};
   return std::make_unique<SliceConcatSpaceToDepthFusion>(
-      gsl::make_span<const OrtNodeUnit* const>(focus_group.data(), focus_group.size()));
+      gsl::make_span<const OrtNodeUnit* const>(focus_group.data(), focus_group.size()),
+      dcr_permutation, channels);
 }
 
 Ort::Status SliceConcatSpaceToDepthFusion::IsSupported(QnnModelWrapper& model_wrapper,
                                                        const Ort::Logger& logger) const {
-  ORT_UNUSED_PARAMETER(logger);
   if (model_wrapper.GetQnnBackendType() != QnnBackendType::HTP &&
       model_wrapper.GetQnnBackendType() != QnnBackendType::HTP_FP16) {
     return MAKE_EP_FAIL("SliceConcatS2D: HTP only.");
@@ -383,61 +598,15 @@ Ort::Status SliceConcatSpaceToDepthFusion::IsSupported(QnnModelWrapper& model_wr
       std::any_of(output_shape.begin(), output_shape.end(), [](uint32_t dim) { return dim == 0; })) {
     return MAKE_EP_FAIL("SliceConcatS2D: rank-4 non-zero shapes only.");
   }
-  return Ort::Status();
+  ORT_UNUSED_PARAMETER(logger);
+  return CreateOrValidateFocusGraph(model_wrapper, *node_units_[0], *concat_node_unit_, phase_permutation_,
+                                    channel_count_, /*validate*/ true, logger);
 }
 
 Ort::Status SliceConcatSpaceToDepthFusion::AddToModelBuilder(QnnModelWrapper& model_wrapper,
                                                              const Ort::Logger& logger) const {
-  ORT_UNUSED_PARAMETER(logger);
-  const OrtNodeUnitIODef& focus_input_def = node_units_[0]->Inputs()[0];
-  const OrtNodeUnitIODef& focus_output_def = concat_node_unit_->Outputs()[0];
-
-  QnnTensorWrapper focus_input_tensor, focus_output_tensor;
-  RETURN_IF_ERROR(model_wrapper.MakeTensorWrapper(focus_input_def, focus_input_tensor));
-  RETURN_IF_ERROR(model_wrapper.MakeTensorWrapper(focus_output_def, focus_output_tensor));
-
-  TensorInfo focus_input_info = {}, focus_output_info = {};
-  RETURN_IF_ERROR(model_wrapper.GetTensorInfo(focus_input_def, focus_input_info));
-  RETURN_IF_ERROR(model_wrapper.GetTensorInfo(focus_output_def, focus_output_info));
-
-  std::vector<uint32_t> input_shape, output_shape;
-  RETURN_IF_NOT(QnnModelWrapper::GetOnnxShape(focus_input_def.shape, input_shape),
-                "SliceConcatS2D: bad input shape.");
-  RETURN_IF_NOT(QnnModelWrapper::GetOnnxShape(focus_output_def.shape, output_shape),
-                "SliceConcatS2D: bad output shape.");
-
-  const std::string base_name = utils::UniqueNameGenerator().New(*concat_node_unit_, "_focus_s2d");
-  const std::string nhwc_input_name = base_name + "_in";
-  const std::string nhwc_output_name = base_name + "_out";
-
-  QnnTensorWrapper nhwc_input_tensor(
-      nhwc_input_name, QNN_TENSOR_TYPE_NATIVE, focus_input_info.qnn_data_type,
-      focus_input_info.quant_param.Copy(),
-      std::vector<uint32_t>{input_shape[0], input_shape[2], input_shape[3], input_shape[1]});
-  QnnTensorWrapper nhwc_output_tensor(
-      nhwc_output_name, QNN_TENSOR_TYPE_NATIVE, focus_output_info.qnn_data_type,
-      focus_output_info.quant_param.Copy(),
-      std::vector<uint32_t>{output_shape[0], output_shape[2], output_shape[3], output_shape[1]});
-
-  auto add_tensor_once = [&](QnnTensorWrapper&& tensor, const std::string& tensor_name,
-                             const char* error_message) -> Ort::Status {
-    if (model_wrapper.IsQnnTensorWrapperExist(tensor_name)) {
-      return Ort::Status();
-    }
-    RETURN_IF_NOT(model_wrapper.AddTensorWrapper(std::move(tensor)), error_message);
-    return Ort::Status();
-  };
-  RETURN_IF_ERROR(add_tensor_once(std::move(focus_input_tensor), focus_input_def.name, "Bad focus input."));
-  RETURN_IF_ERROR(add_tensor_once(std::move(focus_output_tensor), focus_output_def.name, "Bad focus output."));
-  RETURN_IF_NOT(model_wrapper.AddTensorWrapper(std::move(nhwc_input_tensor)), "Bad NHWC input.");
-  RETURN_IF_NOT(model_wrapper.AddTensorWrapper(std::move(nhwc_output_tensor)), "Bad NHWC output.");
-
-  RETURN_IF_ERROR(AddLayoutTranspose(model_wrapper, *concat_node_unit_, base_name + "_pre",
-                                     focus_input_def.name, nhwc_input_name, {0, 2, 3, 1}));
-  RETURN_IF_ERROR(AddCrdSpaceToDepth(model_wrapper, *concat_node_unit_, base_name + "_s2d",
-                                     nhwc_input_name, nhwc_output_name));
-  return AddLayoutTranspose(model_wrapper, *concat_node_unit_, base_name + "_post", nhwc_output_name,
-                            focus_output_def.name, {0, 3, 1, 2});
+  return CreateOrValidateFocusGraph(model_wrapper, *node_units_[0], *concat_node_unit_, phase_permutation_,
+                                    channel_count_, /*validate*/ false, logger);
 }
 
 }  // namespace qnn

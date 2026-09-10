@@ -28,7 +28,9 @@ enum class IndexElementType { kInt64,
                               kInt32 };
 
 // [1,3,8,8] Focus stem; Pair B perf shape [1,3,640,640] shares the pattern with generic N.
-GetTestModelFn BuildFocusTestCase(bool use_qdq, bool use_contrib_qdq, bool wrong_order = false,
+// concat_order selects the Concat input sequence over {h0w0,h1w0,h0w1,h1w1}.
+GetTestModelFn BuildFocusTestCase(bool use_qdq, bool use_contrib_qdq,
+                                  std::vector<std::string> concat_order = {"h0w0", "h1w0", "h0w1", "h1w1"},
                                   IndexElementType index_type = IndexElementType::kInt64,
                                   bool mismatched_scales = false) {
   return [=](ModelTestBuilder& builder) -> void {
@@ -72,15 +74,12 @@ GetTestModelFn BuildFocusTestCase(bool use_qdq, bool use_contrib_qdq, bool wrong
 
     // Optional intermediate requant with a different scale on one branch.
     // Fusion must fail closed here; S2D would skip the requant error.
-    std::string h1w1_in = "h1w1";
+    std::vector<std::string> concat_inputs = concat_order;
     if (mismatched_scales) {
-      h1w1_in = AddQDQNodePair<uint16_t>(builder, "qdq_mismatch", "h1w1", stem_quant.scale * 2.0f,
-                                         stem_quant.zero_point, use_contrib_qdq);
+      concat_inputs.back() = AddQDQNodePair<uint16_t>(builder, "qdq_mismatch", concat_inputs.back(),
+                                                      stem_quant.scale * 2.0f, stem_quant.zero_point,
+                                                      use_contrib_qdq);
     }
-
-    const std::vector<std::string> concat_inputs =
-        wrong_order ? std::vector<std::string>{"h0w0", "h0w1", "h1w0", h1w1_in}
-                    : std::vector<std::string>{"h0w0", "h1w0", "h0w1", h1w1_in};
     builder.AddNode("Concat", "Concat", concat_inputs, {"cat_out"}, kOnnxDomain,
                     {test::MakeAttribute("axis", static_cast<int64_t>(1))});
 
@@ -102,8 +101,8 @@ ProviderOptions HtpOptions() {
   return options;
 }
 
-void RunFocusFusionTest(const std::filesystem::path& dir, GetTestModelFn model_fn, bool expect_fused,
-                        float tolerance = 1e-2f) {
+void RunFocusFusionTest(const std::filesystem::path& dir, GetTestModelFn model_fn, int expect_s2d,
+                        int expect_gather, float tolerance = 1e-2f) {
   std::filesystem::remove_all(dir);
   ASSERT_TRUE(std::filesystem::create_directory(dir));
   auto cleanup = gsl::finally([&dir]() { std::filesystem::remove_all(dir); });
@@ -116,39 +115,51 @@ void RunFocusFusionTest(const std::filesystem::path& dir, GetTestModelFn model_f
                   EPVerificationParams{ExpectedEPNodeAssignment::All,
                                        ElementwiseAbsoluteVerifier(tolerance)},
                   OrtLoggingLevel::ORT_LOGGING_LEVEL_VERBOSE);
-  AssertOpInQnnGraph(dir, "SpaceToDepth", expect_fused ? 1 : 0);
+  AssertOpInQnnGraph(dir, "SpaceToDepth", expect_s2d);
+  AssertOpInQnnGraph(dir, "Gather", expect_gather);
 }
 
 }  // namespace
 
+// YOLOX Focus order: S2D(DCR) + channel Gather restoring exact Concat order.
 TEST_F(QnnHTPBackendTests, FocusSliceConcat_Float_Fused) {
   SKIP_HTP_TEST_ON_ARCH_LESS_THAN_OR_EQUAL_TO(QNN_HTP_DEVICE_ARCH_V68);
-  RunFocusFusionTest("FocusSliceConcatFloat_HTP", BuildFocusTestCase(false, false), true);
+  RunFocusFusionTest("FocusSliceConcatFloat_HTP", BuildFocusTestCase(false, false), 1, 1);
 }
 
 TEST_F(QnnHTPBackendTests, FocusSliceConcat_Float_Int32Indices_Fused) {
   SKIP_HTP_TEST_ON_ARCH_LESS_THAN_OR_EQUAL_TO(QNN_HTP_DEVICE_ARCH_V68);
   RunFocusFusionTest("FocusSliceConcatInt32_HTP",
-                     BuildFocusTestCase(false, false, false, IndexElementType::kInt32), true);
+                     BuildFocusTestCase(false, false, {"h0w0", "h1w0", "h0w1", "h1w1"},
+                                        IndexElementType::kInt32),
+                     1, 1);
 }
 
 TEST_F(QnnHTPBackendTests, FocusSliceConcat_QDQ_U16_Fused) {
   SKIP_HTP_TEST_ON_ARCH_LESS_THAN_OR_EQUAL_TO(QNN_HTP_DEVICE_ARCH_V68);
-  RunFocusFusionTest("FocusSliceConcatQDQU16_HTP", BuildFocusTestCase(true, true), true, 3e-2f);
+  RunFocusFusionTest("FocusSliceConcatQDQU16_HTP", BuildFocusTestCase(true, true), 1, 1, 3e-2f);
 }
 
-TEST_F(QnnHTPBackendTests, FocusSliceConcat_WrongOrder_NotFused) {
+// Canonical DCR order needs no reorder: bare S2D, no Gather.
+TEST_F(QnnHTPBackendTests, FocusSliceConcat_CanonicalOrder_FusedWithoutGather) {
   SKIP_HTP_TEST_ON_ARCH_LESS_THAN_OR_EQUAL_TO(QNN_HTP_DEVICE_ARCH_V68);
-  RunFocusFusionTest("FocusSliceConcatWrongOrder_HTP",
-                     BuildFocusTestCase(false, false, /*wrong_order=*/true), false);
+  RunFocusFusionTest("FocusSliceConcatCanonical_HTP",
+                     BuildFocusTestCase(false, false, {"h0w0", "h0w1", "h1w0", "h1w1"}), 1, 0);
+}
+
+// Duplicated phase must fail closed (S2D would drop a block).
+TEST_F(QnnHTPBackendTests, FocusSliceConcat_DuplicatePhase_NotFused) {
+  SKIP_HTP_TEST_ON_ARCH_LESS_THAN_OR_EQUAL_TO(QNN_HTP_DEVICE_ARCH_V68);
+  RunFocusFusionTest("FocusSliceConcatDuplicate_HTP",
+                     BuildFocusTestCase(false, false, {"h0w0", "h0w0", "h1w0", "h1w1"}), 0, 0);
 }
 
 TEST_F(QnnHTPBackendTests, FocusSliceConcat_MismatchedScales_NotFused) {
   SKIP_HTP_TEST_ON_ARCH_LESS_THAN_OR_EQUAL_TO(QNN_HTP_DEVICE_ARCH_V68);
   RunFocusFusionTest("FocusSliceConcatMismatch_HTP",
-                     BuildFocusTestCase(true, true, false, IndexElementType::kInt64,
-                                        /*mismatched_scales=*/true),
-                     false, 3e-2f);
+                     BuildFocusTestCase(true, true, {"h0w0", "h1w0", "h0w1", "h1w1"},
+                                        IndexElementType::kInt64, /*mismatched_scales=*/true),
+                     0, 0, 3e-2f);
 }
 
 #endif  // defined(__aarch64__) || defined(_M_ARM64) || defined(__linux__)

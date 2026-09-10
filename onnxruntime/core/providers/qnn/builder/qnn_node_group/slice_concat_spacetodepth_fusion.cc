@@ -152,22 +152,29 @@ struct StepTwoSlice {
 }
 
 // Each fused intermediate must have no consumers outside the group; otherwise lowering
-// to S2D would silently drop that edge's tensor.
-[[nodiscard]] bool HasExactlyConsumers(const OrtNodeUnit& producer_unit,
-                                       std::vector<const OrtNode*> expected_consumers) {
+// to S2D would silently drop that edge's tensor. Consumers resolve through NodeUnits:
+// in QDQ graphs the direct edge target is a DQ node owned by the consumer's group.
+[[nodiscard]] bool HasExactlyUnitConsumers(const OrtNodeUnit& producer_unit,
+                                           const std::vector<const OrtNodeUnit*>& expected_consumer_units,
+                                           const NodeToUnitMap& node_to_unit) {
   const Ort::ConstNode producer_node(&producer_unit.GetNode());
   const std::vector<Ort::ConstValueInfo> producer_outputs = producer_node.GetOutputs();
   if (producer_outputs.size() != 1 || producer_outputs[0].IsGraphOutput()) {
     return false;
   }
   const std::vector<Ort::ValueInfoConsumerProducerInfo> consumers = producer_outputs[0].GetConsumers();
-  if (consumers.size() != expected_consumers.size()) {
+  if (consumers.size() != expected_consumer_units.size()) {
     return false;
   }
-  for (const OrtNode* expected : expected_consumers) {
+  for (const OrtNodeUnit* expected_unit : expected_consumer_units) {
     const bool found = std::any_of(consumers.begin(), consumers.end(),
-                                   [expected](const Ort::ValueInfoConsumerProducerInfo& consumer) {
-                                     return consumer.node == expected;
+                                   [&node_to_unit, expected_unit](
+                                       const Ort::ValueInfoConsumerProducerInfo& consumer) {
+                                     if (consumer.node == nullptr) {
+                                       return false;
+                                     }
+                                     const auto it = node_to_unit.find(consumer.node);
+                                     return it != node_to_unit.end() && it->second == expected_unit;
                                    });
     if (!found) {
       return false;
@@ -446,7 +453,7 @@ std::unique_ptr<IQnnNodeGroup> SliceConcatSpaceToDepthFusion::TryFusion(
     width_slices[i] =
         GetParentSliceOrNull(model_wrapper, concat_unit, concat_unit.Inputs()[i], node_to_unit, unit_to_group);
     if (width_slices[i] == nullptr ||
-        !HasExactlyConsumers(*width_slices[i], {&concat_unit.GetNode()})) {
+        !HasExactlyUnitConsumers(*width_slices[i], {&concat_unit}, node_to_unit)) {
       return nullptr;
     }
   }
@@ -471,8 +478,6 @@ std::unique_ptr<IQnnNodeGroup> SliceConcatSpaceToDepthFusion::TryFusion(
     return nullptr;
   }
 
-  const OrtNodeUnit* height_slice_a = height_slice_for_width[0];
-  const OrtNodeUnit* height_slice_b = height_slice_for_width[1];
   if (height_slice_a->Inputs().empty() || height_slice_b->Inputs().empty() ||
       height_slice_a->Inputs()[0].name != height_slice_b->Inputs()[0].name) {
     return nullptr;

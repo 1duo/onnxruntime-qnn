@@ -1229,12 +1229,7 @@ TEST_F(QnnGPUBackendTests, ReshapeGemmFusion) {
 
 #endif  // defined(_M_ARM64) GPU tests
 
-// Builds the compact-weight Gemm case (transB=1): uint16 per-tensor activation QDQ
-// around a Gemm whose weight is a per-channel INT8 chain (int8 init -> DQ -> Q -> DQ),
-// followed by a uint16 per-tensor Q/DQ pair so the graph output stays float for
-// verification. 1024x512 = 512K elems (2 MiB FP32) is past the 1 MiB fold budget.
-// Like MatMul (see BuildCompactWeightQDQMatMulTestCase), the chain joins the Gemm's
-// QDQ group natively and the weight stays a compact INT8 STATIC; no fusion is involved.
+// transB=1 twin of the MatMul compact case (chain groups natively; no fusion).
 // Opset 21 for 16-bit Q/DQ.
 static GetTestModelFn BuildCompactWeightQDQGemmTestCase(int64_t K, int64_t N) {
   return [K, N](ModelTestBuilder& builder) {
@@ -1243,10 +1238,7 @@ static GetTestModelFn BuildCompactWeightQDQGemmTestCase(int64_t K, int64_t N) {
     builder.MakeInitializer<uint16_t>("a_zp", {}, {0});
     builder.AddNode("AQ", "QuantizeLinear", {"input", "a_s", "a_zp"}, {"a_q"}, kOnnxDomain);
     builder.AddNode("ADQ", "DequantizeLinear", {"a_q", "a_s", "a_zp"}, {"a_dq"}, kOnnxDomain);
-    // Two-hop chain from an int8 initializer: ORT constant-folds a Q directly over a
-    // float initializer (which would erase Q1 pre-partition), while DQ nodes are
-    // preserved, so the chain must start quantized to reach the EP intact.
-    // transB=1: stored [N, K], per-channel scales along axis 0.
+    // Chain must start quantized: ORT folds a Q directly over a float initializer.
     const int64_t d0 = N, d1 = K;
     std::vector<int8_t> w(static_cast<size_t>(d0 * d1));
     for (int64_t i = 0; i < d0; ++i) {
@@ -1289,9 +1281,7 @@ static void RunCompactWeightGemmTest(const GetTestModelFn& build, ProviderOption
   provider_options["dump_json_qnn_graph"] = "1";
   provider_options["json_qnn_graph_dir"] = json_dir.string();
 
-  // Graph-boundary quantize/dequantize (AQ in, DQ2 out) stays on CPU (pre-existing
-  // IO placement, backend-agnostic); the grouped core below must be on QNN. AQ/DQ2
-  // placement is deliberately unconstrained.
+  // Boundary Q/DQ stays on CPU (pre-existing IO placement); grouped core must be QNN.
   std::function<void(const Ort::Session&)> checker = [](const Ort::Session& session) {
     std::map<std::string, std::string> node_ep;
     for (const auto& subgraph : session.GetEpGraphAssignmentInfo()) {
@@ -1308,17 +1298,12 @@ static void RunCompactWeightGemmTest(const GetTestModelFn& build, ProviderOption
                   EPVerificationParams{ExpectedEPNodeAssignment::Some,
                                        CosineSimilarityVerifier(0.99f), &checker},
                   OrtLoggingLevel::ORT_LOGGING_LEVEL_ERROR, verify_outputs);
-  // Compact: exactly the two graph-boundary Q/DQ ops stay runtime (AQ in, DQ2 out);
-  // the chain is absorbed and the 512K-elem weight stays INT8 (~0.5 MiB).
-  // Folded it would be 2 MiB of FP32 STATIC.
   AssertOpInQnnGraph(json_dir, "Dequantize", 1);
   AssertOpInQnnGraph(json_dir, "Quantize", 1);
   AssertFp32StaticBytesBelow(json_dir, /*max_bytes*/ 4096);
 }
 
-// Saver twin: structure only (dummy outputs). Runs on x86 CI. transB=1 only:
-// transB=0 with a grouped per-channel weight fragments at build time in the stock
-// Gemm transpose path (pre-existing gap, out of scope for the fold policy).
+// Saver-only structural gate. transB=0 grouped fragments (pre-existing gap, #815).
 TEST_F(QnnCPUBackendTests, GemmU16Act_PerChannelQDQChain_TransB1_SaverMustStayCompact) {
   ProviderOptions provider_options;
   provider_options["backend_type"] = "saver";

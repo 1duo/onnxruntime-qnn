@@ -72,8 +72,6 @@ void AssertNodeNotInQnnGraph(const std::filesystem::path& dump_dir,
 
 namespace {
 
-// Sums FP32 STATIC tensor bytes (type 4 = QNN_TENSOR_TYPE_STATIC,
-// data_type 562 = QNN_DATATYPE_FLOAT_32) in a QNN JSON graph dump.
 size_t SumFp32StaticBytes(const nlohmann::json& root) {
   size_t total_fp32_static_bytes = 0;
   if (root.contains("graph") && root["graph"].contains("tensors")) {

@@ -909,30 +909,11 @@ static std::function<void(const Ort::Session&)> PinQnnNodesOnQnn(int expect_dq, 
   };
 }
 
-// Large-weight materialization policy under test (see qdq_constant_folding.h and the
-// per-channel exemption in the fold guard). Rows: weight-chain topology x consumer.
-//   per-channel chain + float act      -> FOLD to FP32 (no valid quantized lowering;
-//                                         pinned by MustFold below, incl. Above-gate
-//                                         proving the fold materializes).
-//   per-tensor chain (any act)         -> SKIP to runtime Dequantize (pinned by the
-//                                         AboveFoldCutoff tests on CPU and HTP).
-//   per-channel chain + quant act      -> GROUP natively, compact INT8 STATIC
-//                                         (pinned by the Saver twins; Saver-only: the
-//                                         depicted lowering does not validate on HTP).
-//   fp16 act chain / symbolic shapes   -> no QDQ group forms (weight DQs only piggyback
-//                                         on activation-formed groups); falls back.
-//                                         Symbolic shapes never reach QNN at all
-//                                         (EP throws/all-CPU-fallback, proven on a
-//                                         production w4a16 export and synthetics).
-//   direct int8-init DQ + float act      -> standalone, FOLDS (production-carve proven:
-//                                         gate_proj chain lowers to one 12 MiB FP32
-//                                         STATIC consumed directly, no runtime DQ).
-// Weight fusion is deliberately absent: every fusible-looking config is either
-// HTP-invalid (SDK probes) or already grouped (identical graphs with/without fusion).
-// Production census (Qwen3 w4a16 part2, static analysis): all 1625 MatMuls are
-// DQ->MatMul<-DQ with Q-fed chains; activations are u8 per-tensor, weights INT4 or
-// per-tensor; all Q outputs single-consumer; 476 shared DQs are per-tensor weight
-// slots (skip-compact). No per-channel-INT8 residual class exists there.
+// Large-weight policy under test (see qdq_constant_folding.h): per-channel+float-act
+// folds to FP32 (MustFold); per-tensor skips to runtime Dequantize (AboveFoldCutoff,
+// CPU+HTP); per-channel+quant-act groups natively to compact INT8 (Saver twins).
+// No fusion exists: float-act x per-channel is HTP-invalid (SDK probes) and clean
+// chains group without one. Symbolic shapes never reach QNN.
 
 // Builds: w_q0 (int8 init) -> DQ0 -> Q1 -> DQ1 -> MatMul. Qwen-class weight chain:
 // per-channel INT8 quantized along the output dim (axis=1 on [K,N]), with a real
@@ -967,10 +948,8 @@ static GetTestModelFn BuildPerChannelQDQChainMatMulTestCase(int64_t K, int64_t N
   };
 }
 
-// Float activations: no valid quantized-MatMul lowering exists for a float activation
-// with a per-channel weight (proven by SDK backend-validation probes on HTP; CPU
-// rejects all quantized MatMul), so this chain keeps folding to FP32 on every backend.
-// The Saver twin below pins the compact-weights case with quantized activations.
+// No valid quantized lowering for float-act x per-channel weight (SDK probes on HTP;
+// CPU rejects all quantized MatMul): must fold on every backend.
 TEST_F(QnnCPUBackendTests, MatMulf32_PerChannelQDQChain_QwenQProj_MustFold) {
   ProviderOptions provider_options;
   provider_options["backend_type"] = "cpu";
@@ -989,18 +968,13 @@ TEST_F(QnnCPUBackendTests, MatMulf32_PerChannelQDQChain_QwenQProj_MustFold) {
                   /*opset*/ 13,
                   EPVerificationParams{ExpectedEPNodeAssignment::All,
                                        ElementwiseAbsoluteVerifier(1e-2f), &checker});
-  // Folded: no runtime Q/DQ ops (the 1M-elem weight folds to a 4 MiB FP32 STATIC).
   AssertOpInQnnGraph(json_dir, "Dequantize", 0);
   AssertOpInQnnGraph(json_dir, "Quantize", 0);
   AssertOpInQnnGraph(json_dir, "MatMul", 1);
   AssertFp32StaticBytesAbove(json_dir, /*min_bytes*/ 1024 * 1024);
 }
 
-// HTP mirror of the fold above: the same past-budget per-channel chain folds to FP32
-// and executes as a float MatMul on HTP. Cosine similarity (not absolute error):
-// HTP device scheduling is nondeterministic across runs (warmed-up contexts select
-// different kernels), so tight absolute tolerances flake. Calibrated on the x86 HTP
-// sim; re-check margins on silicon (see the calibration protocol in the PR).
+// HTP mirror of MustFold. Cosine: HTP scheduling is nondeterministic; sim-calibrated.
 TEST_F(QnnHTPBackendTests, MatMulf32_PerChannelQDQChain_QwenQProj_MustFold_Htp) {
   ProviderOptions provider_options;
   provider_options["backend_type"] = "htp";
@@ -1025,16 +999,8 @@ TEST_F(QnnHTPBackendTests, MatMulf32_PerChannelQDQChain_QwenQProj_MustFold_Htp) 
   AssertFp32StaticBytesAbove(json_dir, /*min_bytes*/ 1024 * 1024);
 }
 
-// Builds the compact-weight case: uint16 per-tensor activation QDQ around a MatMul whose
-// weight is a per-channel INT8 chain (same Qwen-class chain as above), followed by a
-// uint16 per-tensor Q/DQ pair so the graph output stays float for verification.
-// Past the 1 MiB fold budget: the chain joins the MatMul's QDQ group natively, so the
-// weight lowers to a compact INT8 STATIC (1 MiB) instead of folding to 4 MiB of FP32.
-// No weight fusion is involved: a standalone per-channel chain under a float activation
-// (G1 above) cannot fuse (no valid quantized-MatMul lowering exists there, proven by
-// SDK backend-validation probes), and under quantized activations grouping already
-// delivers the compact lowering (verified: compiled graphs are identical with and
-// without a fusion pass). These tests pin that compactness. Opset 21 for 16-bit Q/DQ.
+// Quant-act chain absorbed into the consumer QDQ group: compact INT8 STATIC, no fusion.
+// Opset 21 for 16-bit Q/DQ.
 static GetTestModelFn BuildCompactWeightQDQMatMulTestCase(int64_t K, int64_t N) {
   return [K, N](ModelTestBuilder& builder) {
     builder.MakeInput<float>("input", {1, K}, -0.1f, 0.1f);
@@ -1082,9 +1048,7 @@ static void RunCompactWeightMatMulTest(const GetTestModelFn& build, ProviderOpti
   provider_options["dump_json_qnn_graph"] = "1";
   provider_options["json_qnn_graph_dir"] = json_dir.string();
 
-  // Graph-boundary quantize/dequantize (AQ in, DQ2 out) stays on CPU (pre-existing
-  // IO placement, backend-agnostic); the grouped core below must be on QNN. AQ/DQ2
-  // placement is deliberately unconstrained.
+  // Boundary Q/DQ stays on CPU (pre-existing IO placement); grouped core must be QNN.
   std::function<void(const Ort::Session&)> checker = [](const Ort::Session& session) {
     std::map<std::string, std::string> node_ep;
     for (const auto& subgraph : session.GetEpGraphAssignmentInfo()) {
@@ -1101,22 +1065,14 @@ static void RunCompactWeightMatMulTest(const GetTestModelFn& build, ProviderOpti
                   EPVerificationParams{ExpectedEPNodeAssignment::Some,
                                        CosineSimilarityVerifier(0.99f), &checker},
                   OrtLoggingLevel::ORT_LOGGING_LEVEL_ERROR, verify_outputs);
-  // Compact: exactly the two graph-boundary Q/DQ ops stay runtime (AQ in, DQ2 out);
-  // the chain is absorbed (no runtime Dequantize for it) and the 1M-elem weight stays
-  // INT8 (~1 MiB). Folded it would be 4 MiB of FP32 STATIC.
   AssertOpInQnnGraph(json_dir, "Dequantize", 1);
   AssertOpInQnnGraph(json_dir, "Quantize", 1);
   AssertOpInQnnGraph(json_dir, "MatMul", 1);
   AssertFp32StaticBytesBelow(json_dir, /*max_bytes*/ 4096);
 }
 
-// Saver twin: Saver stubs backend acceptance (all QNN API calls succeed) and returns
-// dummy outputs, so this gates grouping structure only. There is deliberately no HTP
-// twin: the depicted uint16-activation x int8-per-channel lowering does NOT validate on
-// HTP (SDK probes), and fp16-activation chains do not form QDQ groups (weight DQs only
-// piggyback on activation-formed groups), so no HTP-executable large-int8-chain
-// topology exists. HTP execution is covered for the skip path by the test below.
-// Runs on x86 CI.
+// Saver-only structural gate (dummy outputs; runs on x86 CI). No HTP twin: u16-act x
+// int8-per-channel does not validate on HTP (SDK probes); fp16 chains do not group.
 TEST_F(QnnCPUBackendTests, MatMulU16Act_PerChannelQDQChain_QwenQProj_SaverMustStayCompact) {
   ProviderOptions provider_options;
   provider_options["backend_type"] = "saver";
@@ -1162,16 +1118,11 @@ TEST_F(QnnCPUBackendTests, MatMulf32_PerTensorDQConstWeight_AboveFoldCutoff) {
                   /*opset*/ 13,
                   EPVerificationParams{ExpectedEPNodeAssignment::All,
                                        ElementwiseAbsoluteVerifier(1e-2f), &checker});
-  // Skipped: exactly one runtime Dequantize, nothing folded to FP32.
   AssertOpInQnnGraph(json_dir, "Dequantize", 1);
   AssertFp32StaticBytesBelow(json_dir, /*max_bytes*/ 4096);
 }
 
-// HTP mirror of the skip above: per-tensor runtime Dequantize is valid on HTP too,
-// so the same large weight must skip (not fold) and execute there. Cosine similarity
-// (not absolute error): HTP device scheduling is nondeterministic across runs
-// (warmed-up contexts select different kernels), so tight absolute tolerances flake.
-// Calibrated on the x86 HTP sim; re-check margins on silicon.
+// HTP mirror of the skip. Cosine: HTP scheduling is nondeterministic; sim-calibrated.
 TEST_F(QnnHTPBackendTests, MatMulf32_PerTensorDQConstWeight_AboveFoldCutoff_Htp) {
   ProviderOptions provider_options;
   provider_options["backend_type"] = "htp";
@@ -1194,8 +1145,7 @@ TEST_F(QnnHTPBackendTests, MatMulf32_PerTensorDQConstWeight_AboveFoldCutoff_Htp)
   AssertFp32StaticBytesBelow(json_dir, /*max_bytes*/ 4096);
 }
 
-// Shared trailing DQ feeding two MatMuls (production weight-sharing shape, float
-// activations for determinism): cannot be absorbed, folds once to a shared FP32 STATIC.
+// Shared trailing DQ over two MatMuls: cannot be absorbed; folds once (shared blob).
 static GetTestModelFn BuildSharedPerChannelDQChainMatMulTestCase() {
   return [](ModelTestBuilder& builder) {
     constexpr int64_t K = 1024, N = 1024;
@@ -1245,8 +1195,6 @@ TEST_F(QnnCPUBackendTests, MatMulf32_SharedPerChannelDQChain_TwoMatMuls) {
                   /*opset*/ 13,
                   EPVerificationParams{ExpectedEPNodeAssignment::All,
                                        ElementwiseAbsoluteVerifier(1e-2f)});
-  // Folded once and shared: no runtime ops, two MatMuls, exactly one 4 MiB blob
-  // (Above proves materialization, Below proves no duplication).
   AssertOpInQnnGraph(json_dir, "Dequantize", 0);
   AssertOpInQnnGraph(json_dir, "Quantize", 0);
   AssertOpInQnnGraph(json_dir, "MatMul", 2);

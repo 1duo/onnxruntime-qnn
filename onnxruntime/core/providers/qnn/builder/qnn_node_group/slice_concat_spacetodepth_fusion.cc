@@ -368,20 +368,20 @@ Ort::Status SliceConcatSpaceToDepthFusion::IsSupported(QnnModelWrapper& model_wr
   ORT_UNUSED_PARAMETER(logger);
   if (model_wrapper.GetQnnBackendType() != QnnBackendType::HTP &&
       model_wrapper.GetQnnBackendType() != QnnBackendType::HTP_FP16) {
-    return ORT_MAKE_STATUS(ONNXRUNTIME, FAIL, "SliceConcatS2D: HTP only.");
+    return MAKE_EP_FAIL("SliceConcatS2D: HTP only.");
   }
   if (node_units_.size() != kGroupSize || !IsConcatUnit(concat_node_unit_)) {
-    return ORT_MAKE_STATUS(ONNXRUNTIME, FAIL, "SliceConcatS2D: expected 7 units with Concat target.");
+    return MAKE_EP_FAIL("SliceConcatS2D: expected 7 units with Concat target.");
   }
   std::vector<uint32_t> input_shape, output_shape;
   if (!QnnModelWrapper::GetOnnxShape(node_units_[0]->Inputs()[0].shape, input_shape) ||
       !QnnModelWrapper::GetOnnxShape(concat_node_unit_->Outputs()[0].shape, output_shape)) {
-    return ORT_MAKE_STATUS(ONNXRUNTIME, FAIL, "SliceConcatS2D: unresolved shapes.");
+    return MAKE_EP_FAIL("SliceConcatS2D: unresolved shapes.");
   }
   if (input_shape.size() != kNchwRank || output_shape.size() != kNchwRank ||
       std::any_of(input_shape.begin(), input_shape.end(), [](uint32_t dim) { return dim == 0; }) ||
       std::any_of(output_shape.begin(), output_shape.end(), [](uint32_t dim) { return dim == 0; })) {
-    return ORT_MAKE_STATUS(ONNXRUNTIME, FAIL, "SliceConcatS2D: rank-4 non-zero shapes only.");
+    return MAKE_EP_FAIL("SliceConcatS2D: rank-4 non-zero shapes only.");
   }
   return Ort::Status();
 }

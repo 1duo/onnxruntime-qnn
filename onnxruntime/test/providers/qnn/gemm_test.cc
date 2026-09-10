@@ -4,8 +4,11 @@
 #if !defined(ORT_MINIMAL_BUILD)
 
 #include <cassert>
+#include <filesystem>
+#include <map>
 #include <string>
 
+#include "test/providers/qnn/qnn_node_group/qnn_graph_checker.h"
 #include "test/providers/qnn/qnn_test_utils.h"
 
 #include "gtest/gtest.h"
@@ -703,7 +706,7 @@ GetQDQTestCaseFn BuildBQGemmTestCase(int64_t M, int64_t K, int64_t N, int64_t bl
     // ── Gemm ─────────────────────────────────────────────────────────────────
     std::vector<std::string> gemm_inputs = {act_dql_out, "weight_dql_out"};
     std::vector<ONNX_NAMESPACE::AttributeProto> gemm_attrs;
-    gemm_attrs.push_back(builder.MakeScalarAttribute("transB", trans_b));
+    gemm_attrs.push_back(builder.MakeScalarAttribute("transB", int64_t{1}));
     if (trans_a != 0) {
       gemm_attrs.push_back(builder.MakeScalarAttribute("transA", trans_a));
     }
@@ -1225,6 +1228,103 @@ TEST_F(QnnGPUBackendTests, ReshapeGemmFusion) {
 }
 
 #endif  // defined(_M_ARM64) GPU tests
+
+// Builds the compact-weight Gemm case (transB=1): uint16 per-tensor activation QDQ
+// around a Gemm whose weight is a per-channel INT8 chain (int8 init -> DQ -> Q -> DQ),
+// followed by a uint16 per-tensor Q/DQ pair so the graph output stays float for
+// verification. 1024x512 = 512K elems (2 MiB FP32) is past the 1 MiB fold budget.
+// Like MatMul (see BuildCompactWeightQDQMatMulTestCase), the chain joins the Gemm's
+// QDQ group natively and the weight stays a compact INT8 STATIC; no fusion is involved.
+// Opset 21 for 16-bit Q/DQ.
+static GetTestModelFn BuildCompactWeightQDQGemmTestCase(int64_t K, int64_t N) {
+  return [K, N](ModelTestBuilder& builder) {
+    builder.MakeInput<float>("input", {1, K}, -0.1f, 0.1f);
+    builder.MakeInitializer<float>("a_s", {}, {0.01f});
+    builder.MakeInitializer<uint16_t>("a_zp", {}, {0});
+    builder.AddNode("AQ", "QuantizeLinear", {"input", "a_s", "a_zp"}, {"a_q"}, kOnnxDomain);
+    builder.AddNode("ADQ", "DequantizeLinear", {"a_q", "a_s", "a_zp"}, {"a_dq"}, kOnnxDomain);
+    // Two-hop chain from an int8 initializer: ORT constant-folds a Q directly over a
+    // float initializer (which would erase Q1 pre-partition), while DQ nodes are
+    // preserved, so the chain must start quantized to reach the EP intact.
+    // transB=1: stored [N, K], per-channel scales along axis 0.
+    const int64_t d0 = N, d1 = K;
+    std::vector<int8_t> w(static_cast<size_t>(d0 * d1));
+    for (int64_t i = 0; i < d0; ++i) {
+      for (int64_t j = 0; j < d1; ++j) {
+        w[static_cast<size_t>(i * d1 + j)] = static_cast<int8_t>(((i * 31 + j * 17) % 256) - 128);
+      }
+    }
+    builder.MakeInitializer<int8_t>("w_q0", {N, K}, w);
+    builder.MakeInitializer<float>("s0", {N}, std::vector<float>(static_cast<size_t>(N), 0.02f));
+    builder.MakeInitializer<int8_t>("z0", {N}, std::vector<int8_t>(static_cast<size_t>(N), 0));
+    builder.MakeInitializer<float>("s1", {N}, std::vector<float>(static_cast<size_t>(N), 0.05f));
+    builder.MakeInitializer<int8_t>("z1", {N}, std::vector<int8_t>(static_cast<size_t>(N), -2));
+    std::vector<ONNX_NAMESPACE::AttributeProto> axis_attrs;
+    axis_attrs.push_back(builder.MakeScalarAttribute("axis", int64_t{0}));
+    builder.AddNode("DQ0", "DequantizeLinear", {"w_q0", "s0", "z0"}, {"w_dq0"}, kOnnxDomain,
+                    axis_attrs);
+    builder.AddNode("Q1", "QuantizeLinear", {"w_dq0", "s1", "z1"}, {"w_q1"}, kOnnxDomain, axis_attrs);
+    builder.AddNode("DQ1", "DequantizeLinear", {"w_q1", "s1", "z1"}, {"w_dq"}, kOnnxDomain,
+                    axis_attrs);
+    builder.MakeInitializer<float>("bias", {N}, std::vector<float>(static_cast<size_t>(N), 0.1f));
+    builder.MakeOutput("output");
+    std::vector<ONNX_NAMESPACE::AttributeProto> gemm_attrs;
+    gemm_attrs.push_back(builder.MakeScalarAttribute("transB", int64_t{1}));
+    builder.AddNode("Gemm", "Gemm", {"a_dq", "w_dq", "bias"}, {"gemm_out"}, kOnnxDomain, gemm_attrs);
+    builder.MakeInitializer<float>("o_s", {}, {0.05f});
+    builder.MakeInitializer<uint16_t>("o_zp", {}, {0});
+    builder.AddNode("Q2", "QuantizeLinear", {"gemm_out", "o_s", "o_zp"}, {"gemm_q"}, kOnnxDomain);
+    builder.AddNode("DQ2", "DequantizeLinear", {"gemm_q", "o_s", "o_zp"}, {"output"}, kOnnxDomain);
+  };
+}
+
+static void RunCompactWeightGemmTest(const GetTestModelFn& build, ProviderOptions provider_options,
+                                     bool verify_outputs, const std::string& json_tag) {
+  provider_options["offload_graph_io_quantization"] = "0";
+  namespace fs = std::filesystem;
+  const fs::path json_dir = fs::temp_directory_path() / json_tag;
+  std::filesystem::remove_all(json_dir);
+  ASSERT_TRUE(std::filesystem::create_directories(json_dir));
+  auto cleanup = gsl::finally([&json_dir]() { std::filesystem::remove_all(json_dir); });
+  provider_options["dump_json_qnn_graph"] = "1";
+  provider_options["json_qnn_graph_dir"] = json_dir.string();
+
+  // Graph-boundary quantize/dequantize (AQ in, DQ2 out) stays on CPU (pre-existing
+  // IO placement, backend-agnostic); the grouped core below must be on QNN. AQ/DQ2
+  // placement is deliberately unconstrained.
+  std::function<void(const Ort::Session&)> checker = [](const Ort::Session& session) {
+    std::map<std::string, std::string> node_ep;
+    for (const auto& subgraph : session.GetEpGraphAssignmentInfo()) {
+      for (const auto& node : subgraph.GetNodes()) {
+        node_ep[node.GetName()] = subgraph.GetEpName();
+      }
+    }
+    for (const char* n : {"ADQ", "DQ0", "Q1", "DQ1", "Gemm", "Q2"}) {
+      EXPECT_EQ(node_ep[n], kQnnExecutionProvider) << n;
+    }
+  };
+  RunQnnModelTest(build, provider_options,
+                  /*opset*/ 21,
+                  EPVerificationParams{ExpectedEPNodeAssignment::Some,
+                                       CosineSimilarityVerifier(0.99f), &checker},
+                  OrtLoggingLevel::ORT_LOGGING_LEVEL_ERROR, verify_outputs);
+  // Compact: exactly the two graph-boundary Q/DQ ops stay runtime (AQ in, DQ2 out);
+  // the chain is absorbed and the 512K-elem weight stays INT8 (~0.5 MiB).
+  // Folded it would be 2 MiB of FP32 STATIC.
+  AssertOpInQnnGraph(json_dir, "Dequantize", 1);
+  AssertOpInQnnGraph(json_dir, "Quantize", 1);
+  AssertFp32StaticBytesBelow(json_dir, /*max_bytes*/ 4096);
+}
+
+// Saver twin: structure only (dummy outputs). Runs on x86 CI. transB=1 only:
+// transB=0 with a grouped per-channel weight fragments at build time in the stock
+// Gemm transpose path (pre-existing gap, out of scope for the fold policy).
+TEST_F(QnnCPUBackendTests, GemmU16Act_PerChannelQDQChain_TransB1_SaverMustStayCompact) {
+  ProviderOptions provider_options;
+  provider_options["backend_type"] = "saver";
+  RunCompactWeightGemmTest(BuildCompactWeightQDQGemmTestCase(/*K*/ 1024, /*N*/ 512),
+                           provider_options, /*verify_outputs*/ false, "GemmCompactTransB1Saver");
+}
 
 }  // namespace test
 }  // namespace onnxruntime

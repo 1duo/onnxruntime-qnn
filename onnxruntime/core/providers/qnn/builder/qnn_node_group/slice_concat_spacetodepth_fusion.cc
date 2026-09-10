@@ -247,14 +247,15 @@ struct PerTensorQuant {
 Ort::Status AddLayoutTranspose(QnnModelWrapper& model_wrapper, const OrtNodeUnit& concat_unit,
                                const std::string& transpose_name, const std::string& input_name,
                                const std::string& output_name, std::vector<uint32_t> perm, bool validate,
-                               const std::vector<Qnn_Tensor_t>& validated_inputs,
-                               const std::vector<Qnn_Tensor_t>& validated_outputs) {
+                               std::vector<Qnn_Tensor_t> validated_inputs,
+                               std::vector<Qnn_Tensor_t> validated_outputs) {
   QnnParamWrapper perm_param(concat_unit.Index(), transpose_name, QNN_OP_TRANSPOSE_PARAM_PERM,
                              {static_cast<uint32_t>(perm.size())}, std::move(perm));
   if (validate) {
     std::vector<Qnn_Param_t> params{perm_param.GetQnnParam()};
     return model_wrapper.ValidateQnnNode(transpose_name, QNN_OP_PACKAGE_NAME_QTI_AISW, QNN_OP_TRANSPOSE,
-                                         validated_inputs, validated_outputs, std::move(params));
+                                         std::move(validated_inputs), std::move(validated_outputs),
+                                         std::move(params));
   }
   const std::string perm_param_name = perm_param.GetParamTensorName();
   RETURN_IF_NOT(model_wrapper.AddParamWrapper(std::move(perm_param)), "Failed to add transpose perm.");

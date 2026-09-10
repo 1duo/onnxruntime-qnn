@@ -510,7 +510,8 @@ void QnnEp::ParsePerSocHtpConfigs() {
                                   htp_graph_configs_.htp_graph_finalization_opt_mode,
                                   htp_graph_configs_.enable_htp_fp16_precision,
                                   htp_graph_configs_.enable_htp_monolithic_lstm,
-                                  htp_graph_configs_.enable_htp_fp16_clamp_overflow};
+                                  htp_graph_configs_.enable_htp_fp16_clamp_overflow,
+                                  htp_graph_configs_.enable_htp_matmul_lut};
     htp_graph_configs_per_soc_.push_back(std::move(config));
   }
 
@@ -1015,6 +1016,14 @@ QnnEp::QnnEp(QnnEpFactory& factory,
                 "enable_htp_fp16_clamp_overflow was requested but the QNN HTP SDK in use does "
                 "not support it (requires QAIRT >= 2.49). Ignoring.");
   }
+#endif
+
+#if ORT_QNN_HTP_MATMUL_LUT_SUPPORTED
+  htp_graph_configs_.enable_htp_matmul_lut = ParseBoolOption(ort_api,
+                                                             session_options_,
+                                                             FormatEPConfigKey("enable_htp_matmul_lut"),
+                                                             true,
+                                                             logger_);
 #endif
 
   // Try to parse multi-SoC HTP options first. If not multi-SoC htp_arch/soc_model is given, fallback to normal parsing.
@@ -1919,6 +1928,20 @@ void QnnEp::InitQnnHtpGraphConfigs(
       graph_config->customConfig = htp_fp16_clamp_config;
 #endif
     }
+
+#if ORT_QNN_HTP_MATMUL_LUT_SUPPORTED
+    if (configs.enable_htp_matmul_lut) {
+      gsl::not_null<QnnHtpGraph_CustomConfig_t*> matmul_lut_config = configs_builder.PushCustomConfig();
+      matmul_lut_config->option = QNN_HTP_GRAPH_CONFIG_OPTION_FINALIZE_CONFIG;
+      matmul_lut_config->finalizeConfig.key = "enable_matmul_lut";
+      matmul_lut_config->finalizeConfig.value.dataType = QNN_DATATYPE_BOOL_8;
+      matmul_lut_config->finalizeConfig.value.bool8Value = 1;
+
+      gsl::not_null<QnnGraph_Config_t*> graph_config = configs_builder.PushConfig();
+      graph_config->option = QNN_GRAPH_CONFIG_OPTION_CUSTOM;
+      graph_config->customConfig = matmul_lut_config;
+    }
+#endif
   }
 }
 

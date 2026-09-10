@@ -157,7 +157,12 @@ struct StepTwoSlice {
 [[nodiscard]] bool HasExactlyUnitConsumers(const OrtNodeUnit& producer_unit,
                                            const std::vector<const OrtNodeUnit*>& expected_consumer_units,
                                            const NodeToUnitMap& node_to_unit) {
-  const Ort::ConstNode producer_node(&producer_unit.GetNode());
+  // Group output leaves via the Q node for QDQ groups, via the target otherwise.
+  const OrtNode* output_producer = &producer_unit.GetNode();
+  if (producer_unit.UnitType() == OrtNodeUnit::Type::QDQGroup && !producer_unit.GetQNodes().empty()) {
+    output_producer = producer_unit.GetQNodes()[0];
+  }
+  const Ort::ConstNode producer_node(output_producer);
   const std::vector<Ort::ConstValueInfo> producer_outputs = producer_node.GetOutputs();
   if (producer_outputs.size() != 1 || producer_outputs[0].IsGraphOutput()) {
     return false;
@@ -582,6 +587,8 @@ std::unique_ptr<IQnnNodeGroup> SliceConcatSpaceToDepthFusion::TryFusion(
       &width_slices[3]->Outputs()[0],
       &concat_unit.Outputs()[0],
   };
+  // Float S2D-DCR is inaccurate on HTP (AISW-175353; upstream float-DCR tests disabled),
+  // so fuse quantized graphs only. Revisit when the kernel is fixed.
   std::optional<PerTensorQuant> reference_quant;
   for (const OrtNodeUnitIODef* boundary_def : boundary_defs) {
     const auto boundary_quant = GetBoundaryQuant(model_wrapper, *boundary_def);
@@ -593,6 +600,10 @@ std::unique_ptr<IQnnNodeGroup> SliceConcatSpaceToDepthFusion::TryFusion(
     } else if (!HasSameQuant(*reference_quant, *boundary_quant)) {
       return nullptr;
     }
+  }
+
+  if (!reference_quant.has_value() || !reference_quant->quantized) {
+    return nullptr;
   }
 
   const std::array<const OrtNodeUnit*, kGroupSize> focus_group = {

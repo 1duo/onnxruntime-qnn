@@ -121,30 +121,31 @@ void RunFocusFusionTest(const std::filesystem::path& dir, GetTestModelFn model_f
 
 }  // namespace
 
-// YOLOX Focus order: S2D(DCR) + channel Gather restoring exact Concat order.
-TEST_F(QnnHTPBackendTests, FocusSliceConcat_Float_Fused) {
-  SKIP_HTP_TEST_ON_ARCH_LESS_THAN_OR_EQUAL_TO(QNN_HTP_DEVICE_ARCH_V68);
-  RunFocusFusionTest("FocusSliceConcatFloat_HTP", BuildFocusTestCase(false, false), 1, 1);
-}
-
-TEST_F(QnnHTPBackendTests, FocusSliceConcat_Float_Int32Indices_Fused) {
-  SKIP_HTP_TEST_ON_ARCH_LESS_THAN_OR_EQUAL_TO(QNN_HTP_DEVICE_ARCH_V68);
-  RunFocusFusionTest("FocusSliceConcatInt32_HTP",
-                     BuildFocusTestCase(false, false, {"h0w0", "h1w0", "h0w1", "h1w1"},
-                                        IndexElementType::kInt32),
-                     1, 1);
-}
-
+// YOLOX Focus order (the perf defect): S2D(DCR) + channel Gather restoring exact order.
 TEST_F(QnnHTPBackendTests, FocusSliceConcat_QDQ_U16_Fused) {
   SKIP_HTP_TEST_ON_ARCH_LESS_THAN_OR_EQUAL_TO(QNN_HTP_DEVICE_ARCH_V68);
   RunFocusFusionTest("FocusSliceConcatQDQU16_HTP", BuildFocusTestCase(true, true), 1, 1, 3e-2f);
 }
 
-// Canonical DCR order needs no reorder: bare S2D, no Gather.
-TEST_F(QnnHTPBackendTests, FocusSliceConcat_CanonicalOrder_FusedWithoutGather) {
+TEST_F(QnnHTPBackendTests, FocusSliceConcat_QDQ_U16_Int32Indices_Fused) {
   SKIP_HTP_TEST_ON_ARCH_LESS_THAN_OR_EQUAL_TO(QNN_HTP_DEVICE_ARCH_V68);
-  RunFocusFusionTest("FocusSliceConcatCanonical_HTP",
-                     BuildFocusTestCase(false, false, {"h0w0", "h0w1", "h1w0", "h1w1"}), 1, 0);
+  RunFocusFusionTest("FocusSliceConcatQDQU16Int32_HTP",
+                     BuildFocusTestCase(true, true, {"h0w0", "h1w0", "h0w1", "h1w1"},
+                                        IndexElementType::kInt32),
+                     1, 1, 3e-2f);
+}
+
+// Canonical DCR order needs no reorder: bare S2D, no Gather.
+TEST_F(QnnHTPBackendTests, FocusSliceConcat_QDQ_CanonicalOrder_FusedWithoutGather) {
+  SKIP_HTP_TEST_ON_ARCH_LESS_THAN_OR_EQUAL_TO(QNN_HTP_DEVICE_ARCH_V68);
+  RunFocusFusionTest("FocusSliceConcatQDQCanonical_HTP",
+                     BuildFocusTestCase(true, true, {"h0w0", "h0w1", "h1w0", "h1w1"}), 1, 0, 3e-2f);
+}
+
+// Float S2D-DCR is inaccurate on HTP (AISW-175353): fail closed until fixed.
+TEST_F(QnnHTPBackendTests, FocusSliceConcat_Float_NotFused) {
+  SKIP_HTP_TEST_ON_ARCH_LESS_THAN_OR_EQUAL_TO(QNN_HTP_DEVICE_ARCH_V68);
+  RunFocusFusionTest("FocusSliceConcatFloat_HTP", BuildFocusTestCase(false, false), 0, 0);
 }
 
 // Duplicated phase must fail closed (S2D would drop a block).

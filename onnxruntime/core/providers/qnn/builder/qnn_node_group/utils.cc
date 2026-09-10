@@ -501,7 +501,6 @@ std::optional<std::vector<int64_t>> GetTensorShape(const OrtApi& ort_api, const 
 
   return dims;
 }
-}
 
 }  // namespace qnn
 }  // namespace onnxruntime

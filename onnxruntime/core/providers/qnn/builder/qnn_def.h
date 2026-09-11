@@ -33,6 +33,13 @@ namespace qnn {
 // HTP Graph Splitting (Graph Program Executor) requires QAIRT SDK 2.49+.
 // QNN_SDK_VERSION_MAJOR/MINOR are injected by CMake from the SDK version.
 #if defined(QNN_SDK_VERSION_MAJOR) && defined(QNN_SDK_VERSION_MINOR) && \
+    (QNN_SDK_VERSION_MAJOR > 2 || (QNN_SDK_VERSION_MAJOR == 2 && QNN_SDK_VERSION_MINOR >= 51))
+#define ORT_QNN_HTP_MATMUL_LUT_SUPPORTED 1
+#else
+#define ORT_QNN_HTP_MATMUL_LUT_SUPPORTED 0
+#endif
+
+#if defined(QNN_SDK_VERSION_MAJOR) && defined(QNN_SDK_VERSION_MINOR) && \
     (QNN_SDK_VERSION_MAJOR > 2 || (QNN_SDK_VERSION_MAJOR == 2 && QNN_SDK_VERSION_MINOR >= 49))
 #define QNN_HTP_GRAPH_SPLITTING_AVAILABLE
 #endif
@@ -62,6 +69,13 @@ namespace qnn {
 #if QNN_API_VERSION_MAJOR > 2 || \
     (QNN_API_VERSION_MAJOR == 2 && QNN_API_VERSION_MINOR >= 38)
 #define QNN_HTP_GROUP_QUERY_ATTENTION_AVAILABLE
+#endif
+
+// QNN_HTP_CONTEXT_CONFIG_OPTION_REUSED_IO_LIMIT is available from QAIRT 2.45
+// (QNN API 2.34).
+#if QNN_API_VERSION_MAJOR > 2 || \
+    (QNN_API_VERSION_MAJOR == 2 && QNN_API_VERSION_MINOR >= 34)
+#define QNN_HTP_REUSED_IO_LIMIT_AVAILABLE
 #endif
 
 #if defined(_WIN32) && (defined(__aarch64__) || defined(_M_ARM64))
@@ -170,6 +184,7 @@ typedef struct HtpGraphConfigs {
   bool enable_htp_fp16_precision = false;
   bool enable_htp_monolithic_lstm = false;
   bool enable_htp_fp16_clamp_overflow = false;  // Intentionally undocumented; for internal/diagnostic use only.
+  bool enable_htp_matmul_lut = ORT_QNN_HTP_MATMUL_LUT_SUPPORTED;
 } HtpGraphConfigs_t;
 
 enum class QnnBackendType : uint8_t {

@@ -218,7 +218,8 @@ TEST_F(QnnHTPBackendTests, TiledSliceConcat_Float_NotFused) {
 TEST_F(QnnHTPBackendTests, TiledSliceConcat_DuplicatePhase_NotFused) {
   SKIP_HTP_TEST_ON_ARCH_LESS_THAN_OR_EQUAL_TO(QNN_HTP_DEVICE_ARCH_V68);
   RunTiledSliceConcatFusionTest("TiledSliceConcatDuplicate_HTP",
-                                BuildTiledSliceConcatTestCase(false, false, {"h0w0", "h0w0", "h1w0", "h1w1"}), 0, 0);
+                                BuildTiledSliceConcatTestCase(true, true, {"h0w0", "h0w0", "h1w0", "h1w1"}), 0, 0,
+                                3e-2f);
 }
 
 TEST_F(QnnHTPBackendTests, TiledSliceConcat_MismatchedScales_NotFused) {

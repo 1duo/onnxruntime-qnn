@@ -115,7 +115,7 @@ struct SliceTileSpec {
 // ends are only sanity-read here, never trusted for coverage.
 [[nodiscard]] std::optional<SliceTileSpec> ParseSliceTile(
     const QnnModelWrapper& model_wrapper, const OrtNodeUnit& slice_unit) {
-  if (!IsSliceUnit(&slice_unit) || slice_unit.SinceVersion() < 10) {
+  if (!IsSliceUnit(&slice_unit) || slice_unit.SinceVersion() < 10 || slice_unit.Inputs().empty()) {
     return std::nullopt;
   }
   // Parameter initializers hang off the target node even when the Slice is QDQ-wrapped.
@@ -428,14 +428,16 @@ Ort::Status CreateOrValidateTiledGraph(QnnModelWrapper& model_wrapper, const Ort
       std::vector<uint32_t>{output_shape[0], output_shape[2], output_shape[3], output_shape[1]});
 
   const bool needs_gather = dcr_permutation != std::array<int64_t, 4>{0, 1, 2, 3};
-  const std::string gather_input_name = needs_gather ? base_name + "_gather_in" : nhwc_output_name;
   // Gather runs on NCHW channels after PostT (mirrors upstream S2D-then-Gather order).
-  const std::string nchw_s2d_name = needs_gather ? gather_input_name : tiled_output_def.name;
+  // Without a Gather, PostT writes the group output directly; the intermediate must not
+  // be re-declared under that name, or the real (possibly APP_READ) tensor is shadowed.
+  const std::string nchw_s2d_name = needs_gather ? base_name + "_gather_in" : tiled_output_def.name;
 
-  QnnTensorWrapper nchw_s2d_tensor(
-      nchw_s2d_name, QNN_TENSOR_TYPE_NATIVE, tiled_output_info.qnn_data_type,
-      tiled_output_info.quant_param.Copy(),
-      std::vector<uint32_t>(output_shape));
+  std::optional<QnnTensorWrapper> nchw_s2d_tensor;
+  if (needs_gather) {
+    nchw_s2d_tensor.emplace(nchw_s2d_name, QNN_TENSOR_TYPE_NATIVE, tiled_output_info.qnn_data_type,
+                            tiled_output_info.quant_param.Copy(), std::vector<uint32_t>(output_shape));
+  }
 
   std::vector<int32_t> gather_indices;
   if (needs_gather) {
@@ -485,12 +487,13 @@ Ort::Status CreateOrValidateTiledGraph(QnnModelWrapper& model_wrapper, const Ort
     RETURN_IF_ERROR(AddLayoutTranspose(model_wrapper, concat_unit, post_name, nhwc_output_name,
                                        nchw_s2d_name, {0, 3, 1, 2}, /*validate*/ true,
                                        {nhwc_output_tensor.GetQnnTensor()},
-                                       {nchw_s2d_tensor.GetQnnTensor()}));
+                                       {needs_gather ? nchw_s2d_tensor->GetQnnTensor()
+                                                     : tiled_output_tensor.GetQnnTensor()}));
     if (needs_gather) {
       std::vector<Qnn_Param_t> params{gather_axis_param.GetQnnParam()};
       RETURN_IF_ERROR(model_wrapper.ValidateQnnNode(base_name + "_gather", QNN_OP_PACKAGE_NAME_QTI_AISW,
                                                     QNN_OP_GATHER,
-                                                    {nchw_s2d_tensor.GetQnnTensor(),
+                                                    {nchw_s2d_tensor->GetQnnTensor(),
                                                      gather_indices_tensor->GetQnnTensor()},
                                                     {tiled_output_tensor.GetQnnTensor()}, std::move(params)));
     }
@@ -509,8 +512,8 @@ Ort::Status CreateOrValidateTiledGraph(QnnModelWrapper& model_wrapper, const Ort
   RETURN_IF_ERROR(add_tensor_once(std::move(tiled_output_tensor), tiled_output_def.name, "Bad tiled output."));
   RETURN_IF_NOT(model_wrapper.AddTensorWrapper(std::move(nhwc_input_tensor)), "Bad NHWC input.");
   RETURN_IF_NOT(model_wrapper.AddTensorWrapper(std::move(nhwc_output_tensor)), "Bad NHWC S2D output.");
-  RETURN_IF_NOT(model_wrapper.AddTensorWrapper(std::move(nchw_s2d_tensor)), "Bad NCHW S2D output.");
   if (needs_gather) {
+    RETURN_IF_NOT(model_wrapper.AddTensorWrapper(std::move(*nchw_s2d_tensor)), "Bad NCHW S2D output.");
     RETURN_IF_NOT(model_wrapper.AddTensorWrapper(std::move(*gather_indices_tensor)), "Bad Gather indices.");
   }
 
@@ -550,7 +553,6 @@ gsl::span<const OrtNodeUnit* const> SliceConcatSpaceToDepthFusion::GetNodeUnits(
 std::unique_ptr<IQnnNodeGroup> SliceConcatSpaceToDepthFusion::TryFusion(
     QnnModelWrapper& model_wrapper, const OrtNodeUnit& concat_unit, const NodeToUnitMap& node_to_unit,
     const UnitToGroupMap& unit_to_group, const Ort::Logger& logger) {
-  ORT_UNUSED_PARAMETER(logger);
   if (!IsConcatUnit(&concat_unit) || concat_unit.Inputs().size() != 4) {
     return nullptr;
   }
@@ -640,15 +642,22 @@ std::unique_ptr<IQnnNodeGroup> SliceConcatSpaceToDepthFusion::TryFusion(
   }
 
   // Every boundary tensor shares one per-tensor quant; S2D+Gather only rearrange,
-  // so any intermediate requant would be skipped and change numerics.
+  // so any intermediate requant would be skipped and change numerics. Both sides of
+  // each edge are checked: in QDQ graphs a Slice output def and the consuming def
+  // carry their own DQ encodings, so an input-side requant is invisible in the
+  // producer's def alone.
   std::vector<const OrtNodeUnitIODef*> boundary_defs;
-  boundary_defs.reserve(pattern_slices.size() + 2);
+  boundary_defs.reserve(2 * pattern_slices.size() + 6);
   boundary_defs.push_back(&root_owner.Inputs()[0]);
   for (const OrtNodeUnit* slice_unit : pattern_slices) {
-    if (slice_unit->Outputs().empty()) {
+    if (slice_unit->Inputs().empty() || slice_unit->Outputs().empty()) {
       return nullptr;
     }
+    boundary_defs.push_back(&slice_unit->Inputs()[0]);
     boundary_defs.push_back(&slice_unit->Outputs()[0]);
+  }
+  for (const OrtNodeUnitIODef& concat_input : concat_unit.Inputs()) {
+    boundary_defs.push_back(&concat_input);
   }
   boundary_defs.push_back(&concat_unit.Outputs()[0]);
   // Float S2D-DCR is inaccurate on HTP (AISW-175353; upstream float-DCR tests disabled),
@@ -670,10 +679,19 @@ std::unique_ptr<IQnnNodeGroup> SliceConcatSpaceToDepthFusion::TryFusion(
     return nullptr;
   }
 
+  // Validate on the backend before claiming the NodeUnits: a rejection here must leave
+  // the Slices and Concat free to be offloaded individually, and anything that slips
+  // past Phase 1 would abort the whole partition's Compile.
+  if (!CreateOrValidateTiledGraph(model_wrapper, root_owner, concat_unit, dcr_permutation, channels,
+                                  /*validate*/ true, logger)
+           .IsOK()) {
+    return nullptr;
+  }
+
   pattern_slices.push_back(&concat_unit);
   return std::make_unique<SliceConcatSpaceToDepthFusion>(
       gsl::make_span<const OrtNodeUnit* const>(pattern_slices.data(), pattern_slices.size()),
-      dcr_permutation, channels);
+      root_owner, dcr_permutation, channels);
 }
 
 Ort::Status SliceConcatSpaceToDepthFusion::IsSupported(QnnModelWrapper& model_wrapper,
@@ -682,11 +700,12 @@ Ort::Status SliceConcatSpaceToDepthFusion::IsSupported(QnnModelWrapper& model_wr
       model_wrapper.GetQnnBackendType() != QnnBackendType::HTP_FP16) {
     return MAKE_EP_FAIL("SliceConcatS2D: HTP only.");
   }
-  if (node_units_.size() < kMinGroupSize || !IsConcatUnit(concat_node_unit_)) {
+  if (node_units_.size() < kMinGroupSize || !IsConcatUnit(concat_node_unit_) ||
+      root_input_owner_ == nullptr) {
     return MAKE_EP_FAIL("SliceConcatS2D: expected >= 5 units with Concat target.");
   }
   std::vector<uint32_t> input_shape, output_shape;
-  if (!QnnModelWrapper::GetOnnxShape(node_units_[0]->Inputs()[0].shape, input_shape) ||
+  if (!QnnModelWrapper::GetOnnxShape(root_input_owner_->Inputs()[0].shape, input_shape) ||
       !QnnModelWrapper::GetOnnxShape(concat_node_unit_->Outputs()[0].shape, output_shape)) {
     return MAKE_EP_FAIL("SliceConcatS2D: unresolved shapes.");
   }
@@ -696,13 +715,13 @@ Ort::Status SliceConcatSpaceToDepthFusion::IsSupported(QnnModelWrapper& model_wr
     return MAKE_EP_FAIL("SliceConcatS2D: rank-4 non-zero shapes only.");
   }
   ORT_UNUSED_PARAMETER(logger);
-  return CreateOrValidateTiledGraph(model_wrapper, *node_units_[0], *concat_node_unit_, phase_permutation_,
+  return CreateOrValidateTiledGraph(model_wrapper, *root_input_owner_, *concat_node_unit_, phase_permutation_,
                                     channel_count_, /*validate*/ true, logger);
 }
 
 Ort::Status SliceConcatSpaceToDepthFusion::AddToModelBuilder(QnnModelWrapper& model_wrapper,
                                                              const Ort::Logger& logger) const {
-  return CreateOrValidateTiledGraph(model_wrapper, *node_units_[0], *concat_node_unit_, phase_permutation_,
+  return CreateOrValidateTiledGraph(model_wrapper, *root_input_owner_, *concat_node_unit_, phase_permutation_,
                                     channel_count_, /*validate*/ false, logger);
 }
 

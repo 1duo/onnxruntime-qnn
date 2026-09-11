@@ -33,9 +33,12 @@ class SliceConcatSpaceToDepthFusion : public IQnnNodeGroup {
   static constexpr size_t kMinGroupSize = 5;
 
   SliceConcatSpaceToDepthFusion(gsl::span<const OrtNodeUnit* const> tiled_node_units,
+                                const OrtNodeUnit& root_input_owner,
                                 std::array<int64_t, 4> dcr_phase_permutation,
                                 uint32_t input_channels)
-      : phase_permutation_(dcr_phase_permutation), channel_count_(input_channels) {
+      : root_input_owner_(&root_input_owner),
+        phase_permutation_(dcr_phase_permutation),
+        channel_count_(input_channels) {
     node_units_.reserve(tiled_node_units.size());
     for (const OrtNodeUnit* node_unit : tiled_node_units) {
       node_units_.push_back(node_unit);
@@ -60,6 +63,8 @@ class SliceConcatSpaceToDepthFusion : public IQnnNodeGroup {
  private:
   std::vector<const OrtNodeUnit*> node_units_;
   const OrtNodeUnit* concat_node_unit_ = nullptr;
+  // Slice whose input is the shared root tensor; node_units_ order is not meaningful.
+  const OrtNodeUnit* root_input_owner_ = nullptr;
   // Canonical DCR phase index per Concat input; {0,1,2,3} needs no Gather.
   std::array<int64_t, 4> phase_permutation_{0, 1, 2, 3};
   uint32_t channel_count_ = 0;

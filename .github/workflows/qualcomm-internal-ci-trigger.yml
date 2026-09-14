@@ -42,13 +42,12 @@ concurrency:
 jobs:
   trigger:
     name: Trigger CI from PR comment
-    # Only act on PR comments whose body is exactly "/ci" or starts with "/ci " or "/ci\n".
-    # author_association is a prefilter; the script verifies real write permission.
+    # Cheap prefilter only. Both conditions are re-checked precisely in the script: expression
+    # strings have no escape sequences (so a `'/ci\n'` prefix test is the dead literal `/ci\n`,
+    # not a newline), and author_association does not imply write access.
     if: |
       github.event.issue.pull_request != null &&
-      (github.event.comment.body == '/ci' ||
-       startsWith(github.event.comment.body, '/ci ') ||
-       startsWith(github.event.comment.body, '/ci\n')) &&
+      startsWith(github.event.comment.body, '/ci') &&
       contains(fromJSON('["COLLABORATOR", "MEMBER", "OWNER"]'),
                github.event.comment.author_association)
     permissions:
@@ -66,18 +65,39 @@ jobs:
             const comment = (body) =>
               github.rest.issues.createComment({ owner, repo, issue_number, body });
 
+            // The job `if` is a prefilter: parse the command precisely here. Anything after
+            // `/ci` on the first line must be a commit sha; a malformed argument is rejected
+            // rather than silently treated as an unpinned run.
+            const firstLine = context.payload.comment.body.split(/\r?\n/, 1)[0].trim();
+            if (!/^\/ci(\s|$)/.test(firstLine)) return; // e.g. "/citation", not the command
+            const arg = firstLine.slice('/ci'.length).trim();
+            if (arg && !/^[0-9a-f]{7,40}$/i.test(arg)) {
+              await comment(
+                `⛔ Could not read \`${arg}\` as a commit sha. Use \`/ci\` to run against the ` +
+                'current head, or `/ci <sha>` (7-40 hex chars) to pin a reviewed commit.',
+              );
+              return;
+            }
+
             // author_association in the job `if` does not imply write access: COLLABORATOR
             // includes read/triage-only collaborators and MEMBER is any org member. Check the
             // actual permission level before touching refs or dispatching secrets-bearing work.
-            const perm = await github.rest.repos.getCollaboratorPermissionLevel({
-              owner,
-              repo,
-              username: context.actor,
-            });
-            if (!['admin', 'maintain', 'write'].includes(perm.data.permission)) {
+            // The endpoint 404s for a user with no access at all, which is also "no permission".
+            let permission = 'none';
+            try {
+              const perm = await github.rest.repos.getCollaboratorPermissionLevel({
+                owner,
+                repo,
+                username: context.actor,
+              });
+              permission = perm.data.permission;
+            } catch (e) {
+              if (e.status !== 404) throw e;
+            }
+            if (!['admin', 'maintain', 'write'].includes(permission)) {
               await comment(
                 `⛔ \`/ci\` needs write access to this repository (@${context.actor} has ` +
-                `\`${perm.data.permission}\`).`,
+                `\`${permission}\`).`,
               );
               return;
             }
@@ -97,12 +117,11 @@ jobs:
             // some other repo, and is unreadable (null repo) once a fork is deleted.
             const isFork = headRepo.full_name !== `${owner}/${repo}`;
 
-            // Optional `/ci <sha>` pins the run to the commit the maintainer reviewed, so a push
-            // to the fork between review and comment cannot silently swap the code being run.
-            const requested = (context.payload.comment.body.match(/^\/ci\s+([0-9a-f]{7,40})\b/i) || [])[1];
-            if (requested && !headSha.startsWith(requested.toLowerCase())) {
+            // `/ci <sha>` pins the run to the commit the maintainer reviewed, so a push to the
+            // fork between review and comment cannot silently swap the code being run.
+            if (arg && !headSha.startsWith(arg.toLowerCase())) {
               await comment(
-                `⛔ \`/ci ${requested}\` does not match the current head \`${headSha}\`. ` +
+                `⛔ \`/ci ${arg}\` does not match the current head \`${headSha}\`. ` +
                 'The PR moved; re-review and comment again.',
               );
               return;
@@ -110,10 +129,15 @@ jobs:
 
             let ref = branch;
             let mirrorNote = '';
+            // Everything below talks to the refs/dispatch APIs; the catch at the end reports any
+            // failure back onto the PR (kept unindented to keep this diff readable).
+            try {
             if (isFork) {
-              // Build the mirror tree: fork head tree, with `.github/` taken from this repo's
-              // default branch so only trusted workflow definitions ever run with secrets.
-              const baseBranch = pr.data.base.repo.default_branch;
+              // Build the mirror tree: fork head tree, with `.github/` taken from the PR's own
+              // base branch so only trusted workflow definitions ever run with secrets. Using the
+              // base branch rather than the default branch matters for PRs onto rel-*, whose
+              // pipelines pin different SDK versions and runner labels.
+              const baseBranch = pr.data.base.ref;
               const baseRef = await github.rest.git.getRef({
                 owner,
                 repo,
@@ -199,3 +223,10 @@ jobs:
               `🔄 CI triggered on \`${ref}\`${draftNote} by @${context.actor}.${mirrorNote} ` +
               `[View runs](${runs}).`,
             );
+            } catch (e) {
+              // Mirroring and dispatch can fail for reasons the maintainer cannot see from the
+              // PR (a ruleset blocking ci-fork/*, a ref not yet visible to the dispatch). Say so
+              // on the PR, then fail the run so it is also visible in the Actions tab.
+              await comment(`⛔ \`/ci\` failed: ${e.message}`);
+              throw e;
+            }

@@ -23,6 +23,19 @@ class QnnModelWrapper;
 // W-slices), fused to QNN SpaceToDepth (DCR) + channel Gather. Canonical DCR
 // phase order needs no Gather; any other phase order is restored with a Gather
 // over the 4C channels. Bare S2D alone would silently reorder channels here.
+//
+// Matched pattern (QDQ groups shown as Slice/Concat units):
+//
+//   Parallel (5 units):                Cascaded (7 units):
+//     root ---------------+              root ------+-------+
+//       | Slice(h0w0)     |                | Slice(H0) | Slice(H1)
+//       | Slice(h0w1)     |                | Slice(H0W0/W1) | Slice(H1W0/W1)
+//       | Slice(h1w0)     |                +-------+-------+-------+-------+
+//       | Slice(h1w1)     |                        |       |       |       |
+//       +-------+-------+--+--+                     +-------+-------+-------+
+//               | Concat (axis=1, 4 inputs)                  | Concat (axis=1)
+//               v                                            v
+//   Lowering: PreT(NCHW->NHWC) + S2D(DCR,block=2) + [Gather axis=1] + PostT(NHWC->NCHW).
 class SliceConcatSpaceToDepthFusion : public IQnnNodeGroup {
  public:
   static constexpr uint32_t kBlockHeight = 2;

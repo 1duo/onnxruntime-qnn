@@ -449,18 +449,19 @@ Ort::Status CreateOrValidateTiledGraph(QnnModelWrapper& model_wrapper, const Ort
     std::memcpy(gather_indices_bytes.data(), gather_indices.data(), gather_indices_bytes.size());
   }
   // Static int32 indices (QNN Gather has no int64 static path); built only when reordering.
+  // Gather axis param is also built lazily so the no-Gather (canonical) path creates no Gather params.
   std::optional<QnnTensorWrapper> gather_indices_tensor;
+  std::optional<QnnParamWrapper> gather_axis_param;
   if (needs_gather) {
     gather_indices_tensor.emplace(
         base_name + "_gather_idx", QNN_TENSOR_TYPE_STATIC, QNN_DATATYPE_INT_32, QnnQuantParamsWrapper(),
         std::vector<uint32_t>{static_cast<uint32_t>(gather_indices.size())}, std::move(gather_indices_bytes));
+    Qnn_Scalar_t gather_axis_scalar = QNN_SCALAR_INIT;
+    gather_axis_scalar.dataType = QNN_DATATYPE_INT_32;
+    gather_axis_scalar.int32Value = 1;
+    gather_axis_param.emplace(concat_unit.Index(), base_name + "_gather",
+                              QNN_OP_GATHER_PARAM_AXIS, gather_axis_scalar);
   }
-
-  Qnn_Scalar_t gather_axis_scalar = QNN_SCALAR_INIT;
-  gather_axis_scalar.dataType = QNN_DATATYPE_INT_32;
-  gather_axis_scalar.int32Value = 1;
-  QnnParamWrapper gather_axis_param(concat_unit.Index(), base_name + "_gather",
-                                    QNN_OP_GATHER_PARAM_AXIS, gather_axis_scalar);
 
   std::vector<uint32_t> block_shape{2};
   std::vector<uint32_t> block_data{SliceConcatSpaceToDepthFusion::kBlockHeight,
@@ -490,7 +491,7 @@ Ort::Status CreateOrValidateTiledGraph(QnnModelWrapper& model_wrapper, const Ort
                                        {needs_gather ? nchw_s2d_tensor->GetQnnTensor()
                                                      : tiled_output_tensor.GetQnnTensor()}));
     if (needs_gather) {
-      std::vector<Qnn_Param_t> params{gather_axis_param.GetQnnParam()};
+      std::vector<Qnn_Param_t> params{gather_axis_param->GetQnnParam()};
       RETURN_IF_ERROR(model_wrapper.ValidateQnnNode(base_name + "_gather", QNN_OP_PACKAGE_NAME_QTI_AISW,
                                                     QNN_OP_GATHER,
                                                     {nchw_s2d_tensor->GetQnnTensor(),
@@ -534,8 +535,8 @@ Ort::Status CreateOrValidateTiledGraph(QnnModelWrapper& model_wrapper, const Ort
 
   if (needs_gather) {
     const std::string gather_name = base_name + "_gather";
-    const std::string axis_name = gather_axis_param.GetParamTensorName();
-    RETURN_IF_NOT(model_wrapper.AddParamWrapper(std::move(gather_axis_param)), "Failed to add Gather axis.");
+    const std::string axis_name = gather_axis_param->GetParamTensorName();
+    RETURN_IF_NOT(model_wrapper.AddParamWrapper(std::move(*gather_axis_param)), "Failed to add Gather axis.");
     RETURN_IF_NOT(model_wrapper.CreateQnnNode(gather_name, QNN_OP_PACKAGE_NAME_QTI_AISW, QNN_OP_GATHER,
                                               {nchw_s2d_name, base_name + "_gather_idx"},
                                               {tiled_output_def.name}, {axis_name}, /*validate*/ false),
@@ -556,7 +557,12 @@ std::unique_ptr<IQnnNodeGroup> SliceConcatSpaceToDepthFusion::TryFusion(
   if (!IsConcatUnit(&concat_unit) || concat_unit.Inputs().size() != 4) {
     return nullptr;
   }
-  if (OrtNodeAttrHelper(concat_unit).Get("axis", static_cast<int64_t>(-1)) != kChannelAxis) {
+  // Concat axis may be negative (e.g. -3 == 1 for rank-4); normalize to rank-4 positive.
+  int64_t concat_axis = OrtNodeAttrHelper(concat_unit).Get("axis", static_cast<int64_t>(-1));
+  if (concat_axis < 0) {
+    concat_axis += static_cast<int64_t>(kNchwRank);
+  }
+  if (concat_axis != kChannelAxis) {
     return nullptr;
   }
   if (model_wrapper.GetQnnBackendType() != QnnBackendType::HTP &&

@@ -268,12 +268,13 @@ jobs:
           name: "${{ inputs.target_os }}-${{ inputs.target_arch }}-py${{ inputs.target_py_vsn }}-pdb-zip"
           src_pattern: "${{inputs.target_os}}-${{ inputs.target_arch }}/${{ env.BUILD_CONFIG_DIR }}/dist/onnxruntime-qnn-*-win-*-pdb.zip"
 
-  # Tiered CI: Tier 1 (build, lint, x86_64 unit tests, coverage, ASan) runs on every PR including forks
-  # because it needs no secrets. Tier 2 (cross-runner device tests, QDC hardware tests, wheel smoke) needs
-  # Artifactory/QDC secrets unavailable to forks, so the real test/test-wheel jobs are skipped for fork PRs.
-  # These two stubs carry the same `name:` as the real jobs and stay green (non-blocking) so external
-  # contributions can merge; Tier 2 coverage is enforced at merge time by the merge queue (`merge_group`
-  # runs with secrets) and on demand by a maintainer commenting `/ci` (see qualcomm-internal-ci-trigger.yml).
+  # Tiered CI: Tier 1 (build, lint, x86_64 unit tests, coverage, ASan) runs on every non-draft PR
+  # including forks because it needs no secrets. Tier 2 (cross-runner device tests, QDC hardware tests,
+  # wheel smoke) needs Artifactory/QDC secrets unavailable to forks, so the real test/test-wheel jobs are
+  # skipped for fork PRs. These two stubs carry the same `name:` as the real jobs and stay green
+  # (non-blocking) so external contributions can merge; the fork change is still compiled and unit-tested
+  # pre-merge and the full suite runs post-merge on main. A maintainer can run Tier 2 on demand with `/ci`
+  # (see qualcomm-internal-ci-trigger.yml); merge-queue enforcement is planned but not yet enabled.
   # See CONTRIBUTING.md ("CI for fork pull requests").
   test-fork-stub:
     name: "test-${{inputs.target_os}}-${{inputs.target_arch}}-py${{ inputs.target_py_vsn != 'None' && inputs.target_py_vsn || 'none'}}"
@@ -282,7 +283,7 @@ jobs:
     runs-on: ["self-hosted", "linux", "X64", "Build"]
     timeout-minutes: 10
     steps:
-      - run: echo "Cross-runner device tests need Artifactory secrets, unavailable on fork PRs — deferred to Tier 2 (maintainer '/ci' or merge queue). Tier 1 (build, x86_64 tests, lint) still runs above."
+      - run: echo "Cross-runner device tests need Artifactory secrets, unavailable on fork PRs — skipped here. Tier 1 (build, x86_64 tests, lint) still runs; full suite runs post-merge on main, or on demand via maintainer '/ci'."
         shell: bash
 
   test-wheel-fork-stub:
@@ -292,7 +293,7 @@ jobs:
     runs-on: ["self-hosted", "linux", "X64", "Build"]
     timeout-minutes: 10
     steps:
-      - run: echo "Wheel smoke test needs Artifactory secrets, unavailable on fork PRs — deferred to Tier 2 (maintainer '/ci' or merge queue). The wheel itself is still built above."
+      - run: echo "Wheel smoke test needs Artifactory secrets, unavailable on fork PRs — skipped here. The wheel itself is still built; full suite runs post-merge on main, or on demand via maintainer '/ci'."
         shell: bash
 
   test:

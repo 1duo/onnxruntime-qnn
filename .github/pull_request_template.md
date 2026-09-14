@@ -8,6 +8,7 @@
 - If it fixes an open issue, please link to the issue here. -->
 
 ### Fork PR device coverage
-<!-- Fork PRs automatically get Tier 1 CI (build, x86_64 tests, lint). Device/QDC tests need internal secrets: a maintainer can comment `/ci` for full coverage, otherwise the merge queue validates hardware at merge time. See CONTRIBUTING.md. -->
+Fork PRs automatically get Tier 1 CI (build, x86_64 tests, lint, coverage, ASan). Device/QDC/wheel-smoke tests need internal secrets and report a green placeholder on forks; the full suite runs post-merge on main, or on demand when a maintainer comments `/ci`. See CONTRIBUTING.md ("CI for fork pull requests").
+<!-- Maintainer: after `/ci`, paste the Actions run link here. -->
 
 

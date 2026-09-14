@@ -11,7 +11,7 @@ We're always looking for your help to improve the product (bug fixes, new featur
 
 ## CI for fork pull requests
 
-CI is tiered. **Tier 1** runs on every PR, including forks: all builds, lint, x86_64 unit tests, coverage, and ASan — no secrets needed, so external contributions always get fast feedback and can merge. **Tier 2** (cross-runner device tests, QDC hardware tests, wheel smoke) needs internal Artifactory/QDC secrets unavailable to forks; those jobs report a green placeholder on fork PRs and the coverage is enforced at merge time by the merge queue, or on demand when a maintainer comments `/ci` on the PR.
+CI is tiered. **Tier 1** runs on every non-draft PR, including forks: builds, lint, x86_64 unit tests, coverage, and ASan — no secrets needed, so external contributions always get fast feedback and can merge. **Tier 2** (cross-runner device tests, QDC hardware tests, wheel smoke) needs internal Artifactory/QDC secrets unavailable to forks, so those jobs report a green placeholder on fork PRs. Fork changes are still compiled and unit-tested pre-merge; the full device suite runs post-merge on main. A maintainer can run the full suite on a fork PR on demand by commenting `/ci` (see qualcomm-internal-ci-trigger.yml, which mirrors the fork head into the base repo so `workflow_dispatch` has a valid ref). Merge-queue enforcement at merge time is planned but not yet enabled (no `merge_queue` rule exists, so `merge_group` never fires); enabling it also requires first fixing the required-checks ruleset, which currently contains unexpanded `${{ ... }}` template contexts no job ever reports.
 
 ## Process details
 

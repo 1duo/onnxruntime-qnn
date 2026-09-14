@@ -39,11 +39,15 @@ jobs:
       do_all: true
 
   coverage:
-    if: ${{ github.event_name == 'pull_request' && github.event.pull_request.draft == false }}
+    # Same draft gate as build-and-test-all: non-PR events (push/merge_group/workflow_dispatch)
+    # always run so post-merge, merge-queue, and maintainer `/ci` runs include coverage.
+    # The callee's path filter still reports success when no code changed.
+    if: ${{ github.event_name != 'pull_request' || github.event.pull_request.draft == false }}
     uses: ./.github/workflows/qualcomm-internal-coverage.yml
     secrets: inherit
 
   asan:
-    if: ${{ github.event_name == 'pull_request' && github.event.pull_request.draft == false }}
+    # Same draft gate as build-and-test-all (see above).
+    if: ${{ github.event_name != 'pull_request' || github.event.pull_request.draft == false }}
     uses: ./.github/workflows/qualcomm-internal-asan.yml
     secrets: inherit

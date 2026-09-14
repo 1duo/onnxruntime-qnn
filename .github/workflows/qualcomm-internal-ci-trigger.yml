@@ -2,7 +2,15 @@
 # SPDX-License-Identifier: MIT
 
 # Lets developers trigger CI on a draft PR by commenting "/ci" on the PR.
-# Useful because draft PRs don't auto-trigger CI (see qualcomm-internal-ci.yml).
+# Also lets maintainers run the full (secrets-bearing) suite on fork PRs on demand.
+# Useful because draft PRs don't auto-trigger CI (see qualcomm-internal-ci.yml),
+# and because workflow_dispatch `ref` must be a branch in the base repo, so a fork
+# head branch cannot be dispatched directly (422 "No ref found").
+#
+# Fork support: on a fork PR the job mirrors the fork head SHA into a base-repo
+# branch `ci-fork/pr-<number>` and dispatches on that mirror. Mirroring only happens
+# after the write-level author-association gate below passes, so unprivileged fork
+# contributors cannot trigger secrets-bearing builds by themselves.
 #
 # Any collaborator with write access (COLLABORATOR, MEMBER, OWNER) may trigger.
 # Fork contributors (CONTRIBUTOR, FIRST_TIME_CONTRIBUTOR, etc.) are rejected to
@@ -11,7 +19,7 @@
 name: Qualcomm Internal CI Trigger
 
 permissions:
-  contents: read
+  contents: write # to create/update the ci-fork/pr-<number> mirror branch for fork PRs
   pull-requests: write  # to post the acknowledgement comment
   actions: write        # to dispatch qualcomm-internal-ci.yml via createWorkflowDispatch
 
@@ -37,7 +45,7 @@ jobs:
         uses: actions/github-script@v8
         with:
           script: |
-            // Fetch the PR to get its head branch and draft status.
+            // Fetch the PR to get its head branch, head SHA, fork status, and draft status.
             const pr = await github.rest.pulls.get({
               owner: context.repo.owner,
               repo: context.repo.repo,
@@ -45,15 +53,54 @@ jobs:
             });
 
             const branch = pr.data.head.ref;
+            const headSha = pr.data.head.sha;
+            const isFork = pr.data.head.repo?.fork === true;
             const isDraft = pr.data.draft;
             const prUrl = pr.data.html_url;
 
-            // Dispatch the main CI workflow on the PR's head branch.
+            // workflow_dispatch `ref` must exist in the base repo. A fork head branch does not,
+            // so dispatching `ref: branch` on a fork PR fails with 422 "No ref found" (and on a
+            // name collision would build the wrong code). Mirror the fork head SHA into a
+            // base-repo branch and dispatch on the mirror instead. Internal PRs dispatch directly.
+            let ref = branch;
+            let mirrorNote = '';
+            if (isFork) {
+              ref = `ci-fork/pr-${context.issue.number}`;
+              const refName = `heads/${ref}`;
+              try {
+                await github.rest.git.getRef({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  ref: refName,
+                });
+                await github.rest.git.updateRef({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  ref: refName,
+                  sha: headSha,
+                  force: true,
+                });
+              } catch (e) {
+                if (e.status === 404) {
+                  await github.rest.git.createRef({
+                    owner: context.repo.owner,
+                    repo: context.repo.repo,
+                    ref: `refs/${refName}`,
+                    sha: headSha,
+                  });
+                } else {
+                  throw e;
+                }
+              }
+              mirrorNote = ` (fork head \`${branch}\` mirrored to \`${ref}\`)`;
+            }
+
+            // Dispatch the main CI workflow on the resolved ref.
             await github.rest.actions.createWorkflowDispatch({
               owner: context.repo.owner,
               repo: context.repo.repo,
               workflow_id: 'qualcomm-internal-ci.yml',
-              ref: branch,
+              ref,
             });
 
             // Post an acknowledgement comment so the developer has a clear signal.
@@ -62,5 +109,5 @@ jobs:
               owner: context.repo.owner,
               repo: context.repo.repo,
               issue_number: context.issue.number,
-              body: `🔄 CI triggered on \`${branch}\`${draftNote} by @${context.actor}. Check the [Actions tab](${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions) for progress.`,
+              body: `🔄 CI triggered on \`${ref}\`${draftNote}${mirrorNote} by @${context.actor}. Check the [Actions tab](${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions) for progress.`,
             });

@@ -31,13 +31,17 @@ enum class IndexElementType { kInt64,
 // shares the pattern); concat_order selects the Concat input sequence.
 // multiaxis_slices emits the parallel form (4 dual-axis Slices off the input,
 // as in production exports); otherwise the cascaded form (2 H-slices feeding
-// 4 single-axis W-slices).
+// 4 single-axis W-slices). concat_axis selects the Concat axis (1 or -3).
+// extra_consumer adds a second consumer on one tile to exercise the
+// single-consumer fail-closed gate.
 template <typename QuantType = uint16_t>
 GetTestModelFn BuildTiledSliceConcatTestCase(bool use_qdq, bool use_contrib_qdq,
                                              std::vector<std::string> concat_order = {"h0w0", "h1w0", "h0w1", "h1w1"},
                                              IndexElementType index_type = IndexElementType::kInt64,
                                              bool mismatched_scales = false,
-                                             bool multiaxis_slices = false) {
+                                             bool multiaxis_slices = false,
+                                             int64_t concat_axis = 1,
+                                             bool extra_consumer = false) {
   return [=](ModelTestBuilder& builder) -> void {
     builder.graph_->set_name("tiled_slice_concat_graph");
     const std::vector<int64_t> input_shape{1, 3, 8, 8};
@@ -111,8 +115,14 @@ GetTestModelFn BuildTiledSliceConcatTestCase(bool use_qdq, bool use_contrib_qdq,
                                                        stem_quant.scale * 2.0f, stem_quant.zero_point,
                                                        use_contrib_qdq);
     }
+    // Optional second consumer on one tile: fusion must fail closed rather than
+    // silently drop the extra edge when lowering to S2D.
+    if (extra_consumer) {
+      builder.AddNode("ExtraRelu", "Relu", {"h0w0"}, {"extra_out"}, kOnnxDomain);
+      builder.MakeOutput("extra_out");
+    }
     builder.AddNode("Concat", "Concat", concat_inputs, {"cat_out"}, kOnnxDomain,
-                    {test::MakeAttribute("axis", static_cast<int64_t>(1))});
+                    {test::MakeAttribute("axis", concat_axis)});
 
     std::string tail_in = "cat_out";
     if (use_qdq) {
@@ -227,6 +237,26 @@ TEST_F(QnnHTPBackendTests, TiledSliceConcat_MismatchedScales_NotFused) {
   RunTiledSliceConcatFusionTest("TiledSliceConcatMismatch_HTP",
                                 BuildTiledSliceConcatTestCase(true, true, {"h0w0", "h1w0", "h0w1", "h1w1"},
                                                               IndexElementType::kInt64, /*mismatched_scales=*/true),
+                                0, 0, 3e-2f);
+}
+
+// Negative channel axis (-3 == 1 for rank-4) must fuse identically.
+TEST_F(QnnHTPBackendTests, TiledSliceConcat_QDQ_NegativeAxis_Fused) {
+  SKIP_HTP_TEST_ON_ARCH_LESS_THAN_OR_EQUAL_TO(QNN_HTP_DEVICE_ARCH_V68);
+  RunTiledSliceConcatFusionTest("TiledSliceConcatQDQNegAxis_HTP",
+                                BuildTiledSliceConcatTestCase(true, true, {"h0w0", "h1w0", "h0w1", "h1w1"},
+                                                              IndexElementType::kInt64, false, false,
+                                                              /*concat_axis=*/-3),
+                                1, 1, 3e-2f);
+}
+
+// Extra consumer on a tile must fail closed; lowering to S2D would drop that edge.
+TEST_F(QnnHTPBackendTests, TiledSliceConcat_ExtraConsumer_NotFused) {
+  SKIP_HTP_TEST_ON_ARCH_LESS_THAN_OR_EQUAL_TO(QNN_HTP_DEVICE_ARCH_V68);
+  RunTiledSliceConcatFusionTest("TiledSliceConcatExtraConsumer_HTP",
+                                BuildTiledSliceConcatTestCase(true, true, {"h0w0", "h1w0", "h0w1", "h1w1"},
+                                                              IndexElementType::kInt64, false, false,
+                                                              /*concat_axis=*/1, /*extra_consumer=*/true),
                                 0, 0, 3e-2f);
 }
 

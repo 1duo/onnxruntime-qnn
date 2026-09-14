@@ -9,6 +9,10 @@ We're always looking for your help to improve the product (bug fixes, new featur
 * Make sure your PR adheres to the [PR Guidelines](./docs/PR_Guidelines.md) and [Coding Conventions and Standards](./docs/Coding_Conventions_and_Standards.md) established by the team.
 * If you're unsure about any of the above and want to contribute, you're welcome to [start a discussion](https://github.com/onnxruntime/onnxruntime-qnn/discussions) with the team.
 
+## CI for fork pull requests
+
+CI is tiered. **Tier 1** runs on every PR, including forks: all builds, lint, x86_64 unit tests, coverage, and ASan — no secrets needed, so external contributions always get fast feedback and can merge. **Tier 2** (cross-runner device tests, QDC hardware tests, wheel smoke) needs internal Artifactory/QDC secrets unavailable to forks; those jobs report a green placeholder on fork PRs and the coverage is enforced at merge time by the merge queue, or on demand when a maintainer comments `/ci` on the PR.
+
 ## Process details
 
 Please search the [issue tracker](https://github.com/onnxruntime/onnxruntime-qnn/issues) for a similar idea first: there may already be an issue you can contribute to.

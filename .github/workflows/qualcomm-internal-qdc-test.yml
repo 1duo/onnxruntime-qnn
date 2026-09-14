@@ -50,15 +50,18 @@ env:
   BUILD_ARTIFACTORY_REPO: "${{ secrets.BUILD_ARTIFACTORY_REPO }}"
 
 jobs:
-  # Fork PRs cannot access Artifactory secrets or the QDC API token, so the real test job is skipped for them.
-  # This stub carries the same `name:` and runs only on fork PRs so branch protection sees a green check.
+  # Tiered CI (see CONTRIBUTING.md "CI for fork pull requests"): QDC hardware tests are Tier 2 and need
+  # the QDC API token + Artifactory secrets, unavailable to forks, so the real test job is skipped for them.
+  # This stub carries the same `name:` and stays green (non-blocking) so external contributions can merge;
+  # Tier 2 coverage is enforced at merge time by the merge queue (`merge_group` runs with secrets) and on
+  # demand by a maintainer commenting `/ci` (see qualcomm-internal-ci-trigger.yml).
   test-fork-stub:
     name: "test-${{inputs.target_os}}-${{inputs.target_arch}}-pynone"
     if: ${{ github.event.pull_request.head.repo.fork == true }}
     runs-on: ["self-hosted", "linux", "X64", "Build"]
     timeout-minutes: 10
     steps:
-      - run: echo "QDC device tests skipped on fork PRs (need hardware + Artifactory secrets); change is still compiled, full device suite runs post-merge on main."
+      - run: echo "QDC device tests need hardware + Artifactory secrets, unavailable on fork PRs — deferred to Tier 2 (maintainer '/ci' or merge queue). The change itself is still compiled above."
         shell: bash
 
   test:

@@ -38,18 +38,18 @@ jobs:
     with:
       do_all: true
 
-  # coverage and asan are pre-merge gates: they run on non-draft PRs, in the merge queue, and on a
-  # maintainer `/ci` (a workflow_dispatch on a PR branch or fork mirror). They deliberately do NOT
-  # run on push to main/rel-*, nor on a re-run dispatched on the default branch itself: their
-  # diff-based path filters have nothing to compare against there, so both callees would fall back
-  # to a full build for no added signal over the PR run. Per-file coverage for main comes from the
-  # nightly (nightly_coverage).
+  # coverage and asan are Tier-1 pre-merge gates: non-draft PRs (forks included, since neither
+  # needs secrets) and the merge queue. They deliberately do NOT run on push or workflow_dispatch:
+  # neither has a diff base, so both callees would fall back to a full build. On push to main that
+  # adds nothing over the PR run (per-file coverage for main comes from the nightly), and a
+  # maintainer `/ci` is for the Tier 2 a fork PR could not run — Tier 1 already ran on the PR.
+  # Dispatch either reusable workflow directly from the Actions tab to force a full run.
   coverage:
-    if: ${{ (github.event_name == 'pull_request' && github.event.pull_request.draft == false) || github.event_name == 'merge_group' || (github.event_name == 'workflow_dispatch' && github.ref_name != github.event.repository.default_branch) }}
+    if: ${{ (github.event_name == 'pull_request' && github.event.pull_request.draft == false) || github.event_name == 'merge_group' }}
     uses: ./.github/workflows/qualcomm-internal-coverage.yml
     secrets: inherit
 
   asan:
-    if: ${{ (github.event_name == 'pull_request' && github.event.pull_request.draft == false) || github.event_name == 'merge_group' || (github.event_name == 'workflow_dispatch' && github.ref_name != github.event.repository.default_branch) }}
+    if: ${{ (github.event_name == 'pull_request' && github.event.pull_request.draft == false) || github.event_name == 'merge_group' }}
     uses: ./.github/workflows/qualcomm-internal-asan.yml
     secrets: inherit

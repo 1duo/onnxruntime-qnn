@@ -8,8 +8,9 @@
 #
 # Fork handling. workflow_dispatch resolves BOTH the ref to build and the workflow definitions
 # from the dispatched ref, and a fork head branch does not exist in this repo (dispatching it
-# fails 422 "No ref found"). So a fork PR is mirrored to `ci-fork/pr-<number>-<sha>`: a commit
-# whose tree is the fork's tree with `.github/` replaced by the tree from the PR's base branch, so
+# fails 422 "No ref found"). So a fork PR is mirrored to a branch named
+# `ci-fork/pr-<number>-<fork sha>-<base sha>`, holding a commit whose tree is the fork's tree with
+# `.github/` replaced by the tree from the PR's base branch, so
 # the workflow definitions, permissions and secret plumbing that run are always trusted ones and a
 # fork cannot inject `run:` steps into a secrets-bearing workflow. The base branch is allowlisted
 # to the same refs qualcomm-internal-ci.yml itself runs on. A fork's edits under `.github/` are
@@ -22,8 +23,9 @@
 # is a cheap prefilter only (it reports COLLABORATOR for read-only collaborators and MEMBER for
 # any org member), so the real check is repos.getCollaboratorPermissionLevel below.
 #
-# The mirror ref is per-sha, so a second `/ci` never moves a ref out from under a running job, and
-# the run list for a given ref is unambiguous about which fork commit was tested. Mirror commits
+# The ref name pins both inputs to the mirror, so a second `/ci` creates a new ref rather than
+# moving one out from under a running job, and the run list for a ref is unambiguous about which
+# fork commit was tested against which base. Mirror commits
 # have their own SHA, so Tier 2 results land on the mirror rather than the PR head: they do not
 # overwrite the PR's green Tier-2 placeholders (a fork PR stays mergeable), and are read from the
 # run link in the acknowledgement comment. Stale mirrors are removed by
@@ -45,16 +47,19 @@ concurrency:
 jobs:
   trigger:
     name: Trigger CI from PR comment
-    # Cheap prefilter only. Both conditions are re-checked precisely in the script: expression
-    # strings have no escape sequences (so a `'/ci\n'` prefix test is the dead literal `/ci\n`,
-    # not a newline), and author_association does not imply write access.
+    # Prefilter, so unrelated comments don't claim a runner for a job holding write scopes. The
+    # command must be the whole comment or be followed by a space: expression strings have no
+    # escape sequences, so a newline cannot be matched here (the old `'/ci\n'` test was the dead
+    # literal `/ci\n`). author_association is checked again in the script, where it can be turned
+    # into a real permission lookup.
     if: |
       github.event.issue.pull_request != null &&
-      startsWith(github.event.comment.body, '/ci') &&
+      (github.event.comment.body == '/ci' ||
+       startsWith(github.event.comment.body, '/ci ')) &&
       contains(fromJSON('["COLLABORATOR", "MEMBER", "OWNER"]'),
                github.event.comment.author_association)
     permissions:
-      contents: write       # to create the ci-fork/pr-<number>-<sha> mirror ref for fork PRs
+      contents: write       # to create the ci-fork/pr-<number>-... mirror ref for fork PRs
       pull-requests: write  # to post the acknowledgement comment
       actions: write        # to dispatch qualcomm-internal-ci.yml and cancel superseded runs
     runs-on: ["self-hosted", "X64", "Linux", "Build"]
@@ -199,6 +204,17 @@ jobs:
                     { path: '.github', mode: '040000', type: 'tree', sha: trustedDotGithub.sha },
                   ],
                 });
+                // The trust boundary is createTree replacing the `.github` subtree outright rather
+                // than merging into it (verified against the API: fork-only files under .github/
+                // do not survive). Assert it, so a change in that behaviour fails loudly here
+                // instead of quietly carrying fork-authored files into a privileged run.
+                const mirrored = mirrorTree.data.tree.find((e) => e.path === '.github');
+                if (!mirrored || mirrored.sha !== trustedDotGithub.sha) {
+                  throw new Error(
+                    `Mirror .github is ${mirrored ? mirrored.sha : 'missing'}, expected ` +
+                    `${trustedDotGithub.sha}; refusing to dispatch fork code.`,
+                  );
+                }
                 const mirrorCommit = await github.rest.git.createCommit({
                   owner,
                   repo,
@@ -209,9 +225,13 @@ jobs:
                   parents: [headSha],
                 });
 
-                // Per-sha ref: never force-moves a ref a running job is checking out, and keeps
-                // each run list tied to exactly one fork commit.
-                ref = `ci-fork/pr-${issue_number}-${headSha.slice(0, 12)}`;
+                // The ref name pins both inputs to the mirror — the fork commit and the base
+                // commit the trusted `.github/` came from — so a given ref always denotes the same
+                // content and is never force-moved under a job that is about to check it out.
+                // A repeat `/ci` with both unchanged reuses the existing ref as-is.
+                ref =
+                  `ci-fork/pr-${issue_number}-${headSha.slice(0, 12)}-` +
+                  `${baseRef.data.object.sha.slice(0, 8)}`;
                 try {
                   await github.rest.git.createRef({
                     owner,
@@ -220,14 +240,7 @@ jobs:
                     sha: mirrorCommit.data.sha,
                   });
                 } catch (e) {
-                  if (e.status !== 422) throw e; // already exists: a repeat /ci on the same sha
-                  await github.rest.git.updateRef({
-                    owner,
-                    repo,
-                    ref: `heads/${ref}`,
-                    sha: mirrorCommit.data.sha,
-                    force: true,
-                  });
+                  if (e.status !== 422) throw e; // 422: identical mirror already exists, reuse it
                 }
                 mirrorNote =
                   ` Fork head \`${headSha.slice(0, 10)}\` was mirrored to \`${ref}\` with ` +
@@ -269,7 +282,12 @@ jobs:
             } catch (e) {
               // Failures here (a ruleset blocking ci-fork/*, a transient API error) are otherwise
               // invisible: issue_comment runs are not surfaced as checks on the PR. Say so on the
-              // PR, then fail the run so it also shows in the Actions tab.
-              await comment(`⛔ \`/ci\` failed: ${e.message}`);
+              // PR, then fail the run so it also shows in the Actions tab. Commenting can itself
+              // fail (locked conversation, rate limit); never let that replace the real error.
+              try {
+                await comment(`⛔ \`/ci\` failed: ${e.message}`);
+              } catch (notifyError) {
+                core.warning(`Could not report the failure on the PR: ${notifyError.message}`);
+              }
               throw e;
             }

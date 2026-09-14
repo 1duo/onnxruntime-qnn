@@ -1,7 +1,7 @@
 # Copyright (c) Qualcomm Technologies, Inc. and/or its subsidiaries.
 # SPDX-License-Identifier: MIT
 
-# Deletes the `ci-fork/pr-<number>-<sha>` mirror branches created by
+# Deletes the `ci-fork/pr-<number>-<fork sha>-<base sha>` mirror branches created by
 # qualcomm-internal-ci-trigger.yml when a maintainer runs `/ci` on a fork PR, so mirrored fork code
 # does not accumulate as branches of this repo (visible to every cloner, and re-dispatchable long
 # after the PR closed).
@@ -9,8 +9,9 @@
 # This runs on a schedule rather than on PR close: a Tier-2 device run can outlive the merge of the
 # PR that requested it, and its jobs check out the ref long after they are queued, so deleting on
 # the close transition would fail the run and look like a device regression. A mirror is removed
-# once nothing is running against it and its PR is closed (or, as a backstop, once it is a week old
-# — that also covers a mirror whose PR closed while a run was still in flight).
+# once nothing is running against it and its PR is closed, and unconditionally once it is a week
+# old — the age backstop overrides the other checks so a permanently queued run (offline device
+# runner) cannot pin fork code here forever.
 
 name: Qualcomm Internal CI Mirror Sweep
 
@@ -20,6 +21,11 @@ on:
   schedule:
     - cron: "17 */6 * * *"
   workflow_dispatch:
+
+# A manual sweep and the cron overlapping would race on the same refs.
+concurrency:
+  group: ${{ github.workflow }}
+  cancel-in-progress: false
 
 jobs:
   sweep:
@@ -49,46 +55,61 @@ jobs:
 
             for (const { ref: fullRef, object } of refs) {
               const branch = fullRef.replace(/^refs\/heads\//, '');
-              const prNumber = Number((branch.match(/^ci-fork\/pr-(\d+)-/) || [])[1]);
+              const match = branch.match(/^ci-fork\/pr-(\d+)-/);
+              const prNumber = match ? Number(match[1]) : null;
 
-              // A run checks out the mirror well after it is queued, so never delete while one is
-              // live. Anything still queued/in_progress keeps the mirror alive until the next pass.
-              const runs = await github.rest.actions.listWorkflowRuns({
+              const commit = await github.rest.git.getCommit({
                 owner,
                 repo,
-                workflow_id: 'qualcomm-internal-ci.yml',
-                branch,
-                per_page: 100,
+                commit_sha: object.sha,
               });
-              if (runs.data.workflow_runs.some((r) => r.status !== 'completed')) {
-                core.info(`${branch}: run still active, keeping.`);
-                continue;
-              }
+              const stale =
+                Date.now() - new Date(commit.data.committer.date).getTime() >= STALE_MS;
 
-              let prOpen = false;
-              if (prNumber) {
+              // The age backstop overrides everything below, so a run wedged in `queued` forever
+              // (an offline QDC/Test runner) cannot pin fork code in this repo indefinitely.
+              if (!stale) {
+                // A run checks out the mirror well after it is queued, so never delete while one
+                // is live; it keeps the mirror until a later pass.
+                const runs = await github.rest.actions.listWorkflowRuns({
+                  owner,
+                  repo,
+                  workflow_id: 'qualcomm-internal-ci.yml',
+                  branch,
+                  per_page: 100,
+                });
+                if (runs.data.workflow_runs.some((r) => r.status !== 'completed')) {
+                  core.info(`${branch}: run still active, keeping.`);
+                  continue;
+                }
+
+                // Keep a mirror while its PR is open: the maintainer may still be reading its
+                // results. A name this sweep cannot parse is kept too, rather than deleted on the
+                // first pass, since something outside this feature may own it.
+                if (prNumber === null) {
+                  core.info(`${branch}: cannot resolve a PR number, keeping until stale.`);
+                  continue;
+                }
+                let prOpen = false;
                 try {
                   const pr = await github.rest.pulls.get({ owner, repo, pull_number: prNumber });
                   prOpen = pr.data.state === 'open';
                 } catch (e) {
                   if (e.status !== 404) throw e; // PR gone: treat as closed
                 }
+                if (prOpen) {
+                  core.info(`${branch}: PR #${prNumber} still open, keeping.`);
+                  continue;
+                }
               }
 
-              // Keep a mirror for an open PR: the maintainer may still be reading its results.
-              // The age backstop covers refs whose PR reference cannot be resolved, and mirrors
-              // left behind when a PR closed mid-run.
-              const commit = await github.rest.git.getCommit({
-                owner,
-                repo,
-                commit_sha: object.sha,
-              });
-              const ageMs = Date.now() - new Date(commit.data.committer.date).getTime();
-              if (prOpen && ageMs < STALE_MS) {
-                core.info(`${branch}: PR #${prNumber} still open, keeping.`);
-                continue;
+              // Tolerate a concurrent pass (a manual dispatch overlapping the cron) having already
+              // deleted this ref, so one 404 does not abandon the rest of the sweep.
+              try {
+                await github.rest.git.deleteRef({ owner, repo, ref: `heads/${branch}` });
+                core.info(`Deleted ${branch}${stale ? ' (stale)' : ''}.`);
+              } catch (e) {
+                if (e.status !== 404 && e.status !== 422) throw e;
+                core.info(`${branch}: already gone.`);
               }
-
-              await github.rest.git.deleteRef({ owner, repo, ref: `heads/${branch}` });
-              core.info(`Deleted ${branch}.`);
             }

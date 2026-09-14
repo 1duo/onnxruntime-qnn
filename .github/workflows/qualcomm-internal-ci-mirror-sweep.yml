@@ -31,8 +31,11 @@ jobs:
   sweep:
     name: Delete stale fork CI mirror branches
     permissions:
-      contents: write # to delete ci-fork/* mirror refs
-      actions: read   # to see whether a run is still using a mirror
+      # A permissions block sets every unlisted scope to none, so pull-requests must be listed:
+      # without it pulls.get 403s and the sweep never deletes anything.
+      contents: write      # to delete ci-fork/* mirror refs
+      actions: read        # to see whether a run is still using a mirror
+      pull-requests: read  # to see whether a mirror's PR is still open
     runs-on: ["self-hosted", "X64", "Linux", "Build"]
     steps:
       - name: Delete ci-fork mirrors with no active run
@@ -52,12 +55,17 @@ jobs:
               core.info('No ci-fork/* mirrors present.');
               return;
             }
+            const failures = [];
 
             for (const { ref: fullRef, object } of refs) {
               const branch = fullRef.replace(/^refs\/heads\//, '');
               const match = branch.match(/^ci-fork\/pr-(\d+)-/);
               const prNumber = match ? Number(match[1]) : null;
 
+              // One unhealthy ref (a transient 5xx, a missing scope) must not abandon the rest of
+              // the pass; failures are collected and reported at the end so a permanent problem
+              // shows up as a red sweep rather than a sweep that silently deletes nothing.
+              try {
               const commit = await github.rest.git.getCommit({
                 owner,
                 repo,
@@ -112,4 +120,12 @@ jobs:
                 if (e.status !== 404 && e.status !== 422) throw e;
                 core.info(`${branch}: already gone.`);
               }
+              } catch (e) {
+                failures.push(`${branch}: ${e.message}`);
+                core.warning(`${branch}: skipped this pass (${e.message}).`);
+              }
+            }
+
+            if (failures.length > 0) {
+              core.setFailed(`Could not sweep ${failures.length} mirror(s):\n${failures.join('\n')}`);
             }

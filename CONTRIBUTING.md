@@ -11,7 +11,15 @@ We're always looking for your help to improve the product (bug fixes, new featur
 
 ## CI for fork pull requests
 
-CI is tiered. **Tier 1** runs on every non-draft PR, including forks: builds, lint, x86_64 unit tests, coverage, and ASan — no secrets needed, so external contributions always get fast feedback and can merge. **Tier 2** (cross-runner device tests, QDC hardware tests, wheel smoke) needs internal Artifactory/QDC secrets unavailable to forks, so those jobs report a green placeholder on fork PRs. Fork changes are still compiled and unit-tested pre-merge; the full device suite runs post-merge on main. A maintainer can run the full suite on a fork PR on demand by commenting `/ci` (see qualcomm-internal-ci-trigger.yml, which mirrors the fork head into the base repo so `workflow_dispatch` has a valid ref). Merge-queue enforcement at merge time is planned but not yet enabled (no `merge_queue` rule exists, so `merge_group` never fires); enabling it also requires first fixing the required-checks ruleset, which currently contains unexpanded `${{ ... }}` template contexts no job ever reports.
+CI is tiered, so a fork PR gets everything that can run without internal credentials and is never blocked by what cannot.
+
+**Tier 1 — every non-draft PR, forks included.** Builds for all target platforms, lint, x86_64 unit tests (run on the build runner), coverage, and ASan. None of it needs secrets, so external contributions get the same pre-merge signal as internal ones. Draft PRs run nothing on push; mark the PR ready, or ask a maintainer for `/ci`.
+
+**Tier 2 — cross-runner device tests, QDC hardware tests, wheel smoke.** These hand artifacts between runners through internal Artifactory and need credentials that fork PRs deliberately do not receive, so on a fork PR they report a green placeholder check instead of running. That keeps a fork PR mergeable; the trade-off is that device coverage for a fork change lands **post-merge on main**, where the full suite runs on every push.
+
+**Getting device coverage before merge.** A maintainer can comment `/ci` (or `/ci <sha>` to pin the commit they reviewed) on a fork PR. Because `workflow_dispatch` needs a ref in this repo, the fork head is mirrored to `ci-fork/pr-<number>` as a commit whose `.github/` comes from the default branch — the workflows that run with secrets are always trusted ones. `/ci` still builds and runs the fork's own source and build scripts on internal runners, so it is a deliberate action: read the diff first. Results land on the mirror commit (linked from the acknowledgement comment) rather than on the PR, so they cannot overwrite the placeholder checks. Mirror branches are deleted when the PR closes. A fork's changes under `.github/` are not exercised by `/ci`; those need review by reading, or a maintainer-owned branch.
+
+No merge queue is configured on this repo today, so Tier 2 is not enforced at merge time. Enabling one would also require fixing the required-checks ruleset first: it currently lists context names containing unexpanded `${{ ... }}` expressions that no job ever reports.
 
 ## Process details
 

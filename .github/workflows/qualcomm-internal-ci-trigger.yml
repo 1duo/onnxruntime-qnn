@@ -1,37 +1,49 @@
 # Copyright (c) Qualcomm Technologies, Inc. and/or its subsidiaries.
 # SPDX-License-Identifier: MIT
 
-# Lets developers trigger CI on a draft PR by commenting "/ci" on the PR.
-# Also lets maintainers run the full (secrets-bearing) suite on fork PRs on demand.
-# Useful because draft PRs don't auto-trigger CI (see qualcomm-internal-ci.yml),
-# and because workflow_dispatch `ref` must be a branch in the base repo, so a fork
-# head branch cannot be dispatched directly (422 "No ref found").
+# Lets a maintainer trigger CI by commenting "/ci" (optionally "/ci <sha>") on a PR.
+# Two cases it exists for:
+#   * draft PRs, which don't auto-trigger CI (see qualcomm-internal-ci.yml);
+#   * fork PRs, where Tier 2 (device/QDC/wheel-smoke) is skipped because forks get no secrets.
 #
-# Fork support: on a fork PR the job mirrors the fork head SHA into a base-repo
-# branch `ci-fork/pr-<number>` and dispatches on that mirror. Mirroring only happens
-# after the write-level author-association gate below passes, so unprivileged fork
-# contributors cannot trigger secrets-bearing builds by themselves.
+# Fork handling. workflow_dispatch resolves BOTH the ref to build and the workflow definitions
+# from the dispatched ref, and a fork head branch does not exist in this repo (dispatching it
+# fails 422 "No ref found"). So a fork PR is mirrored to `ci-fork/pr-<number>`: a commit whose
+# tree is the fork's tree with `.github/` replaced by this repo's default-branch `.github/`, so
+# the workflow definitions, permissions and secret plumbing that run are always trusted ones and
+# a fork cannot inject `run:` steps into a secrets-bearing workflow. A fork's edits under
+# `.github/` are therefore NOT exercised by `/ci`; review those by reading the diff.
 #
-# Any collaborator with write access (COLLABORATOR, MEMBER, OWNER) may trigger.
-# Fork contributors (CONTRIBUTOR, FIRST_TIME_CONTRIBUTOR, etc.) are rejected to
-# prevent unprivileged access to internal runners and secrets.
+# What `/ci` still does is build and test the fork's source and build scripts (qcom/, cmake,
+# tests) on internal runners with Artifactory/QDC secrets in the environment. That is inherent
+# to running fork code at all, so `/ci` is a deliberate maintainer action: read the diff first.
+# Only users with write/maintain/admin permission on this repo can trigger it — author_association
+# is a cheap prefilter only (it reports COLLABORATOR for read-only collaborators and MEMBER for
+# any org member), so the real check is repos.getCollaboratorPermissionLevel below.
+#
+# The mirror commit has its own SHA, so Tier 2 results land on the mirror, not on the PR head.
+# They do not overwrite the PR's green Tier-2 placeholders (a fork PR stays mergeable); read them
+# from the run link in the acknowledgement comment. Mirror branches are deleted when the PR
+# closes by qualcomm-internal-ci-trigger-cleanup.yml.
 
 name: Qualcomm Internal CI Trigger
 
-permissions:
-  contents: write # to create/update the ci-fork/pr-<number> mirror branch for fork PRs
-  pull-requests: write  # to post the acknowledgement comment
-  actions: write        # to dispatch qualcomm-internal-ci.yml via createWorkflowDispatch
+permissions: {}
 
 on:
   issue_comment:
     types: [created]
 
+# Serialize per PR so two quick `/ci` comments cannot race on the mirror ref.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.issue.number }}
+  cancel-in-progress: false
+
 jobs:
   trigger:
     name: Trigger CI from PR comment
     # Only act on PR comments whose body is exactly "/ci" or starts with "/ci " or "/ci\n".
-    # Require write-level association so fork contributors cannot trigger builds.
+    # author_association is a prefilter; the script verifies real write permission.
     if: |
       github.event.issue.pull_request != null &&
       (github.event.comment.body == '/ci' ||
@@ -39,75 +51,151 @@ jobs:
        startsWith(github.event.comment.body, '/ci\n')) &&
       contains(fromJSON('["COLLABORATOR", "MEMBER", "OWNER"]'),
                github.event.comment.author_association)
+    permissions:
+      contents: write       # to create/update the ci-fork/pr-<number> mirror ref for fork PRs
+      pull-requests: write  # to post the acknowledgement comment
+      actions: write        # to dispatch qualcomm-internal-ci.yml via createWorkflowDispatch
     runs-on: ["self-hosted", "X64", "Linux", "Build"]
     steps:
       - name: Dispatch CI workflow on PR branch
         uses: actions/github-script@v8
         with:
           script: |
-            // Fetch the PR to get its head branch, head SHA, fork status, and draft status.
-            const pr = await github.rest.pulls.get({
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              pull_number: context.issue.number,
-            });
+            const { owner, repo } = context.repo;
+            const issue_number = context.issue.number;
+            const comment = (body) =>
+              github.rest.issues.createComment({ owner, repo, issue_number, body });
 
+            // author_association in the job `if` does not imply write access: COLLABORATOR
+            // includes read/triage-only collaborators and MEMBER is any org member. Check the
+            // actual permission level before touching refs or dispatching secrets-bearing work.
+            const perm = await github.rest.repos.getCollaboratorPermissionLevel({
+              owner,
+              repo,
+              username: context.actor,
+            });
+            if (!['admin', 'maintain', 'write'].includes(perm.data.permission)) {
+              await comment(
+                `⛔ \`/ci\` needs write access to this repository (@${context.actor} has ` +
+                `\`${perm.data.permission}\`).`,
+              );
+              return;
+            }
+
+            const pr = await github.rest.pulls.get({ owner, repo, pull_number: issue_number });
             const branch = pr.data.head.ref;
             const headSha = pr.data.head.sha;
-            const isFork = pr.data.head.repo?.fork === true;
-            const isDraft = pr.data.draft;
-            const prUrl = pr.data.html_url;
+            const headRepo = pr.data.head.repo; // null when the fork has been deleted
 
-            // workflow_dispatch `ref` must exist in the base repo. A fork head branch does not,
-            // so dispatching `ref: branch` on a fork PR fails with 422 "No ref found" (and on a
-            // name collision would build the wrong code). Mirror the fork head SHA into a
-            // base-repo branch and dispatch on the mirror instead. Internal PRs dispatch directly.
+            if (!headRepo) {
+              await comment(
+                '⛔ Cannot run `/ci`: the head repository of this PR no longer exists.',
+              );
+              return;
+            }
+            // Compare full names rather than head.repo.fork: `fork` is also true for a fork of
+            // some other repo, and is unreadable (null repo) once a fork is deleted.
+            const isFork = headRepo.full_name !== `${owner}/${repo}`;
+
+            // Optional `/ci <sha>` pins the run to the commit the maintainer reviewed, so a push
+            // to the fork between review and comment cannot silently swap the code being run.
+            const requested = (context.payload.comment.body.match(/^\/ci\s+([0-9a-f]{7,40})\b/i) || [])[1];
+            if (requested && !headSha.startsWith(requested.toLowerCase())) {
+              await comment(
+                `⛔ \`/ci ${requested}\` does not match the current head \`${headSha}\`. ` +
+                'The PR moved; re-review and comment again.',
+              );
+              return;
+            }
+
             let ref = branch;
             let mirrorNote = '';
             if (isFork) {
-              ref = `ci-fork/pr-${context.issue.number}`;
+              // Build the mirror tree: fork head tree, with `.github/` taken from this repo's
+              // default branch so only trusted workflow definitions ever run with secrets.
+              const baseBranch = pr.data.base.repo.default_branch;
+              const baseRef = await github.rest.git.getRef({
+                owner,
+                repo,
+                ref: `heads/${baseBranch}`,
+              });
+              const baseCommit = await github.rest.git.getCommit({
+                owner,
+                repo,
+                commit_sha: baseRef.data.object.sha,
+              });
+              const baseTree = await github.rest.git.getTree({
+                owner,
+                repo,
+                tree_sha: baseCommit.data.tree.sha,
+              });
+              const trustedDotGithub = baseTree.data.tree.find((e) => e.path === '.github');
+              if (!trustedDotGithub) {
+                throw new Error(`No .github tree on ${baseBranch}; refusing to mirror fork code.`);
+              }
+
+              // Fork PR objects are reachable from the base repo, so the fork head commit can be
+              // read and used as base_tree / parent here.
+              const forkCommit = await github.rest.git.getCommit({
+                owner,
+                repo,
+                commit_sha: headSha,
+              });
+              const mirrorTree = await github.rest.git.createTree({
+                owner,
+                repo,
+                base_tree: forkCommit.data.tree.sha,
+                tree: [
+                  { path: '.github', mode: '040000', type: 'tree', sha: trustedDotGithub.sha },
+                ],
+              });
+              const mirrorCommit = await github.rest.git.createCommit({
+                owner,
+                repo,
+                message:
+                  `CI mirror of #${issue_number} at ${headSha} ` +
+                  `(.github from ${baseBranch}), requested by @${context.actor}`,
+                tree: mirrorTree.data.sha,
+                parents: [headSha],
+              });
+
+              ref = `ci-fork/pr-${issue_number}`;
               const refName = `heads/${ref}`;
               try {
-                await github.rest.git.getRef({
-                  owner: context.repo.owner,
-                  repo: context.repo.repo,
-                  ref: refName,
-                });
                 await github.rest.git.updateRef({
-                  owner: context.repo.owner,
-                  repo: context.repo.repo,
+                  owner,
+                  repo,
                   ref: refName,
-                  sha: headSha,
+                  sha: mirrorCommit.data.sha,
                   force: true,
                 });
               } catch (e) {
-                if (e.status === 404) {
-                  await github.rest.git.createRef({
-                    owner: context.repo.owner,
-                    repo: context.repo.repo,
-                    ref: `refs/${refName}`,
-                    sha: headSha,
-                  });
-                } else {
-                  throw e;
-                }
+                if (e.status !== 422 && e.status !== 404) throw e;
+                await github.rest.git.createRef({
+                  owner,
+                  repo,
+                  ref: `refs/${refName}`,
+                  sha: mirrorCommit.data.sha,
+                });
               }
-              mirrorNote = ` (fork head \`${branch}\` mirrored to \`${ref}\`)`;
+              mirrorNote =
+                ` Fork head \`${headSha.slice(0, 10)}\` was mirrored to \`${ref}\` with ` +
+                `\`.github/\` from \`${baseBranch}\`, so results appear on the mirror commit, ` +
+                'not on this PR.';
             }
 
-            // Dispatch the main CI workflow on the resolved ref.
             await github.rest.actions.createWorkflowDispatch({
-              owner: context.repo.owner,
-              repo: context.repo.repo,
+              owner,
+              repo,
               workflow_id: 'qualcomm-internal-ci.yml',
               ref,
             });
 
-            // Post an acknowledgement comment so the developer has a clear signal.
-            const draftNote = isDraft ? ' (draft PR — CI was skipped on push)' : '';
-            await github.rest.issues.createComment({
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              issue_number: context.issue.number,
-              body: `🔄 CI triggered on \`${ref}\`${draftNote}${mirrorNote} by @${context.actor}. Check the [Actions tab](${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions) for progress.`,
-            });
+            const runs =
+              `${context.serverUrl}/${owner}/${repo}/actions/workflows/` +
+              `qualcomm-internal-ci.yml?query=branch%3A${encodeURIComponent(ref)}`;
+            const draftNote = pr.data.draft ? ' (draft PR — CI does not run on push)' : '';
+            await comment(
+              `🔄 CI triggered on \`${ref}\`${draftNote} by @${context.actor}.${mirrorNote} ` +
+              `[View runs](${runs}).`,
+            );

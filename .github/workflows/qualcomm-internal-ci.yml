@@ -38,16 +38,16 @@ jobs:
     with:
       do_all: true
 
+  # coverage and asan are pre-merge gates: they run on non-draft PRs, in the merge queue, and on
+  # maintainer `/ci`. They deliberately do NOT run on push to main/rel-*, where their diff-based
+  # path filters have nothing to compare against and the post-merge signal adds no information
+  # over the PR run; per-file coverage for main is produced by the nightly (nightly_coverage).
   coverage:
-    # Same draft gate as build-and-test-all: non-PR events (push/merge_group/workflow_dispatch)
-    # always run so post-merge, merge-queue, and maintainer `/ci` runs include coverage.
-    # The callee's path filter still reports success when no code changed.
-    if: ${{ github.event_name != 'pull_request' || github.event.pull_request.draft == false }}
+    if: ${{ (github.event_name == 'pull_request' && github.event.pull_request.draft == false) || github.event_name == 'merge_group' || github.event_name == 'workflow_dispatch' }}
     uses: ./.github/workflows/qualcomm-internal-coverage.yml
     secrets: inherit
 
   asan:
-    # Same draft gate as build-and-test-all (see above).
-    if: ${{ github.event_name != 'pull_request' || github.event.pull_request.draft == false }}
+    if: ${{ (github.event_name == 'pull_request' && github.event.pull_request.draft == false) || github.event_name == 'merge_group' || github.event_name == 'workflow_dispatch' }}
     uses: ./.github/workflows/qualcomm-internal-asan.yml
     secrets: inherit

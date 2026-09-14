@@ -25,15 +25,26 @@ jobs:
         run: |
           set -euo pipefail
 
+          # Explicitly requested runs (Actions tab, maintainer `/ci`) always run in full:
+          # there is no PR diff to narrow them down to.
           if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
             echo "run=true" >> "${GITHUB_OUTPUT}"
             exit 0
           fi
 
+          # Resolve the base to diff against. Only pull_request populates github.base_ref;
+          # merge_group carries its base under github.event.merge_group. Any other event has no
+          # diff base, so fail toward running (same bias as build-and-test.yml's path-filter)
+          # rather than erroring out and reporting a red check.
           base_ref="${{ github.base_ref }}"
           if [ -z "${base_ref}" ]; then
-            echo "::error::github.base_ref is empty (event_name=${{ github.event_name }})"
-            exit 1
+            merge_group_base="${{ github.event.merge_group.base_ref }}"
+            base_ref="${merge_group_base#refs/heads/}"
+          fi
+          if [ -z "${base_ref}" ]; then
+            echo "No diff base for event_name=${{ github.event_name }}; running full ASan."
+            echo "run=true" >> "${GITHUB_OUTPUT}"
+            exit 0
           fi
 
           if ! changed=$(git diff --name-only "origin/${base_ref}...HEAD"); then

@@ -8,11 +8,12 @@
 #
 # Fork handling. workflow_dispatch resolves BOTH the ref to build and the workflow definitions
 # from the dispatched ref, and a fork head branch does not exist in this repo (dispatching it
-# fails 422 "No ref found"). So a fork PR is mirrored to `ci-fork/pr-<number>`: a commit whose
-# tree is the fork's tree with `.github/` replaced by this repo's default-branch `.github/`, so
-# the workflow definitions, permissions and secret plumbing that run are always trusted ones and
-# a fork cannot inject `run:` steps into a secrets-bearing workflow. A fork's edits under
-# `.github/` are therefore NOT exercised by `/ci`; review those by reading the diff.
+# fails 422 "No ref found"). So a fork PR is mirrored to `ci-fork/pr-<number>-<sha>`: a commit
+# whose tree is the fork's tree with `.github/` replaced by the tree from the PR's base branch, so
+# the workflow definitions, permissions and secret plumbing that run are always trusted ones and a
+# fork cannot inject `run:` steps into a secrets-bearing workflow. The base branch is allowlisted
+# to the same refs qualcomm-internal-ci.yml itself runs on. A fork's edits under `.github/` are
+# therefore NOT exercised by `/ci`; review those by reading the diff.
 #
 # What `/ci` still does is build and test the fork's source and build scripts (qcom/, cmake,
 # tests) on internal runners with Artifactory/QDC secrets in the environment. That is inherent
@@ -21,10 +22,12 @@
 # is a cheap prefilter only (it reports COLLABORATOR for read-only collaborators and MEMBER for
 # any org member), so the real check is repos.getCollaboratorPermissionLevel below.
 #
-# The mirror commit has its own SHA, so Tier 2 results land on the mirror, not on the PR head.
-# They do not overwrite the PR's green Tier-2 placeholders (a fork PR stays mergeable); read them
-# from the run link in the acknowledgement comment. Mirror branches are deleted when the PR
-# closes by qualcomm-internal-ci-trigger-cleanup.yml.
+# The mirror ref is per-sha, so a second `/ci` never moves a ref out from under a running job, and
+# the run list for a given ref is unambiguous about which fork commit was tested. Mirror commits
+# have their own SHA, so Tier 2 results land on the mirror rather than the PR head: they do not
+# overwrite the PR's green Tier-2 placeholders (a fork PR stays mergeable), and are read from the
+# run link in the acknowledgement comment. Stale mirrors are removed by
+# qualcomm-internal-ci-mirror-sweep.yml.
 
 name: Qualcomm Internal CI Trigger
 
@@ -34,7 +37,7 @@ on:
   issue_comment:
     types: [created]
 
-# Serialize per PR so two quick `/ci` comments cannot race on the mirror ref.
+# Serialize per PR so two quick `/ci` comments are handled in order.
 concurrency:
   group: ${{ github.workflow }}-${{ github.event.issue.number }}
   cancel-in-progress: false
@@ -51,9 +54,9 @@ jobs:
       contains(fromJSON('["COLLABORATOR", "MEMBER", "OWNER"]'),
                github.event.comment.author_association)
     permissions:
-      contents: write       # to create/update the ci-fork/pr-<number> mirror ref for fork PRs
+      contents: write       # to create the ci-fork/pr-<number>-<sha> mirror ref for fork PRs
       pull-requests: write  # to post the acknowledgement comment
-      actions: write        # to dispatch qualcomm-internal-ci.yml via createWorkflowDispatch
+      actions: write        # to dispatch qualcomm-internal-ci.yml and cancel superseded runs
     runs-on: ["self-hosted", "X64", "Linux", "Build"]
     steps:
       - name: Dispatch CI workflow on PR branch
@@ -65,168 +68,208 @@ jobs:
             const comment = (body) =>
               github.rest.issues.createComment({ owner, repo, issue_number, body });
 
-            // The job `if` is a prefilter: parse the command precisely here. Anything after
-            // `/ci` on the first line must be a commit sha; a malformed argument is rejected
-            // rather than silently treated as an unpinned run.
+            // The job `if` is a prefilter: parse the command precisely here. Returning without a
+            // comment keeps unrelated messages (and unprivileged commenters) from making the bot
+            // speak at all.
             const firstLine = context.payload.comment.body.split(/\r?\n/, 1)[0].trim();
             if (!/^\/ci(\s|$)/.test(firstLine)) return; // e.g. "/citation", not the command
             const arg = firstLine.slice('/ci'.length).trim();
-            if (arg && !/^[0-9a-f]{7,40}$/i.test(arg)) {
-              await comment(
-                `⛔ Could not read \`${arg}\` as a commit sha. Use \`/ci\` to run against the ` +
-                'current head, or `/ci <sha>` (7-40 hex chars) to pin a reviewed commit.',
-              );
-              return;
-            }
 
-            // author_association in the job `if` does not imply write access: COLLABORATOR
-            // includes read/triage-only collaborators and MEMBER is any org member. Check the
-            // actual permission level before touching refs or dispatching secrets-bearing work.
-            // The endpoint 404s for a user with no access at all, which is also "no permission".
-            let permission = 'none';
             try {
-              const perm = await github.rest.repos.getCollaboratorPermissionLevel({
-                owner,
-                repo,
-                username: context.actor,
-              });
-              permission = perm.data.permission;
-            } catch (e) {
-              if (e.status !== 404) throw e;
-            }
-            if (!['admin', 'maintain', 'write'].includes(permission)) {
-              await comment(
-                `⛔ \`/ci\` needs write access to this repository (@${context.actor} has ` +
-                `\`${permission}\`).`,
-              );
-              return;
-            }
-
-            const pr = await github.rest.pulls.get({ owner, repo, pull_number: issue_number });
-            const branch = pr.data.head.ref;
-            const headSha = pr.data.head.sha;
-            const headRepo = pr.data.head.repo; // null when the fork has been deleted
-
-            if (!headRepo) {
-              await comment(
-                '⛔ Cannot run `/ci`: the head repository of this PR no longer exists.',
-              );
-              return;
-            }
-            // Compare full names rather than head.repo.fork: `fork` is also true for a fork of
-            // some other repo, and is unreadable (null repo) once a fork is deleted.
-            const isFork = headRepo.full_name !== `${owner}/${repo}`;
-
-            // `/ci <sha>` pins the run to the commit the maintainer reviewed, so a push to the
-            // fork between review and comment cannot silently swap the code being run.
-            if (arg && !headSha.startsWith(arg.toLowerCase())) {
-              await comment(
-                `⛔ \`/ci ${arg}\` does not match the current head \`${headSha}\`. ` +
-                'The PR moved; re-review and comment again.',
-              );
-              return;
-            }
-
-            let ref = branch;
-            let mirrorNote = '';
-            // Everything below talks to the refs/dispatch APIs; the catch at the end reports any
-            // failure back onto the PR (kept unindented to keep this diff readable).
-            try {
-            if (isFork) {
-              // Build the mirror tree: fork head tree, with `.github/` taken from the PR's own
-              // base branch so only trusted workflow definitions ever run with secrets. Using the
-              // base branch rather than the default branch matters for PRs onto rel-*, whose
-              // pipelines pin different SDK versions and runner labels.
-              const baseBranch = pr.data.base.ref;
-              const baseRef = await github.rest.git.getRef({
-                owner,
-                repo,
-                ref: `heads/${baseBranch}`,
-              });
-              const baseCommit = await github.rest.git.getCommit({
-                owner,
-                repo,
-                commit_sha: baseRef.data.object.sha,
-              });
-              const baseTree = await github.rest.git.getTree({
-                owner,
-                repo,
-                tree_sha: baseCommit.data.tree.sha,
-              });
-              const trustedDotGithub = baseTree.data.tree.find((e) => e.path === '.github');
-              if (!trustedDotGithub) {
-                throw new Error(`No .github tree on ${baseBranch}; refusing to mirror fork code.`);
-              }
-
-              // Fork PR objects are reachable from the base repo, so the fork head commit can be
-              // read and used as base_tree / parent here.
-              const forkCommit = await github.rest.git.getCommit({
-                owner,
-                repo,
-                commit_sha: headSha,
-              });
-              const mirrorTree = await github.rest.git.createTree({
-                owner,
-                repo,
-                base_tree: forkCommit.data.tree.sha,
-                tree: [
-                  { path: '.github', mode: '040000', type: 'tree', sha: trustedDotGithub.sha },
-                ],
-              });
-              const mirrorCommit = await github.rest.git.createCommit({
-                owner,
-                repo,
-                message:
-                  `CI mirror of #${issue_number} at ${headSha} ` +
-                  `(.github from ${baseBranch}), requested by @${context.actor}`,
-                tree: mirrorTree.data.sha,
-                parents: [headSha],
-              });
-
-              ref = `ci-fork/pr-${issue_number}`;
-              const refName = `heads/${ref}`;
+              // author_association in the job `if` does not imply write access: COLLABORATOR
+              // includes read/triage-only collaborators and MEMBER is any org member. Check the
+              // real permission level first, before this job echoes any comment content back or
+              // touches refs, so an unprivileged commenter cannot use the bot as a mouthpiece.
+              // The endpoint 404s for a user with no access at all, which is also "no permission".
+              let permission = 'none';
               try {
-                await github.rest.git.updateRef({
+                const perm = await github.rest.repos.getCollaboratorPermissionLevel({
                   owner,
                   repo,
-                  ref: refName,
-                  sha: mirrorCommit.data.sha,
-                  force: true,
+                  username: context.actor,
                 });
+                permission = perm.data.permission;
               } catch (e) {
-                if (e.status !== 422 && e.status !== 404) throw e;
-                await github.rest.git.createRef({
+                if (e.status !== 404) throw e;
+              }
+              if (!['admin', 'write'].includes(permission)) {
+                await comment(
+                  `⛔ \`/ci\` needs write access to this repository (@${context.actor} has ` +
+                  `\`${permission}\`).`,
+                );
+                return;
+              }
+
+              // Anything after `/ci` must be a commit sha. A malformed argument is rejected
+              // rather than silently treated as an unpinned run. Echo it back defanged.
+              if (arg && !/^[0-9a-f]{7,40}$/i.test(arg)) {
+                const shown = arg.replace(/[`\r\n]/g, ' ').slice(0, 40);
+                await comment(
+                  `⛔ Could not read \`${shown}\` as a commit sha. Use \`/ci\` to run against ` +
+                  'the current head, or `/ci <sha>` (7-40 hex chars) to pin a reviewed commit.',
+                );
+                return;
+              }
+
+              const pr = await github.rest.pulls.get({ owner, repo, pull_number: issue_number });
+              if (pr.data.state !== 'open') {
+                // A mirror created here would outlive the close transition the sweep keys on.
+                await comment(`⛔ \`/ci\` only runs on open PRs (this one is ${pr.data.state}).`);
+                return;
+              }
+
+              const branch = pr.data.head.ref;
+              const headSha = pr.data.head.sha;
+              const headRepo = pr.data.head.repo; // null when the fork has been deleted
+              if (!headRepo) {
+                await comment(
+                  '⛔ Cannot run `/ci`: the head repository of this PR no longer exists.',
+                );
+                return;
+              }
+              // Compare full names rather than head.repo.fork: `fork` is also true for a fork of
+              // some other repo, and is unreadable (null repo) once a fork is deleted.
+              const isFork = headRepo.full_name !== `${owner}/${repo}`;
+
+              // `/ci <sha>` pins the run to the commit the maintainer reviewed, so a push to the
+              // fork between review and comment cannot silently swap the code being run. For a
+              // non-fork PR the dispatch is by branch name, which workflow_dispatch re-resolves,
+              // so there the pin is a best-effort check rather than a guarantee.
+              if (arg && !headSha.startsWith(arg.toLowerCase())) {
+                await comment(
+                  `⛔ \`/ci ${arg}\` does not match the current head \`${headSha}\`. ` +
+                  'The PR moved; re-review and comment again.',
+                );
+                return;
+              }
+
+              let ref = branch;
+              let mirrorNote = '';
+              if (isFork) {
+                // The mirror's `.github/` is the trust anchor, so it must come from a branch this
+                // repo actually gates. qualcomm-internal-ci.yml runs on main and rel branches;
+                // allowlist the same set rather than trusting any base a PR happens to target.
+                const baseBranch = pr.data.base.ref;
+                const baseAllowed =
+                  baseBranch === pr.data.base.repo.default_branch ||
+                  /^rel-/.test(baseBranch) ||
+                  /^rel\//.test(baseBranch);
+                if (!baseAllowed) {
+                  await comment(
+                    `⛔ \`/ci\` on a fork PR needs a \`main\` or \`rel-*\` base to take trusted ` +
+                    `workflows from; this PR targets \`${baseBranch}\`.`,
+                  );
+                  return;
+                }
+
+                const baseRef = await github.rest.git.getRef({
                   owner,
                   repo,
-                  ref: `refs/${refName}`,
-                  sha: mirrorCommit.data.sha,
+                  ref: `heads/${baseBranch}`,
                 });
+                const baseCommit = await github.rest.git.getCommit({
+                  owner,
+                  repo,
+                  commit_sha: baseRef.data.object.sha,
+                });
+                const baseTree = await github.rest.git.getTree({
+                  owner,
+                  repo,
+                  tree_sha: baseCommit.data.tree.sha,
+                });
+                const trustedDotGithub = baseTree.data.tree.find((e) => e.path === '.github');
+                if (!trustedDotGithub) {
+                  throw new Error(
+                    `No .github tree on ${baseBranch}; refusing to mirror fork code.`,
+                  );
+                }
+
+                // Fork PR objects are reachable from the base repo, so the fork head commit can
+                // be read and used as base_tree / parent here.
+                const forkCommit = await github.rest.git.getCommit({
+                  owner,
+                  repo,
+                  commit_sha: headSha,
+                });
+                const mirrorTree = await github.rest.git.createTree({
+                  owner,
+                  repo,
+                  base_tree: forkCommit.data.tree.sha,
+                  tree: [
+                    { path: '.github', mode: '040000', type: 'tree', sha: trustedDotGithub.sha },
+                  ],
+                });
+                const mirrorCommit = await github.rest.git.createCommit({
+                  owner,
+                  repo,
+                  message:
+                    `CI mirror of #${issue_number} at ${headSha} ` +
+                    `(.github from ${baseBranch}), requested by @${context.actor}`,
+                  tree: mirrorTree.data.sha,
+                  parents: [headSha],
+                });
+
+                // Per-sha ref: never force-moves a ref a running job is checking out, and keeps
+                // each run list tied to exactly one fork commit.
+                ref = `ci-fork/pr-${issue_number}-${headSha.slice(0, 12)}`;
+                try {
+                  await github.rest.git.createRef({
+                    owner,
+                    repo,
+                    ref: `refs/heads/${ref}`,
+                    sha: mirrorCommit.data.sha,
+                  });
+                } catch (e) {
+                  if (e.status !== 422) throw e; // already exists: a repeat /ci on the same sha
+                  await github.rest.git.updateRef({
+                    owner,
+                    repo,
+                    ref: `heads/${ref}`,
+                    sha: mirrorCommit.data.sha,
+                    force: true,
+                  });
+                }
+                mirrorNote =
+                  ` Fork head \`${headSha.slice(0, 10)}\` was mirrored to \`${ref}\` with ` +
+                  `\`.github/\` from \`${baseBranch}\`, so results appear on the mirror commit, ` +
+                  'not on this PR.';
               }
-              mirrorNote =
-                ` Fork head \`${headSha.slice(0, 10)}\` was mirrored to \`${ref}\` with ` +
-                `\`.github/\` from \`${baseBranch}\`, so results appear on the mirror commit, ` +
-                'not on this PR.';
-            }
 
-            await github.rest.actions.createWorkflowDispatch({
-              owner,
-              repo,
-              workflow_id: 'qualcomm-internal-ci.yml',
-              ref,
-            });
+              // Supersede an earlier `/ci` on the same ref: qualcomm-internal-ci.yml's own
+              // concurrency group falls back to run_id for workflow_dispatch, so it will not
+              // cancel these itself, and two live Tier-2 runs contend for the same device slots.
+              const prior = await github.rest.actions.listWorkflowRuns({
+                owner,
+                repo,
+                workflow_id: 'qualcomm-internal-ci.yml',
+                branch: ref,
+                event: 'workflow_dispatch',
+              });
+              for (const run of prior.data.workflow_runs) {
+                if (run.status !== 'completed') {
+                  await github.rest.actions.cancelWorkflowRun({ owner, repo, run_id: run.id });
+                }
+              }
 
-            const runs =
-              `${context.serverUrl}/${owner}/${repo}/actions/workflows/` +
-              `qualcomm-internal-ci.yml?query=branch%3A${encodeURIComponent(ref)}`;
-            const draftNote = pr.data.draft ? ' (draft PR — CI does not run on push)' : '';
-            await comment(
-              `🔄 CI triggered on \`${ref}\`${draftNote} by @${context.actor}.${mirrorNote} ` +
-              `[View runs](${runs}).`,
-            );
+              await github.rest.actions.createWorkflowDispatch({
+                owner,
+                repo,
+                workflow_id: 'qualcomm-internal-ci.yml',
+                ref,
+              });
+
+              const runs =
+                `${context.serverUrl}/${owner}/${repo}/actions/workflows/` +
+                `qualcomm-internal-ci.yml?query=branch%3A${encodeURIComponent(ref)}`;
+              const draftNote = pr.data.draft ? ' (draft PR — CI does not run on push)' : '';
+              await comment(
+                `🔄 CI triggered on \`${ref}\`${draftNote} by @${context.actor}.${mirrorNote} ` +
+                `[View runs](${runs}).`,
+              );
             } catch (e) {
-              // Mirroring and dispatch can fail for reasons the maintainer cannot see from the
-              // PR (a ruleset blocking ci-fork/*, a ref not yet visible to the dispatch). Say so
-              // on the PR, then fail the run so it is also visible in the Actions tab.
+              // Failures here (a ruleset blocking ci-fork/*, a transient API error) are otherwise
+              // invisible: issue_comment runs are not surfaced as checks on the PR. Say so on the
+              // PR, then fail the run so it also shows in the Actions tab.
               await comment(`⛔ \`/ci\` failed: ${e.message}`);
               throw e;
             }

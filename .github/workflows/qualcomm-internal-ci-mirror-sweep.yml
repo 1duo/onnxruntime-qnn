@@ -9,9 +9,12 @@
 # This runs on a schedule rather than on PR close: a Tier-2 device run can outlive the merge of the
 # PR that requested it, and its jobs check out the ref long after they are queued, so deleting on
 # the close transition would fail the run and look like a device regression. A mirror is removed
-# once nothing is running against it and its PR is closed, and unconditionally once it is a week
-# old — the age backstop overrides the other checks so a permanently queued run (offline device
-# runner) cannot pin fork code here forever.
+# once nothing is running against it and its PR is closed, and unconditionally once it has gone a
+# week unused — the age backstop overrides the other checks so a permanently queued run (offline
+# device runner) cannot pin fork code here forever.
+#
+# qualcomm-internal-ci-trigger.yml already deletes the mirrors a new `/ci` supersedes, so in
+# practice this handles the ones left behind by a closed PR or an abandoned run.
 
 name: Qualcomm Internal CI Mirror Sweep
 
@@ -59,8 +62,15 @@ jobs:
 
             for (const { ref: fullRef, object } of refs) {
               const branch = fullRef.replace(/^refs\/heads\//, '');
-              const match = branch.match(/^ci-fork\/pr-(\d+)-/);
-              const prNumber = match ? Number(match[1]) : null;
+              // Only names this feature creates are swept, however old: something outside it may
+              // own another `ci-fork/*` ref, and the age backstop must not become a way to delete
+              // refs this sweep cannot reason about.
+              const match = branch.match(/^ci-fork\/pr-(\d+)(?:-|$)/);
+              if (!match) {
+                core.info(`${branch}: not a mirror this sweep owns, leaving it alone.`);
+                continue;
+              }
+              const prNumber = Number(match[1]);
 
               // One unhealthy ref (a transient 5xx, a missing scope) must not abandon the rest of
               // the pass; failures are collected and reported at the end so a permanent problem
@@ -71,33 +81,36 @@ jobs:
                 repo,
                 commit_sha: object.sha,
               });
-              const stale =
-                Date.now() - new Date(commit.data.committer.date).getTime() >= STALE_MS;
+              const runs = await github.rest.actions.listWorkflowRuns({
+                owner,
+                repo,
+                workflow_id: 'qualcomm-internal-ci.yml',
+                branch,
+                per_page: 100,
+              });
+
+              // Age is measured from the last time the mirror was used, not from when it was
+              // created: a repeat `/ci` with the same fork and base commits reuses the existing
+              // ref, so keying on the commit date alone would let the backstop delete a ref out
+              // from under a run dispatched days later.
+              const lastUsed = Math.max(
+                new Date(commit.data.committer.date).getTime(),
+                ...runs.data.workflow_runs.map((r) => new Date(r.created_at).getTime()),
+              );
+              const stale = Date.now() - lastUsed >= STALE_MS;
 
               // The age backstop overrides everything below, so a run wedged in `queued` forever
               // (an offline QDC/Test runner) cannot pin fork code in this repo indefinitely.
               if (!stale) {
                 // A run checks out the mirror well after it is queued, so never delete while one
                 // is live; it keeps the mirror until a later pass.
-                const runs = await github.rest.actions.listWorkflowRuns({
-                  owner,
-                  repo,
-                  workflow_id: 'qualcomm-internal-ci.yml',
-                  branch,
-                  per_page: 100,
-                });
                 if (runs.data.workflow_runs.some((r) => r.status !== 'completed')) {
                   core.info(`${branch}: run still active, keeping.`);
                   continue;
                 }
 
                 // Keep a mirror while its PR is open: the maintainer may still be reading its
-                // results. A name this sweep cannot parse is kept too, rather than deleted on the
-                // first pass, since something outside this feature may own it.
-                if (prNumber === null) {
-                  core.info(`${branch}: cannot resolve a PR number, keeping until stale.`);
-                  continue;
-                }
+                // results.
                 let prOpen = false;
                 try {
                   const pr = await github.rest.pulls.get({ owner, repo, pull_number: prNumber });

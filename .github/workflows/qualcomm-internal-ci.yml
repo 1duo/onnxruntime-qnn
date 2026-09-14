@@ -19,6 +19,11 @@ on:
 
   # Allow this workflow to be run manually from the Actions tab
   workflow_dispatch:
+    inputs:
+      full_tier1:
+        description: "Also run coverage and ASan (full build: a dispatch has no diff base)"
+        type: boolean
+        default: false
 
 # only one active job per PR. this will cause jobs to be immediately cancelled on subsequent pushes in PRs.
 # ref: https://docs.github.com/en/actions/using-jobs/using-concurrency#example-using-a-fallback-value
@@ -39,17 +44,19 @@ jobs:
       do_all: true
 
   # coverage and asan are Tier-1 pre-merge gates: non-draft PRs (forks included, since neither
-  # needs secrets) and the merge queue. They deliberately do NOT run on push or workflow_dispatch:
-  # neither has a diff base, so both callees would fall back to a full build. On push to main that
-  # adds nothing over the PR run (per-file coverage for main comes from the nightly), and a
-  # maintainer `/ci` is for the Tier 2 a fork PR could not run — Tier 1 already ran on the PR.
-  # Dispatch either reusable workflow directly from the Actions tab to force a full run.
+  # needs secrets), the merge queue, and any dispatch that asks for them. They do not run on push,
+  # nor on a plain dispatch: neither has a diff base, so both callees fall back to a full build, and
+  # on push to main that adds nothing over the PR run (per-file coverage for main comes from the
+  # nightly). `/ci` sets full_tier1 for a draft PR, where nothing has run on push yet, and leaves it
+  # off for a ready PR, which already got Tier 1 — the point of `/ci` there is Tier 2.
+  # format() rather than a bare comparison: the value is a boolean by dispatch input type but a
+  # string over the REST API.
   coverage:
-    if: ${{ (github.event_name == 'pull_request' && github.event.pull_request.draft == false) || github.event_name == 'merge_group' }}
+    if: ${{ (github.event_name == 'pull_request' && github.event.pull_request.draft == false) || github.event_name == 'merge_group' || (github.event_name == 'workflow_dispatch' && format('{0}', inputs.full_tier1) == 'true') }}
     uses: ./.github/workflows/qualcomm-internal-coverage.yml
     secrets: inherit
 
   asan:
-    if: ${{ (github.event_name == 'pull_request' && github.event.pull_request.draft == false) || github.event_name == 'merge_group' }}
+    if: ${{ (github.event_name == 'pull_request' && github.event.pull_request.draft == false) || github.event_name == 'merge_group' || (github.event_name == 'workflow_dispatch' && format('{0}', inputs.full_tier1) == 'true') }}
     uses: ./.github/workflows/qualcomm-internal-asan.yml
     secrets: inherit

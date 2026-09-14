@@ -85,7 +85,11 @@ jobs:
               // includes read/triage-only collaborators and MEMBER is any org member. Check the
               // real permission level first, before this job echoes any comment content back or
               // touches refs, so an unprivileged commenter cannot use the bot as a mouthpiece.
-              // The endpoint 404s for a user with no access at all, which is also "no permission".
+              // Observed behaviour of the endpoint: 200 with `read` for a non-collaborator of a
+              // public repo, 404 only when the username is not a GitHub user, and 403 when the
+              // caller itself lacks push access. Only 404 is treated as "no permission"; a 403
+              // means this check cannot be performed and must fail loudly rather than lock every
+              // maintainer out with a message blaming their access.
               let permission = 'none';
               try {
                 const perm = await github.rest.repos.getCollaboratorPermissionLevel({
@@ -95,6 +99,12 @@ jobs:
                 });
                 permission = perm.data.permission;
               } catch (e) {
+                if (e.status === 403) {
+                  throw new Error(
+                    'GITHUB_TOKEN cannot read collaborator permissions for this repository ' +
+                    `(${e.message}); \`/ci\` cannot authorize anyone until that is fixed.`,
+                  );
+                }
                 if (e.status !== 404) throw e;
               }
               if (!['admin', 'write'].includes(permission)) {
@@ -294,19 +304,43 @@ jobs:
                   event: 'workflow_dispatch',
                   per_page: 100,
                 });
+                let cancelled = 0;
                 for (const run of prior.data.workflow_runs) {
-                  if (run.status !== 'completed') {
+                  if (run.status === 'completed') continue;
+                  try {
                     await github.rest.actions.cancelWorkflowRun({ owner, repo, run_id: run.id });
+                    cancelled += 1;
                     core.info(`Cancelled superseded run ${run.id} on ${staleRef}.`);
+                  } catch (e) {
+                    // A run that completed between the list and the cancel answers 409; that is
+                    // the outcome this loop wanted, so it must not abort the dispatch below.
+                    if (e.status !== 409 && e.status !== 404) throw e;
+                    core.info(`Superseded run ${run.id} on ${staleRef} had already finished.`);
+                  }
+                }
+
+                // Drop a mirror nothing will run on again, so fork code does not accumulate as
+                // branches for the life of a long-lived PR. A run cancelled just now may still be
+                // tearing down and reading the ref, so leave those to the sweep.
+                if (isFork && staleRef !== ref && cancelled === 0) {
+                  try {
+                    await github.rest.git.deleteRef({ owner, repo, ref: `heads/${staleRef}` });
+                    core.info(`Deleted superseded mirror ${staleRef}.`);
+                  } catch (e) {
+                    if (e.status !== 404 && e.status !== 422) throw e;
                   }
                 }
               }
 
+              // A draft PR has never run Tier 1 on push, so `/ci` there must also run coverage and
+              // ASan. Only send the input when it is needed: a non-draft dispatch stays compatible
+              // with branches whose qualcomm-internal-ci.yml predates the input.
               await github.rest.actions.createWorkflowDispatch({
                 owner,
                 repo,
                 workflow_id: 'qualcomm-internal-ci.yml',
                 ref,
+                ...(pr.data.draft ? { inputs: { full_tier1: 'true' } } : {}),
               });
 
               const runs =

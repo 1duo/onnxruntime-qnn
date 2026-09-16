@@ -41,7 +41,9 @@ GetTestModelFn BuildTiledSliceConcatTestCase(bool use_qdq, bool use_contrib_qdq,
                                              bool mismatched_scales = false,
                                              bool multiaxis_slices = false,
                                              int64_t concat_axis = 1,
-                                             bool extra_consumer = false) {
+                                             bool extra_consumer = false,
+                                             bool cropped_parent_width = false,
+                                             bool omit_slice_axes = false) {
   return [=](ModelTestBuilder& builder) -> void {
     builder.graph_->set_name("tiled_slice_concat_graph");
     const std::vector<int64_t> input_shape{1, 3, 8, 8};
@@ -91,7 +93,7 @@ GetTestModelFn BuildTiledSliceConcatTestCase(bool use_qdq, bool use_contrib_qdq,
           builder.Make1DInitializer<int32_t>(name + "_steps", {1, 1, 2, 2});
         }
         builder.AddNode(name, "Slice",
-                        {stem_in, name + "_starts", name + "_ends", name + "_axes", name + "_steps"},
+                        {stem_in, name + "_starts", name + "_ends", omit_slice_axes ? "" : name + "_axes", name + "_steps"},
                         {output}, kOnnxDomain);
       };
       add_tile("SliceH0W0", 0, 0, "h0w0");
@@ -101,8 +103,23 @@ GetTestModelFn BuildTiledSliceConcatTestCase(bool use_qdq, bool use_contrib_qdq,
     } else {
       add_slice("SliceH0", stem_in, 2, 0, 8, "h0");
       add_slice("SliceH1", stem_in, 2, 1, 8, "h1");
-      add_slice("SliceH0W0", "h0", 3, 0, 8, "h0w0");
-      add_slice("SliceH1W0", "h1", 3, 0, 8, "h1w0");
+      if (cropped_parent_width) {
+        for (int64_t h = 0; h < 2; ++h) {
+          const std::string name = "SliceCroppedH" + std::to_string(h);
+          builder.Make1DInitializer<int64_t>(name + "_starts", {h, 1});
+          builder.Make1DInitializer<int64_t>(name + "_ends", {8, 8});
+          builder.Make1DInitializer<int64_t>(name + "_axes", {2, 3});
+          builder.Make1DInitializer<int64_t>(name + "_steps", {2, 1});
+          builder.AddNode(name, "Slice",
+                          {stem_in, name + "_starts", name + "_ends", name + "_axes", name + "_steps"},
+                          {name + "_out"}, kOnnxDomain);
+          add_slice("SliceH" + std::to_string(h) + "W0", name + "_out", 3, 0, 8,
+                    "h" + std::to_string(h) + "w0");
+        }
+      } else {
+        add_slice("SliceH0W0", "h0", 3, 0, 8, "h0w0");
+        add_slice("SliceH1W0", "h1", 3, 0, 8, "h1w0");
+      }
       add_slice("SliceH0W1", "h0", 3, 1, 8, "h0w1");
       add_slice("SliceH1W1", "h1", 3, 1, 8, "h1w1");
     }
@@ -257,6 +274,25 @@ TEST_F(QnnHTPBackendTests, TiledSliceConcat_ExtraConsumer_NotFused) {
                                 BuildTiledSliceConcatTestCase(true, true, {"h0w0", "h1w0", "h0w1", "h1w1"},
                                                               IndexElementType::kInt64, false, false,
                                                               /*concat_axis=*/1, /*extra_consumer=*/true),
+                                0, 0, 3e-2f);
+}
+
+TEST_F(QnnHTPBackendTests, TiledSliceConcat_CroppedParentWidth_NotFused) {
+  SKIP_HTP_TEST_ON_ARCH_LESS_THAN_OR_EQUAL_TO(QNN_HTP_DEVICE_ARCH_V68);
+  RunTiledSliceConcatFusionTest("TiledSliceConcatCroppedParentWidth_HTP",
+                                BuildTiledSliceConcatTestCase(true, true, {"h0w0", "h1w0", "h0w1", "h1w1"},
+                                                              IndexElementType::kInt64, false, false, 1, false, true),
+                                0, 0, 3e-2f);
+}
+
+// Omitted optional Slice inputs (axes/steps) must fail closed, not crash: the target-node
+// walk preserves the null slots so the matcher rejects without dereferencing them.
+TEST_F(QnnHTPBackendTests, TiledSliceConcat_OmittedSliceAxes_NotFused) {
+  SKIP_HTP_TEST_ON_ARCH_LESS_THAN_OR_EQUAL_TO(QNN_HTP_DEVICE_ARCH_V68);
+  RunTiledSliceConcatFusionTest("TiledSliceConcatOmittedAxes_HTP",
+                                BuildTiledSliceConcatTestCase(true, true, {"h0w0", "h1w0", "h0w1", "h1w1"},
+                                                              IndexElementType::kInt64, false, true, 1, false,
+                                                              false, true),
                                 0, 0, 3e-2f);
 }
 

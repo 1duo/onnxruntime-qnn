@@ -51,11 +51,17 @@ constexpr std::array<SlicePhase, 4> kCanonicalDcrPhases = {
 
 // Slice starts/ends/axes/steps are inputs of the Slice target node itself. For
 // QDQ-wrapped Slices, unit Inputs() are the outer (quantized) tensors, so the
-// parameter names must come from the target node.
+// parameter names must come from the target node. Slots for omitted optional
+// inputs (e.g. a Slice-13 `axes`) hold a null OrtValueInfo; keep the empty slot
+// so optional-input indices stay aligned and ReadSliceIndexInitializer fails closed.
 [[nodiscard]] std::vector<std::string> GetSliceTargetInputNames(const OrtNodeUnit& slice_unit) {
   std::vector<std::string> names;
   for (const Ort::ConstValueInfo& input_info : Ort::ConstNode(&slice_unit.GetNode()).GetInputs()) {
-    names.emplace_back(input_info.GetName());
+    if (input_info == nullptr) {
+      names.emplace_back();
+    } else {
+      names.emplace_back(input_info.GetName());
+    }
   }
   return names;
 }
@@ -110,9 +116,11 @@ struct SliceTileSpec {
 
 // Parse one Slice into the (H, W) tile offsets it selects. Accepts single-axis
 // slices (cascaded tiling) and multi-axis slices (parallel tiling);
-// starts/ends/axes/steps may be int32 or int64. Exact coverage is proven by
-// output shapes at the call site — ends may exceed the dim (ONNX clamps), so
-// ends are only sanity-read here, never trusted for coverage.
+// starts/ends/axes/steps may be int32 or int64. Step-2 axes must start at 0/1;
+// exact tile coverage is proven by output shapes at the call site — ends may
+// exceed the dim (ONNX clamps), so step-2 ends are never trusted. Step-1 axes
+// (passthrough) must cover the full extent, or the Slice crops values and the
+// S2D lowering would be numerically wrong.
 [[nodiscard]] std::optional<SliceTileSpec> ParseSliceTile(
     const QnnModelWrapper& model_wrapper, const OrtNodeUnit& slice_unit) {
   if (!IsSliceUnit(&slice_unit) || slice_unit.SinceVersion() < 10 || slice_unit.Inputs().empty()) {
@@ -154,14 +162,18 @@ struct SliceTileSpec {
     if (steps[i] != 1 && steps[i] != kSliceStepTwo) {
       return std::nullopt;
     }
+    const int64_t dim = static_cast<int64_t>(data_shape[static_cast<size_t>(axis)]);
+    const int64_t start = (*starts)[i] < 0 ? (*starts)[i] + dim : (*starts)[i];
     if (steps[i] != kSliceStepTwo) {
+      const int64_t end = (*ends)[i] < 0 ? (*ends)[i] + dim : (*ends)[i];
+      if (std::clamp(start, int64_t{0}, dim) != 0 || std::clamp(end, int64_t{0}, dim) != dim) {
+        return std::nullopt;
+      }
       continue;
     }
     if (axis != kHeightAxis && axis != kWidthAxis) {
       return std::nullopt;
     }
-    const int64_t dim = static_cast<int64_t>(data_shape[static_cast<size_t>(axis)]);
-    const int64_t start = (*starts)[i] < 0 ? (*starts)[i] + dim : (*starts)[i];
     if (start != 0 && start != 1) {
       return std::nullopt;
     }

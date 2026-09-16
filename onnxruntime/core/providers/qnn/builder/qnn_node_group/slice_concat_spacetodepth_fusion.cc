@@ -666,8 +666,8 @@ std::unique_ptr<IQnnNodeGroup> SliceConcatSpaceToDepthFusion::TryFusion(
     boundary_defs.push_back(&concat_input);
   }
   boundary_defs.push_back(&concat_unit.Outputs()[0]);
-  // Float S2D-DCR is inaccurate on HTP (AISW-175353; upstream float-DCR tests disabled),
-  // so fuse quantized graphs only. Revisit when the kernel is fixed.
+  // Float S2D-DCR is inaccurate on HTP (upstream float-DCR tests remain disabled),
+  // so fuse quantized graphs only.
   std::optional<PerTensorQuant> reference_quant;
   for (const OrtNodeUnitIODef* boundary_def : boundary_defs) {
     const auto boundary_quant = GetBoundaryQuant(model_wrapper, *boundary_def);

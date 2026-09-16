@@ -218,7 +218,7 @@ TEST_F(QnnHTPBackendTests, TiledSliceConcat_QDQ_ReversedOrder_Fused) {
                                 3e-2f);
 }
 
-// Float S2D-DCR is inaccurate on HTP (AISW-175353): fail closed until fixed.
+// Float S2D-DCR is inaccurate on HTP (upstream float-DCR tests remain disabled): fail closed.
 TEST_F(QnnHTPBackendTests, TiledSliceConcat_Float_NotFused) {
   SKIP_HTP_TEST_ON_ARCH_LESS_THAN_OR_EQUAL_TO(QNN_HTP_DEVICE_ARCH_V68);
   RunTiledSliceConcatFusionTest("TiledSliceConcatFloat_HTP", BuildTiledSliceConcatTestCase(false, false), 0, 0);

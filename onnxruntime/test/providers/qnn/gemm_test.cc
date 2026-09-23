@@ -927,16 +927,21 @@ struct DirectGemmReshapeQConfig {
   int64_t M = 4;
   int64_t K = 8;
   int64_t N = 6;
-  int64_t trans_b = 0;                  // 0 → weight [K,N]; 1 → weight [N,K]
-  bool include_bias = true;             // rank-1 bias by default
+  int64_t trans_a = 0;       // 0 → activation [M,K]; 1 → activation [K,M]
+  int64_t trans_b = 0;       // 0 → weight [K,N]; 1 → weight [N,K]
+  bool include_bias = true;  // rank-1 bias by default
+  bool include_relu = false;
   bool bias_is_initializer = true;
-  bool bias_from_intermediate = false;  // if true, bias is produced by an intermediate MatMul (NATIVE bias)
+  bool bias_is_overridable_initializer = false;  // if true, bias is both a graph input and an initializer
+  bool bias_from_intermediate = false;           // if true, bias is produced by an intermediate MatMul (NATIVE bias)
   std::optional<std::vector<int64_t>> bias_shape;
 };
 
 GetTestModelFn BuildDirectGemmReshapeQTestCase(const DirectGemmReshapeQConfig& cfg) {
   return [cfg](ModelTestBuilder& builder) {
-    const std::vector<int64_t> act_shape{cfg.M, cfg.K};
+    const std::vector<int64_t> act_shape = cfg.trans_a == 0
+                                               ? std::vector<int64_t>{cfg.M, cfg.K}
+                                               : std::vector<int64_t>{cfg.K, cfg.M};
     const std::vector<int64_t> weight_shape = cfg.trans_b == 0
                                                   ? std::vector<int64_t>{cfg.K, cfg.N}
                                                   : std::vector<int64_t>{cfg.N, cfg.K};
@@ -973,6 +978,21 @@ GetTestModelFn BuildDirectGemmReshapeQTestCase(const DirectGemmReshapeQConfig& c
                                                                   act_qp.zero_point, /*use_contrib_qdq=*/true);
         builder.AddNode("bias_mm", "MatMul", {bias_mm_dq_a, "bias_mm_w"}, {"bias_native"}, kOnnxDomain);
         gemm_inputs.push_back("bias_native");
+      } else if (cfg.bias_is_overridable_initializer) {
+        // Build an overridable initializer: the same tensor name appears as both a graph input and
+        // an initializer. The runtime feed, not the initializer default, must determine the bias.
+        const std::vector<int64_t> bias_shape = cfg.bias_shape.value_or(std::vector<int64_t>{cfg.N});
+        const size_t num_bias_elems = SizeOfShape(bias_shape);
+        const std::vector<int32_t> default_bias(num_bias_elems, 0);
+        std::vector<int32_t> override_bias(num_bias_elems);
+        for (size_t i = 0; i < num_bias_elems; ++i) {
+          override_bias[i] = static_cast<int32_t>(1000 + i);
+        }
+        builder.MakeInitializer<int32_t>("bias", bias_shape, default_bias);
+        builder.MakeInput<int32_t>("bias", bias_shape, override_bias);
+        builder.AddDequantizeLinearNode<int32_t>("bias_dq", "bias", act_qp.scale * wt_qp.scale, 0,
+                                                 "bias_dq_out", /*use_contrib_qdq=*/true);
+        gemm_inputs.push_back("bias_dq_out");
       } else {
         const std::vector<int64_t> bias_shape = cfg.bias_shape.value_or(std::vector<int64_t>{cfg.N});
         TestInputDef<float> bias_def(bias_shape, cfg.bias_is_initializer,
@@ -984,6 +1004,7 @@ GetTestModelFn BuildDirectGemmReshapeQTestCase(const DirectGemmReshapeQConfig& c
     }
 
     std::vector<ONNX_NAMESPACE::AttributeProto> gemm_attrs;
+    gemm_attrs.push_back(test::MakeAttribute("transA", cfg.trans_a));
     gemm_attrs.push_back(test::MakeAttribute("transB", cfg.trans_b));
     builder.AddNode("gemm", "Gemm", gemm_inputs, {"gemm_out"}, kOnnxDomain, gemm_attrs);
 
@@ -992,8 +1013,15 @@ GetTestModelFn BuildDirectGemmReshapeQTestCase(const DirectGemmReshapeQConfig& c
     builder.Make1DInitializer<int64_t>("reshape_shape", reshape_target);
     builder.AddNode("reshape", "Reshape", {"gemm_out", "reshape_shape"}, {"reshape_out"});
 
+    // An optional Relu keeps a Reshape -> activation -> Q chain visible to the selector.
+    std::string post_reshape = "reshape_out";
+    if (cfg.include_relu) {
+      builder.AddNode("relu", "Relu", {"reshape_out"}, {"relu_out"});
+      post_reshape = "relu_out";
+    }
+
     QuantParams<uint16_t> out_qp = QuantParams<uint16_t>::Compute(0.0f, 8.0f, /*symmetric=*/false);
-    AddQDQNodePairWithOutputAsGraphOutput<uint16_t>(builder, "out", "reshape_out",
+    AddQDQNodePairWithOutputAsGraphOutput<uint16_t>(builder, "out", post_reshape,
                                                     out_qp.scale, out_qp.zero_point,
                                                     /*use_contrib_qdq=*/true);
   };
@@ -1042,6 +1070,29 @@ TEST_F(QnnHTPBackendTests, GemmReshapeQ_Direct_NativeBias_NotAbsorbed) {
 TEST_F(QnnHTPBackendTests, GemmReshapeQ_Direct_DynamicQDQBias_NotAbsorbed) {
   DirectGemmReshapeQConfig cfg;
   cfg.bias_is_initializer = false;
+  RunQnnModelTest(BuildDirectGemmReshapeQTestCase(cfg), GetHtpProviderOptions(), /*opset=*/21,
+                  EPVerificationParams{ExpectedEPNodeAssignment::All, ElementwiseAbsoluteVerifier(2e-2f)});
+}
+
+// Negative gate (M-4): direct Gemm with an overridable QDQ bias must NOT be absorbed
+// as FullyConnected bias. Although the bias has an initializer default, its matching
+// graph input can override the value at runtime. The regular QDQ Gemm path can still
+// handle the graph.
+TEST_F(QnnHTPBackendTests, GemmReshapeQ_Direct_OverridableQDQBias_NotAbsorbed) {
+  DirectGemmReshapeQConfig cfg;
+  cfg.bias_is_overridable_initializer = true;
+  RunQnnModelTest(BuildDirectGemmReshapeQTestCase(cfg), GetHtpProviderOptions(), /*opset=*/21,
+                  EPVerificationParams{ExpectedEPNodeAssignment::All, ElementwiseAbsoluteVerifier(2e-2f)});
+}
+
+// Negative gate (M-5): direct Gemm(transA=1) -> Reshape -> Relu -> Q must NOT be absorbed
+// by the absorb-Reshape selector — the builder's absorbed path only supports transA=0.
+// The graph still runs on QNN EP via the regular Gemm path with a standalone Reshape.
+TEST_F(QnnHTPBackendTests, GemmReshapeQ_Direct_TransA1_NotAbsorbed) {
+  DirectGemmReshapeQConfig cfg;
+  cfg.trans_a = 1;
+  cfg.include_bias = false;
+  cfg.include_relu = true;
   RunQnnModelTest(BuildDirectGemmReshapeQTestCase(cfg), GetHtpProviderOptions(), /*opset=*/21,
                   EPVerificationParams{ExpectedEPNodeAssignment::All, ElementwiseAbsoluteVerifier(2e-2f)});
 }

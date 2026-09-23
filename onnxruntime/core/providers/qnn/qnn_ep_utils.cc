@@ -98,13 +98,25 @@ const OrtValue* GetInitializerFromValueInfo(const OrtGraph* graph, const OrtApi&
   return GetConstantInitializer(graph, ort_api, name);
 }
 
-bool IsInitializerValueInfo(const OrtGraph* graph, const OrtApi& ort_api, const OrtValueInfo* value_info) {
-  return value_info != nullptr && GetInitializerFromValueInfo(graph, ort_api, value_info) != nullptr;
+bool IsConstantInitializerValueInfo(const OrtGraph* graph, const OrtApi& ort_api, const OrtValueInfo* value_info) {
+  if (value_info == nullptr || GetInitializerFromValueInfo(graph, ort_api, value_info) == nullptr) {
+    return false;
+  }
+
+  // Graph_GetInitializers also returns overridable initializers that have matching graph inputs.
+  // Those values may be overridden at runtime, so require a true constant initializer.
+  bool is_constant_initializer = false;
+  OrtStatus* status = ort_api.ValueInfo_IsConstantInitializer(value_info, &is_constant_initializer);
+  if (status != nullptr) {
+    ort_api.ReleaseStatus(status);
+    return false;
+  }
+  return is_constant_initializer;
 }
 
 bool IsConstantOrInitializerValueInfo(const OrtGraph* graph, const OrtApi& ort_api, const OrtValueInfo* value_info) {
   if (value_info == nullptr) return false;
-  if (IsInitializerValueInfo(graph, ort_api, value_info)) return true;
+  if (IsConstantInitializerValueInfo(graph, ort_api, value_info)) return true;
 
   const OrtNode* producer = nullptr;
   if (ort_api.ValueInfo_GetValueProducer(value_info, &producer, nullptr) != nullptr || producer == nullptr) {
@@ -365,9 +377,10 @@ bool IsGemmWeightBlockQuantized(const OrtApi& ort_api, const OrtValueInfo* weigh
 }
 
 // 3b.0 Guard for the absorb-Reshape path. Reject configurations that require another builder path:
-// transposed B, non-FC bias shapes, NATIVE bias, and BQ weight.
+// transposed A/B, non-FC bias shapes, NATIVE bias, and BQ weight.
 bool IsGemmSafeForAbsorbedReshape(const OrtGraph* graph, const OrtApi& ort_api, const OrtNode* gemm_node) {
   OrtNodeAttrHelper attrs(*gemm_node);
+  if (attrs.Get("transA", static_cast<int64_t>(0)) != 0) return false;
   if (attrs.Get("transB", static_cast<int64_t>(0)) != 0) return false;
 
   size_t num_inputs = 0;

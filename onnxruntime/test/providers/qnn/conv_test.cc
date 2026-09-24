@@ -1432,6 +1432,70 @@ TEST_F(QnnHTPBackendTests, ConvU8S8S32_SharedBiasInitializer_TinyScales) {
   AssertNodeInputsDistinctInQnnGraph(json_dir, "Conv2d", /*input_index=*/2);
 }
 
+// Conv with a u16 activation and a u8 output, as produced by mixed-precision LLM exports.
+static GetTestQDQModelFn<uint8_t> BuildQDQConvU16ActivationU8OutputTestCase(const TestInputDef<float>& input_def,
+                                                                            const TestInputDef<float>& weights_def,
+                                                                            const TestInputDef<float>& bias_def) {
+  return [input_def, weights_def, bias_def](ModelTestBuilder& builder,
+                                            std::vector<QuantParams<uint8_t>>& output_qparams) {
+    MakeTestInput<float>(builder, "input", input_def);
+    const QuantParams<uint16_t> input_qparams = GetTestInputQuantParams<uint16_t>(input_def);
+    const std::string input_dq = AddQDQNodePair<uint16_t>(builder, "qdq_input", "input", input_qparams.scale,
+                                                          input_qparams.zero_point, /*use_contrib_qdq=*/true);
+
+    MakeTestInput<float>(builder, "weights", weights_def);
+    const QuantParams<uint8_t> weights_qparams = GetTestInputQuantParams<uint8_t>(weights_def);
+    const std::string weights_dq = AddQDQNodePair<uint8_t>(builder, "qdq_weights", "weights", weights_qparams.scale,
+                                                           weights_qparams.zero_point, /*use_contrib_qdq=*/true);
+
+    const float bias_scale = input_qparams.scale * weights_qparams.scale;
+    const std::string bias_dq = MakeTestQDQBiasInput(builder, "bias", bias_def, bias_scale, /*use_contrib_qdq=*/true);
+
+    builder.AddNode("Conv", "Conv", {input_dq, weights_dq, bias_dq}, {"Y"}, kOnnxDomain);
+    AddQDQNodePairWithOutputAsGraphOutput<uint8_t>(builder, "qdq_out", "Y", output_qparams[0].scale,
+                                                   output_qparams[0].zero_point, /*use_contrib_qdq=*/true);
+  };
+}
+
+static void RunConvU16ActivationU8OutputTest(const char* test_name, const std::vector<int64_t>& input_shape,
+                                             const std::vector<int64_t>& weight_shape) {
+  const std::filesystem::path json_dir = std::string("ConvU16ActivationU8Output_") + test_name;
+  std::filesystem::remove_all(json_dir);
+  ASSERT_TRUE(std::filesystem::create_directory(json_dir));
+  auto cleanup = gsl::finally([&json_dir]() { std::filesystem::remove_all(json_dir); });
+
+  ProviderOptions provider_options;
+  provider_options["backend_type"] = "htp";
+  provider_options["offload_graph_io_quantization"] = "0";
+  provider_options["dump_json_qnn_graph"] = "1";
+  provider_options["json_qnn_graph_dir"] = json_dir.string();
+
+  TestInputDef<float> input_def(input_shape, false, GetFloatDataInRange(-1.0f, 1.0f, SizeOfShape(input_shape)));
+  TestInputDef<float> weight_def(weight_shape, true, GetFloatDataInRange(-0.5f, 0.5f, SizeOfShape(weight_shape)));
+  TestInputDef<float> bias_def({weight_shape[0]}, true, GetFloatDataInRange(-0.1f, 0.1f, weight_shape[0]));
+
+  TestQDQModelAccuracy(BuildF32ConvTestCase("Conv", input_def, weight_def, bias_def, {}, {}, {}, std::nullopt),
+                       BuildQDQConvU16ActivationU8OutputTestCase(input_def, weight_def, bias_def),
+                       provider_options,
+                       21,  // opset
+                       ExpectedEPNodeAssignment::All);
+
+  if (::testing::Test::IsSkipped()) {
+    return;
+  }
+  AssertOpInQnnGraph(json_dir, "Conv2d", 1);
+  AssertOpInQnnGraph(json_dir, "Convert", 1);
+  AssertConvertOutputDataType(json_dir, QNN_DATATYPE_UFIXED_POINT_8);
+}
+
+TEST_F(QnnHTPBackendTests, ConvU16U8_U8Output) {
+  RunConvU16ActivationU8OutputTest("2d", {1, 4, 5, 5}, {3, 4, 1, 1});
+}
+
+TEST_F(QnnHTPBackendTests, ConvU16U8_U8Output_1D) {
+  RunConvU16ActivationU8OutputTest("1d", {1, 4, 6}, {3, 4, 2});
+}
+
 // Tests QDQ Conv where activation and weight are per-tensor quantized but bias is a plain float
 // initializer.
 TEST_F(QnnHTPBackendTests, ConvU8U8_FloatBias) {

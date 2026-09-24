@@ -757,6 +757,53 @@ static void RunDynamicInput1QuantErrorTest(const char* test_name,
   }
 }
 
+// A 16-bit activation with an 8-bit output stays in one node unit: the op runs at 16 bits and a Convert narrows it.
+template <typename ActivationQType, typename WeightQType, typename OutputQType>
+static void RunNarrowingOutputTest(const char* test_name, bool weight_is_initializer,
+                                   Qnn_DataType_t expected_convert_type) {
+  namespace fs = std::filesystem;
+  const fs::path graph_dir = fs::temp_directory_path() / (std::string("MatMulOp_QDQ_NarrowingOutput_") + test_name);
+  fs::remove_all(graph_dir);
+  ASSERT_TRUE(fs::create_directories(graph_dir));
+  auto cleanup = gsl::finally([&graph_dir]() { fs::remove_all(graph_dir); });
+
+  ProviderOptions provider_options = GetQDQMatMulProviderOptions(graph_dir);
+
+  TestInputDef<float> input0_def({2, 16}, false, GetFloatDataInRange(-1.0f, 1.0f, 32));
+  TestInputDef<float> input1_def({16, 8}, weight_is_initializer, GetFloatDataInRange(-0.5f, 0.5f, 128));
+
+  const auto f32_model = BuildMatMulOpTestCase(input0_def, input1_def);
+  const auto qdq_model =
+      BuildMatMulOpQDQTestCase<ActivationQType, WeightQType, OutputQType>(input0_def, input1_def, true);
+  TestQDQModelAccuracy(f32_model, qdq_model, provider_options, 21, ExpectedEPNodeAssignment::All, QDQTolerance());
+
+  if (::testing::Test::IsSkipped()) {
+    return;
+  }
+  AssertOpInQnnGraph(graph_dir, "Convert", 1);
+  AssertConvertOutputDataType(graph_dir, expected_convert_type);
+}
+
+TEST_F(QnnHTPBackendTests, MatMulOp_QDQ_U16ActivationU8Output_StaticWeight) {
+  RunNarrowingOutputTest<uint16_t, uint8_t, uint8_t>("u16_u8_static", /*weight_is_initializer=*/true,
+                                                     QNN_DATATYPE_UFIXED_POINT_8);
+}
+
+TEST_F(QnnHTPBackendTests, MatMulOp_QDQ_U16ActivationU8Output_DynamicInput1) {
+  RunNarrowingOutputTest<uint16_t, uint8_t, uint8_t>("u16_u8_dynamic", /*weight_is_initializer=*/false,
+                                                     QNN_DATATYPE_UFIXED_POINT_8);
+}
+
+TEST_F(QnnHTPBackendTests, MatMulOp_QDQ_U16ActivationS8Output_StaticWeight) {
+  RunNarrowingOutputTest<uint16_t, uint8_t, int8_t>("u16_s8_static", /*weight_is_initializer=*/true,
+                                                    QNN_DATATYPE_SFIXED_POINT_8);
+}
+
+TEST_F(QnnHTPBackendTests, MatMulOp_QDQ_S16ActivationS8Output_StaticWeight) {
+  RunNarrowingOutputTest<int16_t, int8_t, int8_t>("s16_s8_static", /*weight_is_initializer=*/true,
+                                                  QNN_DATATYPE_SFIXED_POINT_8);
+}
+
 TEST_F(QnnHTPBackendTests, MatMulOp_QDQ_U16DynamicInput1_LowQuantErrorUsesAsymmetricU8) {
   RunDynamicInput1QuantErrorTest("low_error", 0.0f, 0.2f, QNN_DATATYPE_UFIXED_POINT_8);
 }

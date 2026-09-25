@@ -737,7 +737,9 @@ Ort::Status InsertConvertOp(QnnModelWrapper& qnn_model_wrapper,
 
 // Adds `output_name` and the op producing it. HTP Conv/MatMul/FullyConnected only emit their activation's
 // datatype, so a 16-bit activation with an 8-bit output is built as the op into a 16-bit intermediate
-// spanning exactly the output's range, followed by a Convert into `output_name`.
+// spanning exactly the output's range, followed by a Convert into `output_name`. HTP also lacks float32
+// kernels for a quantized weight, so a float32 activation with a quantized weight runs the op in float16
+// between Casts.
 Ort::Status AddOpWithQuantizedOutput(QnnModelWrapper& qnn_model_wrapper,
                                      const std::string& node_name,
                                      const std::string& op_type,

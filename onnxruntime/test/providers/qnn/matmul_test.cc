@@ -839,6 +839,70 @@ TEST_F(QnnHTPBackendTests, MatMulOp_QDQ_NonU16Input1DoesNotUseU16ConversionGate)
   AssertOpInQnnGraph(graph_dir, "Convert", 0);
 }
 
+// Float MatMul whose only QDQ node is a per-channel DQ on a constant weight, as in weight-only quantized LLMs.
+template <typename WeightQType>
+static void RunPerChannelWeightOnlyTest(const char* test_name) {
+  SKIP_HTP_TEST_ON_ARCH_LESS_THAN_OR_EQUAL_TO(QNN_HTP_DEVICE_ARCH_V75);
+  namespace fs = std::filesystem;
+  const fs::path graph_dir = fs::temp_directory_path() / (std::string("MatMulOp_PerChannelWeightOnly_") + test_name);
+  fs::remove_all(graph_dir);
+  ASSERT_TRUE(fs::create_directories(graph_dir));
+  auto cleanup = gsl::finally([&graph_dir]() { fs::remove_all(graph_dir); });
+
+  ProviderOptions provider_options;
+  provider_options["backend_type"] = "htp";
+  provider_options["offload_graph_io_quantization"] = "0";
+  provider_options["enable_htp_fp16_precision"] = "1";
+  provider_options["dump_json_qnn_graph"] = "1";
+  provider_options["json_qnn_graph_dir"] = graph_dir.string();
+#if defined(__linux__) && !defined(__aarch64__)
+  provider_options["soc_model"] = std::to_string(QNN_SOC_MODEL_SM8850);
+#endif
+
+  TestInputDef<float> input_def({2, 16}, false, GetFloatDataInRange(-1.0f, 1.0f, 32));
+  TestInputDef<float> weight_def({16, 8}, true, GetFloatDataInRange(-0.5f, 0.5f, 128));
+  const std::vector<int64_t>& weight_shape = weight_def.GetShape();
+  constexpr int64_t kAxis = 1;
+
+  auto build_model = [&](ModelTestBuilder& builder) {
+    MakeTestInput<float>(builder, "input", input_def);
+
+    std::vector<float> scales;
+    std::vector<WeightQType> zero_points;
+    GetTestInputQuantParamsPerChannel<WeightQType>(weight_def, scales, zero_points, kAxis, true);
+
+    size_t num_storage_elems = SizeOfShape(weight_shape);
+    if constexpr (std::is_same_v<WeightQType, Int4x2>) {
+      num_storage_elems = Int4x2::CalcNumInt4Pairs(num_storage_elems);
+    }
+    std::vector<WeightQType> quantized(num_storage_elems);
+    QuantizeValues<float, WeightQType>(weight_def.GetRawData(), quantized, weight_shape, scales, zero_points, kAxis);
+    builder.MakeInitializer<WeightQType>("weight_quant", weight_shape, quantized);
+    builder.AddDequantizeLinearNode<WeightQType>("weight_dq", "weight_quant", scales, zero_points, "weight_dq_out",
+                                                 {builder.MakeScalarAttribute("axis", kAxis)});
+
+    builder.MakeOutput("Y");
+    builder.AddNode("MatMul", "MatMul", {"input", "weight_dq_out"}, {"Y"}, kOnnxDomain);
+  };
+
+  RunQnnModelTest(build_model, provider_options, 21,
+                  EPVerificationParams{ExpectedEPNodeAssignment::All, ElementwiseAbsoluteVerifier(0.01f)});
+
+  if (::testing::Test::IsSkipped()) {
+    return;
+  }
+  AssertOpInQnnGraph(graph_dir, "FullyConnected", 1);
+  AssertOpInQnnGraph(graph_dir, "Dequantize", 0);
+}
+
+TEST_F(QnnHTPBackendTests, MatMulOp_F32S8_PerChannelWeightOnly) {
+  RunPerChannelWeightOnlyTest<int8_t>("s8");
+}
+
+TEST_F(QnnHTPBackendTests, MatMulOp_F32S4_PerChannelWeightOnly) {
+  RunPerChannelWeightOnlyTest<Int4x2>("s4");
+}
+
 // Tests MatMul with two uint16 (quantized) inputs with weight as static.
 // This exercises a workaround in QNN EP that inserts a QNN Convert op before input[1] (converts from uint16 to sint16).
 // This workaround prevents a validation error for this specific MatMul configuration.

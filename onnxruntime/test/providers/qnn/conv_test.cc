@@ -1539,6 +1539,87 @@ TEST_F(QnnHTPBackendTests, ConvU8S8_PerChannel_FloatBias) {
       provider_options, 13, ExpectedEPNodeAssignment::All, QDQTolerance(0.015f));
 }
 
+// Float Conv whose only QDQ node is a per-channel DQ on a constant weight, as in weight-only quantized LLMs.
+template <typename WeightQType>
+static GetTestModelFn BuildConvPerChannelWeightOnlyTestCase(const TestInputDef<float>& input_def,
+                                                            const TestInputDef<float>& weights_def,
+                                                            bool has_bias) {
+  return [input_def, weights_def, has_bias](ModelTestBuilder& builder) {
+    MakeTestInput<float>(builder, "input", input_def);
+
+    const std::vector<int64_t>& weights_shape = weights_def.GetShape();
+    std::vector<float> weight_scales;
+    std::vector<WeightQType> weight_zero_points;
+    GetTestInputQuantParamsPerChannel<WeightQType>(weights_def, weight_scales, weight_zero_points, 0, true);
+
+    size_t num_weight_storage_elems = SizeOfShape(weights_shape);
+    if constexpr (std::is_same_v<WeightQType, Int4x2>) {
+      num_weight_storage_elems = Int4x2::CalcNumInt4Pairs(num_weight_storage_elems);
+    }
+    std::vector<WeightQType> quantized_weights(num_weight_storage_elems);
+    QuantizeValues<float, WeightQType>(weights_def.GetRawData(), quantized_weights, weights_shape, weight_scales,
+                                       weight_zero_points, 0);
+    builder.MakeInitializer<WeightQType>("weights_quant", weights_shape, quantized_weights);
+    builder.AddDequantizeLinearNode<WeightQType>("WeightDQ", "weights_quant", weight_scales, weight_zero_points,
+                                                 "weights_dq", {builder.MakeScalarAttribute("axis", int64_t{0})});
+
+    std::vector<std::string> conv_inputs = {"input", "weights_dq"};
+    if (has_bias) {
+      builder.MakeInitializer<float>("bias", {weights_shape[0]},
+                                     GetFloatDataInRange(-0.5f, 0.5f, static_cast<size_t>(weights_shape[0])));
+      conv_inputs.push_back("bias");
+    }
+
+    builder.MakeOutput("output");
+    builder.AddNode("Conv", "Conv", conv_inputs, {"output"}, kOnnxDomain);
+  };
+}
+
+template <typename WeightQType>
+static void RunConvPerChannelWeightOnlyTest(const char* test_name, bool has_bias = false) {
+  SKIP_HTP_TEST_ON_ARCH_LESS_THAN_OR_EQUAL_TO(QNN_HTP_DEVICE_ARCH_V75);
+  const std::filesystem::path json_dir = std::string("ConvPerChannelWeightOnly_") + test_name;
+  std::filesystem::remove_all(json_dir);
+  ASSERT_TRUE(std::filesystem::create_directory(json_dir));
+  auto cleanup = gsl::finally([&json_dir]() { std::filesystem::remove_all(json_dir); });
+
+  ProviderOptions provider_options;
+  provider_options["backend_type"] = "htp";
+  provider_options["offload_graph_io_quantization"] = "0";
+  provider_options["enable_htp_fp16_precision"] = "1";
+  provider_options["dump_json_qnn_graph"] = "1";
+  provider_options["json_qnn_graph_dir"] = json_dir.string();
+#if defined(__linux__) && !defined(__aarch64__)
+  provider_options["soc_model"] = std::to_string(QNN_SOC_MODEL_SM8850);
+#endif
+
+  TestInputDef<float> input_def({1, 8, 1, 4}, false, GetFloatDataInRange(-1.0f, 1.0f, 32));
+  TestInputDef<float> weights_def({4, 8, 1, 1}, true, GetFloatDataInRange(-0.5f, 0.5f, 32));
+
+  RunQnnModelTest(BuildConvPerChannelWeightOnlyTestCase<WeightQType>(input_def, weights_def, has_bias),
+                  provider_options,
+                  /*opset*/ 21,
+                  EPVerificationParams{ExpectedEPNodeAssignment::All, ElementwiseAbsoluteVerifier(0.01f)});
+
+  if (::testing::Test::IsSkipped()) {
+    return;
+  }
+  AssertOpInQnnGraph(json_dir, "Conv2d", 1);
+  AssertOpInQnnGraph(json_dir, "Dequantize", 0);
+}
+
+TEST_F(QnnHTPBackendTests, ConvF32S8_PerChannelWeightOnly) {
+  RunConvPerChannelWeightOnlyTest<int8_t>("s8");
+}
+
+TEST_F(QnnHTPBackendTests, ConvF32S4_PerChannelWeightOnly) {
+  RunConvPerChannelWeightOnlyTest<Int4x2>("s4");
+}
+
+TEST_F(QnnHTPBackendTests, ConvF32S8_PerChannelWeightOnly_Bias) {
+  RunConvPerChannelWeightOnlyTest<int8_t>("s8_bias", /*has_bias*/ true);
+}
+
 // Test per-channel QDQ Conv with INT4 weights and no bias.
 // in0: u16, in1 (weight): s4, out: u8
 // Tests bug in QNN SDK 2.25 when validating Conv without a bias (QNN EP adds a dummy bias).

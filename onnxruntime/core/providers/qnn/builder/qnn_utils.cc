@@ -1901,8 +1901,35 @@ Ort::Status AddOpWithQuantizedOutput(QnnModelWrapper& qnn_model_wrapper,
                                      std::vector<uint32_t>&& output_shape,
                                      Qnn_DataType_t activation_qnn_data_type,
                                      bool do_op_validation) {
+  const bool is_float_act_quant_weight = IsNpuBackend(qnn_model_wrapper.GetQnnBackendType()) &&
+                                         activation_qnn_data_type == QNN_DATATYPE_FLOAT_32 &&
+                                         input_names.size() > 1 &&
+                                         qnn_model_wrapper.GetQnnTensorWrapper(input_names[1])
+                                             .GetQnnQuantParams()
+                                             .IsQuantized();
+  if (is_float_act_quant_weight) {
+    for (auto& input_name : input_names) {
+      const auto& input_tensor = qnn_model_wrapper.GetQnnTensorWrapper(input_name);
+      if (input_tensor.GetTensorDataType() != QNN_DATATYPE_FLOAT_32) {
+        continue;
+      }
+      const std::string cast_output_name = UniqueNameGenerator().New(input_name, "_cast_fp16");
+      RETURN_IF_ERROR(qnn_model_wrapper.AddCastNode(UniqueNameGenerator().New(cast_output_name, QNN_OP_CAST),
+                                                    input_name, cast_output_name, QNN_TENSOR_TYPE_NATIVE,
+                                                    QNN_DATATYPE_FLOAT_16, QnnQuantParamsWrapper(),
+                                                    std::vector<uint32_t>(input_tensor.GetTensorDims()),
+                                                    do_op_validation));
+      input_name = cast_output_name;
+    }
+  }
+
   std::string op_output_name = output_name;
-  if (IsNarrowingQuantOutput(activation_qnn_data_type, output_qnn_data_type)) {
+  if (is_float_act_quant_weight) {
+    op_output_name = UniqueNameGenerator().New(output_name, "_fp16");
+    QnnTensorWrapper fp16_tensorwrapper(op_output_name, QNN_TENSOR_TYPE_NATIVE, QNN_DATATYPE_FLOAT_16,
+                                        QnnQuantParamsWrapper(), std::vector<uint32_t>(output_shape));
+    RETURN_IF_NOT(qnn_model_wrapper.AddTensorWrapper(std::move(fp16_tensorwrapper)), "Failed to add tensor.");
+  } else if (IsNarrowingQuantOutput(activation_qnn_data_type, output_qnn_data_type)) {
     QnnQuantParamsWrapper intermediate_quant_param;
     RETURN_IF_ERROR(GetNarrowingIntermediateQuantParams(activation_qnn_data_type, output_qnn_data_type,
                                                         output_quant_param, intermediate_quant_param));
@@ -1926,14 +1953,15 @@ Ort::Status AddOpWithQuantizedOutput(QnnModelWrapper& qnn_model_wrapper,
                 "Failed to add node.");
 
   if (op_output_name != output_name) {
-    RETURN_IF_NOT(qnn_model_wrapper.CreateQnnNode(UniqueNameGenerator().New(output_name, QNN_OP_CONVERT),
+    const char* op = is_float_act_quant_weight ? QNN_OP_CAST : QNN_OP_CONVERT;
+    RETURN_IF_NOT(qnn_model_wrapper.CreateQnnNode(UniqueNameGenerator().New(output_name, op),
                                                   QNN_OP_PACKAGE_NAME_QTI_AISW,
-                                                  QNN_OP_CONVERT,
+                                                  op,
                                                   {op_output_name},
                                                   {output_name},
                                                   {},
                                                   do_op_validation),
-                  "Failed to add Convert node.");
+                  "Failed to add output conversion node.");
   }
   return Ort::Status();
 }

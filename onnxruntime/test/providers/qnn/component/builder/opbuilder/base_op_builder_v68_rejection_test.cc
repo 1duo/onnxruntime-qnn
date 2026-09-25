@@ -157,9 +157,9 @@ TEST(QnnUnit_BaseOpBuilder_V68Rejection, V68_HTP_FP32Output_IsRejected) {
 
   // INT8 input passes the input scan; FP32 output must be caught by the output scan.
   auto input = MakeMockIODef("x", ONNX_TENSOR_ELEMENT_DATA_TYPE_INT8,
-                              std::vector<int64_t>{1, 4});
+                             std::vector<int64_t>{1, 4});
   auto output = MakeMockIODef("y", ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT,
-                               std::vector<int64_t>{1, 4});
+                              std::vector<int64_t>{1, 4});
   auto node_unit = MakeMockNodeUnit("Cast", {input}, {output}, "cast_node");
 
   Ort::Status status = builder->IsOpSupported(*wrapper, node_unit, ctx.ort_logger);
@@ -185,9 +185,9 @@ TEST(QnnUnit_BaseOpBuilder_V68Rejection, V68_HTP_INT8_PassesThrough) {
 
   // INT8 input (no quant params here — stub wrapper returns a raw INT8 TensorInfo).
   auto input = MakeMockIODef("x", ONNX_TENSOR_ELEMENT_DATA_TYPE_INT8,
-                              std::vector<int64_t>{1, 4});
+                             std::vector<int64_t>{1, 4});
   auto output = MakeMockIODef("y", ONNX_TENSOR_ELEMENT_DATA_TYPE_INT8,
-                               std::vector<int64_t>{1, 4});
+                              std::vector<int64_t>{1, 4});
   auto node_unit = MakeMockNodeUnit("Relu", {input}, {output}, "relu_node");
 
   Ort::Status status = builder->IsOpSupported(*wrapper, node_unit, ctx.ort_logger);

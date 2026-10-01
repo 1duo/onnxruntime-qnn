@@ -26,8 +26,7 @@ namespace qnn {
 // Runtime Convert demotes constants to activations, blocking HTP folding downstream.
 namespace {
 
-// Cap folded DequantizeLinear output (FP32 DLC bloat).
-inline constexpr size_t kDqqFoldMaxFp32Bytes = 1024 * 1024;  // 1 MiB
+// kFoldedStaticMaxBytes (folded_static_utils.h) caps folded outputs; kept here via shared header.
 
 Ort::Status ComputeNumElements(gsl::span<const uint32_t> shape, /*out*/ size_t& num_elems) {
   size_t total = 1;
@@ -89,8 +88,7 @@ Ort::Status FoldConstantDequantizeLinear(QnnModelWrapper& qnn_model_wrapper, con
 
   size_t num_elems = 0;
   RETURN_IF_ERROR(ComputeNumElements(gsl::make_span(output_info.shape), num_elems));
-  // DQQ scales are scalar, so a large fold only bloats the DLC.
-  RETURN_IF(num_elems > kDqqFoldMaxFp32Bytes / sizeof(float),
+  RETURN_IF(num_elems > kFoldedStaticMaxBytes / sizeof(float),
             "DequantizeLinear output too large to fold.");
 
   std::vector<uint8_t> quant_bytes;
@@ -151,6 +149,7 @@ Ort::Status FoldConstantQuantizeLinear(QnnModelWrapper& qnn_model_wrapper, const
   RETURN_IF_ERROR(ResolvePerChannelAxis(qnn_model_wrapper, output_def, axis));
 
   const size_t total_bytes = utils::GetQnnTensorDataSizeInBytes(num_elems, output_info.qnn_data_type);
+  RETURN_IF(total_bytes > kFoldedStaticMaxBytes, "QuantizeLinear output too large to fold.");
   std::vector<uint8_t> quant_bytes(total_bytes);
   RETURN_IF_ERROR(utils::QuantizeData(fp32_input, gsl::make_span(input_info.shape),
                                       gsl::make_span(scales), gsl::make_span(offsets),

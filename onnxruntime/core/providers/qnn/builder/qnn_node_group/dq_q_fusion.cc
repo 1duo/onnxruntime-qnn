@@ -216,7 +216,16 @@ DQQFusion::DQQFusion(const OrtNodeUnit& dq_node_unit, const OrtNodeUnit& q_node_
 
 Ort::Status DQQFusion::IsSupported(QnnModelWrapper& qmw, const Ort::Logger& logger) const {
   ORT_UNUSED_PARAMETER(logger);
-  return ValidateOnQnn(qmw, *node_units_[0], *node_units_[1]);
+  RETURN_IF_ERROR(ValidateOnQnn(qmw, *node_units_[0], *node_units_[1]));
+
+  // Register the Q output as op builders do while validating, so groups validated later on this wrapper
+  // (e.g. a standalone Transpose, whose NodeUnit input carries no quant params) see the quantized tensor
+  // instead of synthesizing an unquantized one. Only IsSupported does this: TryFusion also validates during
+  // compose, where a NATIVE placeholder would block the STATIC fold (AddTensorWrapper never overwrites).
+  QnnTensorWrapper output_tensor;
+  RETURN_IF_ERROR(qmw.MakeTensorWrapper(node_units_[1]->Outputs()[0], output_tensor));
+  RETURN_IF_NOT(qmw.AddTensorWrapper(std::move(output_tensor)), "Failed to add output");
+  return Ort::Status();
 }
 
 Ort::Status DQQFusion::AddToModelBuilder(QnnModelWrapper& qmw, const Ort::Logger& logger) const {
@@ -246,12 +255,10 @@ static Ort::Status CreateOrValidateOnQnn(QnnModelWrapper& qnn_model_wrapper,
                                   output_def.type == ONNX_TENSOR_ELEMENT_DATA_TYPE_UINT4 ||
                                   output_def.type == ONNX_TENSOR_ELEMENT_DATA_TYPE_INT2 ||
                                   output_def.type == ONNX_TENSOR_ELEMENT_DATA_TYPE_UINT2;
-  if (!is_sub_byte_output && CanFoldConstantQdq(qnn_model_wrapper, dq_node_unit) &&
+  // Folding is build-only: validation always checks the runtime Convert, which is also the fallback when a
+  // fold is declined.
+  if (!validate && !is_sub_byte_output && CanFoldConstantQdq(qnn_model_wrapper, dq_node_unit) &&
       !qnn_model_wrapper.IsGraphOutput(output_def.name)) {
-    if (validate) {
-      // Supported via folding; fold later in AddToModelBuilder to keep validation side-effect free.
-      return Ort::Status();
-    }
     if (FoldConstantDequantizeLinear(qnn_model_wrapper, dq_node_unit).IsOK() &&
         FoldConstantQuantizeLinear(qnn_model_wrapper, q_node_unit).IsOK()) {
       return Ort::Status();

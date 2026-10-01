@@ -142,7 +142,7 @@ Ort::Status TransposeOpBuilder::ProcessAttributesAndOutputs(QnnModelWrapper& qnn
     return Ort::Status();
   }
 
-  if (IsFoldedStaticTensor(qnn_model_wrapper, input_names[0]) &&
+  if (!do_op_validation && IsFoldedStaticTensor(qnn_model_wrapper, input_names[0]) &&
       !qnn_model_wrapper.IsGraphOutput(node_unit.Outputs()[0].name)) {
     Ort::Status fold_status = TryFoldConstantTranspose(qnn_model_wrapper, node_unit, input_names[0]);
     if (fold_status.IsOK()) {
@@ -188,7 +188,20 @@ Ort::Status TransposeOpBuilder::ProcessAttributesAndOutputs(QnnModelWrapper& qnn
   std::vector<uint32_t> output_shape;
   RETURN_IF_NOT(qnn_model_wrapper.GetOnnxShape(node_unit.Outputs()[0].shape, output_shape), "Cannot get shape");
 
-  const QnnTensorWrapper& input_tensor_wrapper = qnn_model_wrapper.GetQnnTensorWrapper(input_names[0]);
+  // The input may be a fusion output (e.g. DQQFusion's Q) with no wrapper registered yet during
+  // validation. Fall back to NodeUnit TensorInfo so validation does not depend on build order.
+  Qnn_DataType_t input_data_type = QNN_DATATYPE_UNDEFINED;
+  QnnQuantParamsWrapper input_quant_param;
+  if (qnn_model_wrapper.IsQnnTensorWrapperExist(input_names[0])) {
+    const QnnTensorWrapper& input_tensor_wrapper = qnn_model_wrapper.GetQnnTensorWrapper(input_names[0]);
+    input_data_type = input_tensor_wrapper.GetTensorDataType();
+    input_quant_param = input_tensor_wrapper.GetQnnQuantParams().Copy();
+  } else {
+    TensorInfo input_info = {};
+    RETURN_IF_ERROR(qnn_model_wrapper.GetTensorInfo(node_unit.Inputs()[0], input_info));
+    input_data_type = input_info.qnn_data_type;
+    input_quant_param = input_info.quant_param.Copy();
+  }
 
   // If a cast to int64 is needed, add the cast node
   if (needs_int64_cast) {
@@ -214,8 +227,8 @@ Ort::Status TransposeOpBuilder::ProcessAttributesAndOutputs(QnnModelWrapper& qnn
   // 2. In QDQ model, Transpose also support non-quantized data like int32.
   QnnTensorWrapper output_tensorwrapper(output_name,
                                         tensor_type,
-                                        input_tensor_wrapper.GetTensorDataType(),
-                                        input_tensor_wrapper.GetQnnQuantParams().Copy(),
+                                        input_data_type,
+                                        std::move(input_quant_param),
                                         std::move(output_shape));
 
   RETURN_IF_NOT(qnn_model_wrapper.AddTensorWrapper(std::move(output_tensorwrapper)), "Failed to add tensor.");

@@ -90,6 +90,7 @@ static Ort::Status TryFoldConstantTranspose(QnnModelWrapper& qnn_model_wrapper,
   RETURN_IF_ERROR(GetConstantOrFoldedBytes(qnn_model_wrapper, input_name, input_bytes));
   RETURN_IF(input_bytes.size() != SafeInt<size_t>(num_elems) * elem_size,
             "Folded Transpose input byte size mismatch with shape.");
+  RETURN_IF(input_bytes.size() > kFoldedStaticMaxBytes, "Folded Transpose input too large to fold.");
 
   std::vector<uint8_t> output_bytes(input_bytes.size());
   std::vector<uint32_t> index(rank, 0);

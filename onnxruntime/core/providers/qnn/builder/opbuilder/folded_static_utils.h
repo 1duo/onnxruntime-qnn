@@ -3,6 +3,7 @@
 
 #pragma once
 
+#include <cstddef>
 #include <gsl/gsl>
 #include <string>
 #include <vector>
@@ -12,6 +13,9 @@
 
 namespace onnxruntime {
 namespace qnn {
+
+// Cap folded STATIC outputs (DLC bloat). DQQ scales are scalar, so a large fold only bloats the DLC.
+inline constexpr size_t kFoldedStaticMaxBytes = 1024 * 1024;  // 1 MiB
 
 // Chaining without a global set: a STATIC wrapper is initializer-backed or fold-derived.
 inline bool IsFoldedStaticTensor(const QnnModelWrapper& qnn_model_wrapper, const std::string& tensor_name) {

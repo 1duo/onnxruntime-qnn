@@ -67,6 +67,7 @@ Ort::Status TryFoldConstantQuantizeLinear(QnnModelWrapper& qnn_model_wrapper, co
 
   gsl::span<const float> fp32_input(reinterpret_cast<const float*>(input_bytes.data()), num_elems);
   const size_t total_bytes = utils::GetQnnTensorDataSizeInBytes(num_elems, output_info.qnn_data_type);
+  RETURN_IF(total_bytes > kFoldedStaticMaxBytes, "QuantizeLinear output too large to fold.");
   std::vector<uint8_t> quant_bytes(total_bytes);
   RETURN_IF_ERROR(utils::QuantizeData(fp32_input, gsl::make_span(input_info.shape),
                                       gsl::make_span(scales), gsl::make_span(offsets),

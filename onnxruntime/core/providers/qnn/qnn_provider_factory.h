@@ -87,6 +87,8 @@ class QnnEpFactory : public OrtEpFactory, public ApiPtrs {
   // Synthesized NPU hardware device when ORT Core doesn't enumerate one.
   // Real-but-undetected (WoS Makena, Linux/Android arm64) or virtual (x86 cross-compile).
   HardwareDeviceUniquePtr synthesized_npu_hw_device_;
+  // Virtual NPU for lockdown AOT when a real NPU already exists (ARM64).
+  HardwareDeviceUniquePtr synthesized_virtual_npu_hw_device_;
 
   // Custom op domains reported to ORT via GetCustomOpDomains. Holds both the qti_aisw block-op
   // domain (always registered) and any domains built from ORT_QNN_CUSTOM_OP_DOMAINS.

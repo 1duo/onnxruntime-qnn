@@ -1,7 +1,7 @@
-From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
-From: Hua-Yu Chou <hchou@qti.qualcomm.com>
-Date: Wed, 10 Sep 2026 10:00:00 +0800
-Subject: [PATCH 8/8] Suppress HandleReshapeSplit for rank-5/6 Reshape outputs
+From 8b71f317552755dc6ba042f5817f78c24be18b35 Mon Sep 17 00:00:00 2001
+From: ORT QNN EP team <noreply@qualcomm.com>
+Date: Thu, 10 Sep 2026 10:00:00 +0800
+Subject: [PATCH 3/5] Suppress HandleReshapeSplit for rank-5/6 Reshape outputs
 
 ORT 1.29's HandleReshapeSplit absorbs NHWC layout-conversion transposes
 into adjacent Reshape nodes whose output rank is higher than the incoming
@@ -13,16 +13,17 @@ recognise the pattern in the post-Layout-Transform GetCapability pass.
 
 Add an early-return guard that skips absorption when the Reshape output
 rank is 5 or 6, leaving all other ranks unchanged.
-
 ---
- onnxruntime/core/optimizer/transpose_optimization/onnx_transpose_optimization.cc | 9 +++++++++
+ .../onnx_transpose_optimization.cc                       | 9 +++++++++
  1 file changed, 9 insertions(+)
 
+diff --git a/onnxruntime/core/optimizer/transpose_optimization/onnx_transpose_optimization.cc b/onnxruntime/core/optimizer/transpose_optimization/onnx_transpose_optimization.cc
+index 33c0bd2..fd2993c 100755
 --- a/onnxruntime/core/optimizer/transpose_optimization/onnx_transpose_optimization.cc
 +++ b/onnxruntime/core/optimizer/transpose_optimization/onnx_transpose_optimization.cc
-@@ -2641,6 +2641,15 @@ static bool HandleReshapeSplit(HandlerArgs& args) {
+@@ -2658,6 +2658,15 @@ static bool HandleReshapeSplit(HandlerArgs& args) {
    }
-
+ 
    // This handler is for pure splits (output rank > post-transpose rank).
 +
 +  // Do not absorb transposes into rank-5 or rank-6 Reshape outputs. These ranks
@@ -36,5 +37,6 @@ rank is 5 or 6, leaving all other ranks unchanged.
    // Equal or smaller ranks are the domain of HandleReshapeAsTranspose.
    if (requested_shape.size() <= rank) {
      return false;
---
-2.39.0
+-- 
+2.53.0.windows.1
+

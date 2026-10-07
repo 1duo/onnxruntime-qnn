@@ -498,8 +498,14 @@ void OverrideParamTypeForRequantize(Qnn_DataType_t x_dtype,
 // Single source of truth for float execution, shared by ProcessInputs (stores params) and
 // ProcessAttributesAndOutputs (emits the op).
 //   - has_float_output: quantized input, no output Q -> float island; BN emits float directly.
+//     This is mandatory: without an output Q there are no quant params to lower a quantized BN to.
 //   - use_float_params: also covers u8/u16 input with per-channel scale, whose fused weight
 //     gamma/sqrt(var+eps) can overflow a single per-tensor requant scale.
+//     This second case is opportunistic, not mandatory, and is restricted to backends with native
+//     float BatchNorm (CPU/GPU). Fixed-point NPU backends (HTP/DSP) reject the float lowering at
+//     backend validation (QNN error 3110, observed on SM7750/v73); the rejected NHWC node then
+//     fatally breaks partitioning, while the quantized lowering validates fine. So on NPU
+//     backends the quantized lowering is the safe default there.
 struct BatchNormFloatExecution {
   bool has_float_output;
   bool use_float_params;
@@ -507,12 +513,13 @@ struct BatchNormFloatExecution {
 
 BatchNormFloatExecution GetBatchNormFloatExecution(const TensorInfo& input_info,
                                                    const TensorInfo& scale_info,
-                                                   const TensorInfo& output_info) {
+                                                   const TensorInfo& output_info,
+                                                   QnnBackendType backend_type) {
   const bool is_quantized_op = input_info.quant_param.IsQuantized();
   const bool has_float_output = is_quantized_op && !output_info.quant_param.IsQuantized();
   const bool use_float_params =
       has_float_output ||
-      (is_quantized_op &&
+      (!IsNpuBackend(backend_type) && is_quantized_op &&
        (input_info.qnn_data_type == QNN_DATATYPE_UFIXED_POINT_8 ||
         input_info.qnn_data_type == QNN_DATATYPE_UFIXED_POINT_16) &&
        scale_info.quant_param.IsPerChannel());
@@ -627,7 +634,9 @@ Ort::Status BatchNormalizationOpBuilder::ProcessInputs(QnnModelWrapper& qnn_mode
     // When BN runs in float, params below are stored as f32 (see GetBatchNormFloatExecution).
     TensorInfo output_info = {};
     RETURN_IF_ERROR(qnn_model_wrapper.GetTensorInfo(node_unit.Outputs()[0], output_info));
-    const bool use_float_params = GetBatchNormFloatExecution(input_info, scale_info, output_info).use_float_params;
+    const bool use_float_params = GetBatchNormFloatExecution(input_info, scale_info, output_info,
+                                                             qnn_model_wrapper.GetQnnBackendType())
+                                      .use_float_params;
 
     // Check if bias needs conversion (will be done after preprocessing)
     const bool bias_is_float = !bias_info.quant_param.IsQuantized() &&
@@ -762,7 +771,8 @@ Ort::Status BatchNormalizationOpBuilder::ProcessAttributesAndOutputs(QnnModelWra
   RETURN_IF_ERROR(qnn_model_wrapper.GetTensorInfo(node_unit.Outputs()[0], output_info));
 
   // has_float_output emits BN's float result with no trailing Quantize, feeding downstream float ops.
-  const BatchNormFloatExecution float_exec = GetBatchNormFloatExecution(input_info, scale_info, output_info);
+  const BatchNormFloatExecution float_exec =
+      GetBatchNormFloatExecution(input_info, scale_info, output_info, qnn_model_wrapper.GetQnnBackendType());
   const bool has_float_output = float_exec.has_float_output;
   const bool use_float_params = float_exec.use_float_params;
 

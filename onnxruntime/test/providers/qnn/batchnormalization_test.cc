@@ -772,12 +772,9 @@ TEST_F(QnnHTPBackendTests, BatchNorm2D_NearZeroVariance_U16) {
 // Test BatchNorm with near-zero variance channels (U8 input). When gamma/sqrt(var+eps) produces
 // outlier values, per-tensor uint8 quantization of fused weight overflows. The float-promotion path
 // (Convert U8->F32, BN in F32, Convert F32->U8) avoids this accuracy loss.
-// NOTE: the float-promotion path is only available on backends with native float BatchNorm (CPU/GPU).
-// Fixed-point NPU backends (HTP/DSP) reject the float lowering at backend validation, so there the EP
-// uses the quantized lowering (which is lossy for this pathological input). This test therefore runs
-// on the CPU backend, where the float path is supported and the accuracy assertion is meaningful.
-// HTP coverage of quantized BatchNorm lowering is provided by the other BatchNorm* tests (e.g.,
-// BatchNorm2D_U8S8F32, BatchNorm2dQdqParams) and by end-to-end quantized models.
+// NOTE: the float-promotion path requires native float BatchNorm, which NPU backends (HTP/DSP)
+// reject (QNN error 3110). Run on CPU, where the accuracy assertion is meaningful; HTP coverage
+// of the quantized lowering lives in the other BatchNorm* tests.
 TEST_F(QnnCPUBackendTests, BatchNorm2D_NearZeroVariance_U8) {
   constexpr int64_t batch = 1;
   constexpr int64_t channels = 4;

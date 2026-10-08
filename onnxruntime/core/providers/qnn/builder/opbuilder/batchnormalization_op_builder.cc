@@ -498,14 +498,12 @@ void OverrideParamTypeForRequantize(Qnn_DataType_t x_dtype,
 // Single source of truth for float execution, shared by ProcessInputs (stores params) and
 // ProcessAttributesAndOutputs (emits the op).
 //   - has_float_output: quantized input, no output Q -> float island; BN emits float directly.
-//     This is mandatory: without an output Q there are no quant params to lower a quantized BN to.
+//     Mandatory: without an output Q there are no quant params for a quantized lowering.
 //   - use_float_params: also covers u8/u16 input with per-channel scale, whose fused weight
 //     gamma/sqrt(var+eps) can overflow a single per-tensor requant scale.
-//     This second case is opportunistic, not mandatory, and is restricted to backends with native
-//     float BatchNorm (CPU/GPU). Fixed-point NPU backends (HTP/DSP) reject the float lowering at
-//     backend validation (QNN error 3110, observed on SM7750/v73); the rejected NHWC node then
-//     fatally breaks partitioning, while the quantized lowering validates fine. So on NPU
-//     backends the quantized lowering is the safe default there.
+//     Opportunistic: NPU backends (HTP/DSP) reject the float lowering (QNN error 3110), and an
+//     unselected NHWC node fatally breaks partitioning. Allowed only where float BatchNorm is
+//     native (CPU/GPU); NPU uses the quantized lowering.
 struct BatchNormFloatExecution {
   bool has_float_output;
   bool use_float_params;

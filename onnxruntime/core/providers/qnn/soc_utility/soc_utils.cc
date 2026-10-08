@@ -244,6 +244,29 @@ uint32_t MapHtpArchFromSocModel(uint32_t soc_model) {
   return 0;
 }
 
+std::optional<uint32_t> ParseHtpArchitecture(std::string_view architecture) {
+  if (architecture.empty() || architecture == "0") return 0;
+  if (architecture == "68") return 68;
+  if (architecture == "69") return 69;
+  if (architecture == "73") return 73;
+  if (architecture == "75") return 75;
+  if (architecture == "79") return 79;
+  if (architecture == "81") return 81;
+  return std::nullopt;
+}
+
+std::optional<uint32_t> ParseHtpTarget(std::string_view target) {
+  constexpr std::string_view prefix = "htp-v";
+  if (target.substr(0, prefix.size()) != prefix) return std::nullopt;
+  const auto architecture = ParseHtpArchitecture(target.substr(prefix.size()));
+  return architecture && *architecture != 0 ? architecture : std::nullopt;
+}
+
+std::string MakeHtpTarget(uint32_t architecture) {
+  const auto text = std::to_string(architecture);
+  return architecture != 0 && ParseHtpArchitecture(text) ? "htp-v" + text : std::string{};
+}
+
 }  // namespace soc
 }  // namespace qnn
 }  // namespace onnxruntime

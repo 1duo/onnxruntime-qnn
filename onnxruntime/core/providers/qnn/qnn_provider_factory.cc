@@ -5,19 +5,24 @@
 
 #include <algorithm>
 #include <cassert>
+#include <charconv>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <exception>
+#include <filesystem>
 #include <iostream>
 #include <optional>
+#include <string_view>
+#include <type_traits>
 #include <utility>
 
 #include "QnnCommon.h"
 #include "onnxruntime_c_api.h"
 #include "onnxruntime_ep_device_ep_metadata_keys.h"
 #include "onnxruntime_env_config_keys.h"
+#include "gsl/gsl"
 
 #include "core/providers/qnn/custom_op/qnn_custom_op_domain_registry.h"
 #include "core/providers/qnn/ort_api.h"
@@ -28,7 +33,56 @@
 #include "qnn_ep_min_ort_api_version.h"
 
 #ifdef _WIN32
+#include <windows.h>
 #include "core/providers/qnn/qnn_external_resource_importer.h"
+#endif
+
+#if defined(_WIN32) && QNN_ARCH_ARM64 && \
+    (QNN_API_VERSION_MAJOR > 2 || (QNN_API_VERSION_MAJOR == 2 && QNN_API_VERSION_MINOR >= 40))
+#include "QnnInterface.h"
+#include "HTP/QnnHtpCommon.h"
+#include "HTP/QnnHtpDevice.h"
+
+// Only used when ORT identifies one physical Qualcomm NPU. QNN backend device
+// IDs are not DXCore IDs; decline ambiguous mappings instead of guessing.
+static std::string DiscoverSingleHtpTarget() {
+  const auto location = onnxruntime::GetDynamicLibraryLocationByAddress(
+      reinterpret_cast<const void*>(&DiscoverSingleHtpTarget));
+  if (location.empty()) return {};
+  const auto path = std::filesystem::path(location).parent_path() / L"QnnHtp.dll";
+  const auto release_library = [](HMODULE module) { if (module) FreeLibrary(module); };
+  std::unique_ptr<std::remove_pointer_t<HMODULE>, decltype(release_library)> library(
+      LoadLibraryExW(path.c_str(), nullptr, LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR | LOAD_LIBRARY_SEARCH_DEFAULT_DIRS),
+      release_library);
+  if (!library) return {};
+  auto get_providers = reinterpret_cast<decltype(&QnnInterface_getProviders)>(
+      GetProcAddress(library.get(), "QnnInterface_getProviders"));
+  const QnnInterface_t** providers = nullptr;
+  uint32_t count = 0;
+  if (!get_providers || get_providers(&providers, &count) != QNN_SUCCESS || !providers) return {};
+  for (uint32_t i = 0; i < count; ++i) {
+    if (!providers[i] || providers[i]->backendId != QNN_BACKEND_ID_HTP) continue;
+    const auto& version = providers[i]->apiVersion.coreApiVersion;
+    if (version.major != QNN_API_VERSION_MAJOR || version.minor < QNN_API_VERSION_MINOR) continue;
+    const auto& api = providers[i]->QNN_INTERFACE_VER_NAME;
+    if (!api.deviceGetPlatformInfo || !api.deviceFreePlatformInfo) continue;
+    const QnnDevice_PlatformInfo_t* info = nullptr;
+    const auto release_info = [&api](const QnnDevice_PlatformInfo_t* value) {
+      if (value) api.deviceFreePlatformInfo(nullptr, value);
+    };
+    const auto result = api.deviceGetPlatformInfo(nullptr, &info);
+    std::unique_ptr<const QnnDevice_PlatformInfo_t, decltype(release_info)> owned_info(info, release_info);
+    if (result != QNN_SUCCESS || !info || info->version != QNN_DEVICE_PLATFORM_INFO_VERSION_1 ||
+        info->v1.numHwDevices != 1 || !info->v1.hwDevices) continue;
+    const auto& device = info->v1.hwDevices[0];
+    if (device.version != QNN_DEVICE_HARDWARE_DEVICE_INFO_VERSION_1) continue;
+    const auto* extension = reinterpret_cast<const QnnHtpDevice_DeviceInfoExtension_t*>(device.v1.deviceInfoExtension);
+    if (extension && extension->devType == QNN_HTP_DEVICE_TYPE_ON_CHIP) {
+      return onnxruntime::qnn::soc::MakeHtpTarget(static_cast<uint32_t>(extension->onChipDevice.arch));
+    }
+  }
+  return {};
+}
 #endif
 
 // We allow `backend_type` (e.g., `htp`) or `backend_path` in relative path (e.g., `QnnHtp.dll`) for configurations,
@@ -176,10 +230,75 @@ OrtStatus* ORT_API_CALL QnnEpFactory::GetSupportedDevicesImpl(OrtEpFactory* this
 
   size_t& num_ep_devices = *p_num_ep_devices;
   num_ep_devices = 0;
+  const size_t initial_ep_count = factory->ep_devices_.size();
+  const size_t initial_hw_count = factory->synthesized_hw_devices_.size();
+  bool discovery_complete = false;
+  auto rollback = gsl::finally([&]() {
+    if (!discovery_complete) {
+      for (size_t i = 0; i < num_ep_devices; ++i) {
+        factory->ep_api.ReleaseEpDevice(ep_devices[i]);
+        ep_devices[i] = nullptr;
+      }
+      factory->ep_devices_.resize(initial_ep_count);
+      factory->synthesized_hw_devices_.resize(initial_hw_count);
+      num_ep_devices = 0;
+    }
+  });
 
-  auto create_ep_device = [&factory, &ep_devices, &num_ep_devices](const OrtHardwareDevice* device) -> OrtStatus* {
+  // Read the environment before advertising devices. A compiler can describe its
+  // target here even when ORT's hardware discovery cannot access the NPU.
+  [[maybe_unused]] bool allow_virtual_devices = false;
+  std::optional<uint32_t> configured_npu_device_id;
+  std::string configured_target;
+  {
+    OrtKeyValuePairs* env_config = nullptr;
+    RETURN_IF_NOT_NULL(factory->ep_api.GetEnvConfigEntries(&env_config));
+    std::unique_ptr<OrtKeyValuePairs, decltype(factory->ort_api.ReleaseKeyValuePairs)> entries(
+        env_config, factory->ort_api.ReleaseKeyValuePairs);
+    if (entries) {
+      const char* allow = factory->ort_api.GetKeyValue(entries.get(), "allow_virtual_devices");
+      allow_virtual_devices = allow != nullptr && std::string_view(allow) == "1";
+      const std::string key = "ep_factory." + factory->ep_name_ + ".qnn_hardware_device_id";
+      if (const char* value = factory->ort_api.GetKeyValue(entries.get(), key.c_str())) {
+        // Chromium writes an unprefixed hexadecimal ID (e.g. "41304430").
+        // Accept an explicit hex prefix too, but reject partial/overflow parses.
+        std::string_view text(value);
+        if (text.size() >= 2 && text[0] == '0' && (text[1] == 'x' || text[1] == 'X')) {
+          text.remove_prefix(2);
+        }
+        uint32_t parsed = 0;
+        const auto result = std::from_chars(text.data(), text.data() + text.size(), parsed, 16);
+        if (text.empty() || result.ec != std::errc{} || result.ptr != text.data() + text.size()) {
+          return factory->ort_api.CreateStatus(
+              ORT_INVALID_ARGUMENT, (key + " must be a hexadecimal uint32 hardware device ID.").c_str());
+        }
+        configured_npu_device_id = parsed;
+      }
+      const std::string target_key = "ep_factory." + factory->ep_name_ + ".qnn_target_architecture";
+      if (const char* value = factory->ort_api.GetKeyValue(entries.get(), target_key.c_str())) {
+        if (!qnn::soc::ParseHtpTarget(value)) {
+          return factory->ort_api.CreateStatus(
+              ORT_INVALID_ARGUMENT, (target_key + " must name a supported HTP architecture, e.g. htp-v73.").c_str());
+        }
+        if (!configured_npu_device_id.has_value()) {
+          return factory->ort_api.CreateStatus(ORT_INVALID_ARGUMENT,
+                                               "QNN target architecture requires qnn_hardware_device_id in the same environment.");
+        }
+        configured_target = value;
+      }
+    }
+  }
+
+  auto create_ep_device = [&factory, &ep_devices, &num_ep_devices](const OrtHardwareDevice* device,
+                                                                   const std::string& target = std::string{}) -> OrtStatus* {
+    OrtKeyValuePairs* metadata = nullptr;
+    factory->ort_api.CreateKeyValuePairs(&metadata);
+    std::unique_ptr<OrtKeyValuePairs, decltype(factory->ort_api.ReleaseKeyValuePairs)> owned_metadata(
+        metadata, factory->ort_api.ReleaseKeyValuePairs);
+    if (!target.empty()) factory->ort_api.AddKeyValuePair(metadata, "target_architecture", target.c_str());
     OrtEpDevice* ep_device = nullptr;
-    RETURN_IF_NOT_NULL(factory->ep_api.CreateEpDevice(factory, device, nullptr, nullptr, &ep_device));
+    OrtStatus* status = factory->ep_api.CreateEpDevice(factory, device, metadata, nullptr, &ep_device);
+    if (status) return status;
 
     // Advertise HOST_ACCESSIBLE memory for NPU devices so OrtEnv can create a
     // QnnHtpShared allocator before a QNN session exists. Loading RPCMEM is deferred
@@ -187,7 +306,7 @@ OrtStatus* ORT_API_CALL QnnEpFactory::GetSupportedDevicesImpl(OrtEpFactory* this
     const auto device_type = factory->ort_api.HardwareDevice_Type(device);
     if (device_type == OrtHardwareDeviceType_NPU &&
         factory->host_accessible_memory_info_ != nullptr) {
-      OrtStatus* status = factory->ep_api.EpDevice_AddAllocatorInfo(
+      status = factory->ep_api.EpDevice_AddAllocatorInfo(
           ep_device, factory->host_accessible_memory_info_.get());
       if (status != nullptr) {
         factory->ep_api.ReleaseEpDevice(ep_device);
@@ -203,7 +322,8 @@ OrtStatus* ORT_API_CALL QnnEpFactory::GetSupportedDevicesImpl(OrtEpFactory* this
 
   auto create_hw_device = [&factory](const OrtHardwareDeviceType device_type,
                                      OrtHardwareDevice*& device,
-                                     const bool is_virtual = true) {
+                                     const bool is_virtual = true,
+                                     const uint32_t device_id = 0) {
     OrtKeyValuePairs* hw_metadata = nullptr;
     factory->ort_api.CreateKeyValuePairs(&hw_metadata);
     factory->ort_api.AddKeyValuePair(hw_metadata, "Description",
@@ -214,7 +334,7 @@ OrtStatus* ORT_API_CALL QnnEpFactory::GetSupportedDevicesImpl(OrtEpFactory* this
 
     OrtStatus* status = factory->ep_api.CreateHardwareDevice(device_type,
                                                              factory->vendor_id_,
-                                                             0,
+                                                             device_id,
                                                              factory->vendor_.c_str(),
                                                              hw_metadata,
                                                              &device);
@@ -227,7 +347,20 @@ OrtStatus* ORT_API_CALL QnnEpFactory::GetSupportedDevicesImpl(OrtEpFactory* this
   };
 
   bool has_npu_hw_device = false;
+  uint32_t npu_device_id = 0;  // DXCore device_id of the real NPU, propagated to virtual NPU for WebNN matching.
+  std::string discovered_target;
+#if defined(_WIN32) && QNN_ARCH_ARM64 && \
+    (QNN_API_VERSION_MAJOR > 2 || (QNN_API_VERSION_MAJOR == 2 && QNN_API_VERSION_MINOR >= 40))
+  size_t physical_npu_count = 0;
+  for (size_t i = 0; i < num_devices; ++i) {
+    if (factory->ort_api.HardwareDevice_Type(devices[i]) == OrtHardwareDeviceType_NPU &&
+        factory->ort_api.HardwareDevice_VendorId(devices[i]) == factory->vendor_id_) ++physical_npu_count;
+  }
+  // A supplied compilation target must not depend on driver access in a sandbox.
+  if (physical_npu_count == 1 && configured_target.empty()) discovered_target = DiscoverSingleHtpTarget();
+#endif
 
+  // Phase 1: Claim ORT Core hardware devices (from DXCore/SetupAPI).
   for (size_t idx = 0; idx < num_devices && num_ep_devices < max_ep_devices; ++idx) {
     const OrtHardwareDevice* device = devices[idx];
     auto device_type = factory->ort_api.HardwareDevice_Type(device);
@@ -235,17 +368,30 @@ OrtStatus* ORT_API_CALL QnnEpFactory::GetSupportedDevicesImpl(OrtEpFactory* this
 
     if ((kDefaultBackends.find(device_type) != kDefaultBackends.end() && vendor_id == factory->vendor_id_) ||
         (device_type == OrtHardwareDeviceType_CPU && QnnCpuBackendEnabled())) {
-      RETURN_IF_NOT_NULL(create_ep_device(device));
+      RETURN_IF_NOT_NULL(create_ep_device(device, device_type == OrtHardwareDeviceType_NPU ? discovered_target : std::string{}));
 
       if (device_type == OrtHardwareDeviceType_NPU) {
         has_npu_hw_device = true;
+        npu_device_id = factory->ort_api.HardwareDevice_DeviceId(device);
       }
     }
   }
 
-  bool has_real_npu = has_npu_hw_device;
+  // Explicit compiler target identity takes precedence over discovery. Zero is
+  // a valid supplied identity, so presence is tracked separately from its value.
+  if (configured_npu_device_id.has_value()) {
+    if (npu_device_id != *configured_npu_device_id) discovered_target.clear();
+    npu_device_id = *configured_npu_device_id;
+  }
 
-  if (!has_npu_hw_device && num_ep_devices < max_ep_devices) {
+  bool use_supplied_virtual_device = false;
+#if defined(_WIN32) && QNN_ARCH_ARM64 && \
+    (QNN_API_VERSION_MAJOR > 2 || (QNN_API_VERSION_MAJOR == 2 && QNN_API_VERSION_MINOR >= 40))
+  use_supplied_virtual_device = allow_virtual_devices && configured_npu_device_id.has_value();
+#endif
+
+  if (!has_npu_hw_device && num_ep_devices < max_ep_devices &&
+      !use_supplied_virtual_device) {
     const bool has_real_undetected_npu = qnn::soc::GetSocId() != 0 || qnn::soc::HasFastRpcCdspDevice();
 
     bool allow_virtual_devices = false;
@@ -268,41 +414,48 @@ OrtStatus* ORT_API_CALL QnnEpFactory::GetSupportedDevicesImpl(OrtEpFactory* this
       // explicitly allowed a compile-only virtual device with no local hardware.
       const bool is_virtual = !has_real_undetected_npu;
       OrtHardwareDevice* synthesized_npu_hw_device = nullptr;
-      RETURN_IF_NOT_NULL(create_hw_device(OrtHardwareDeviceType_NPU, synthesized_npu_hw_device, is_virtual));
-      factory->synthesized_npu_hw_device_ = HardwareDeviceUniquePtr(
+      RETURN_IF_NOT_NULL(create_hw_device(OrtHardwareDeviceType_NPU, synthesized_npu_hw_device, is_virtual,
+                                          npu_device_id));
+      factory->synthesized_hw_devices_.push_back(HardwareDeviceUniquePtr(
           synthesized_npu_hw_device,
-          FuncDeleter<OrtHardwareDevice>{factory->ep_api.ReleaseHardwareDevice});
+          FuncDeleter<OrtHardwareDevice>{factory->ep_api.ReleaseHardwareDevice}));
 
-      RETURN_IF_NOT_NULL(create_ep_device(factory->synthesized_npu_hw_device_.get()));
-
-      if (!is_virtual) {
-        has_real_npu = true;
-      }
+      RETURN_IF_NOT_NULL(create_ep_device(factory->synthesized_hw_devices_.back().get()));
     }
   }
 
-  // Phase 3: Synthesize a virtual NPU for lockdown AOT when a real NPU exists.
+  // Phase 3: Advertise an ARM64 compilation device only when the host opts in.
+  // The supplied identity also enables this path without hardware rediscovery.
   // Selecting this device auto-configures cross_device_prepare + prepare_only in CreateEpImpl.
   // Cross device prepare requires Windows ARM64 + QAIRT >= 2.51 (QNN API 2.40).
 #if defined(_WIN32) && QNN_ARCH_ARM64 && \
     (QNN_API_VERSION_MAJOR > 2 || (QNN_API_VERSION_MAJOR == 2 && QNN_API_VERSION_MINOR >= 40))
-  if (has_real_npu && num_ep_devices < max_ep_devices) {
+  if (allow_virtual_devices && num_ep_devices < max_ep_devices) {
+    if (!has_npu_hw_device && !configured_npu_device_id.has_value()) {
+      const std::string message =
+          "QNN virtual NPU discovery requires a discovered NPU or the hexadecimal environment entry ep_factory." +
+          factory->ep_name_ + ".qnn_hardware_device_id. The host must supply the selected hardware identity.";
+      return factory->ort_api.CreateStatus(ORT_FAIL, message.c_str());
+    }
     OrtHardwareDevice* virtual_npu = nullptr;
-    RETURN_IF_NOT_NULL(create_hw_device(OrtHardwareDeviceType_NPU, virtual_npu, /*is_virtual=*/true));
-    factory->synthesized_virtual_npu_hw_device_ = HardwareDeviceUniquePtr(
+    RETURN_IF_NOT_NULL(create_hw_device(OrtHardwareDeviceType_NPU, virtual_npu, /*is_virtual=*/true,
+                                        npu_device_id));
+    factory->synthesized_hw_devices_.push_back(HardwareDeviceUniquePtr(
         virtual_npu,
-        FuncDeleter<OrtHardwareDevice>{factory->ep_api.ReleaseHardwareDevice});
+        FuncDeleter<OrtHardwareDevice>{factory->ep_api.ReleaseHardwareDevice}));
 
-    RETURN_IF_NOT_NULL(create_ep_device(factory->synthesized_virtual_npu_hw_device_.get()));
+    RETURN_IF_NOT_NULL(create_ep_device(factory->synthesized_hw_devices_.back().get(),
+                                       configured_target.empty() ? discovered_target : configured_target));
   }
 #endif
 
+  discovery_complete = true;
   return nullptr;
 }
 
 OrtStatus* ORT_API_CALL QnnEpFactory::CreateEpImpl(OrtEpFactory* this_ptr,
                                                    _In_reads_(num_devices) const OrtHardwareDevice* const* devices,
-                                                   _In_reads_(num_devices) const OrtKeyValuePairs* const* /*ep_metadata*/,
+                                                   _In_reads_(num_devices) const OrtKeyValuePairs* const* ep_metadata,
                                                    _In_ size_t num_devices,
                                                    _In_ const OrtSessionOptions* session_options,
                                                    _In_ const OrtLogger* logger,
@@ -408,7 +561,8 @@ OrtStatus* ORT_API_CALL QnnEpFactory::CreateEpImpl(OrtEpFactory* this_ptr,
   // Injects cross_device_prepare, prepare_only, and context_enable as defaults (skipped if user already set them).
   {
     bool has_virtual_device = false;
-    for (size_t i = 0; i < num_devices && !has_virtual_device; ++i) {
+    std::optional<uint32_t> target_arch;
+    for (size_t i = 0; i < num_devices; ++i) {
       const auto* metadata = factory->ort_api.HardwareDevice_Metadata(devices[i]);
       if (metadata) {
         const char* const* keys = nullptr;
@@ -419,6 +573,16 @@ OrtStatus* ORT_API_CALL QnnEpFactory::CreateEpImpl(OrtEpFactory* this_ptr,
           if (strcmp(keys[j], kOrtHardwareDevice_MetadataKey_IsVirtual) == 0 &&
               strcmp(values[j], "1") == 0) {
             has_virtual_device = true;
+            if (ep_metadata && ep_metadata[i]) {
+              const char* target = factory->ort_api.GetKeyValue(ep_metadata[i], "target_architecture");
+              if (target) {
+                const auto parsed = qnn::soc::ParseHtpTarget(target);
+                if (!parsed || (target_arch && *target_arch != *parsed)) {
+                  return factory->ort_api.CreateStatus(ORT_INVALID_ARGUMENT, "Invalid or conflicting QNN virtual-device targets.");
+                }
+                target_arch = parsed;
+              }
+            }
             break;
           }
         }
@@ -440,6 +604,54 @@ OrtStatus* ORT_API_CALL QnnEpFactory::CreateEpImpl(OrtEpFactory* this_ptr,
         }
         return nullptr;
       };
+
+      const auto arch_key = provider_prefix + "htp_arch";
+      const auto soc_key = provider_prefix + "soc_model";
+      auto read_option = [&](const std::string& key, std::string& value) -> OrtStatus* {
+        int present = 0;
+        RETURN_IF_NOT_NULL(factory->ort_api.HasSessionConfigEntry(session_options, key.c_str(), &present));
+        if (present) {
+          size_t size = 0;
+          RETURN_IF_NOT_NULL(factory->ort_api.GetSessionConfigEntry(session_options, key.c_str(), nullptr, &size));
+          std::vector<char> buffer(size);
+          RETURN_IF_NOT_NULL(factory->ort_api.GetSessionConfigEntry(session_options, key.c_str(), buffer.data(), &size));
+          value = buffer.data();
+        }
+        return nullptr;
+      };
+      std::string explicit_arch;
+      std::string explicit_soc;
+      RETURN_IF_NOT_NULL(read_option(arch_key, explicit_arch));
+      RETURN_IF_NOT_NULL(read_option(soc_key, explicit_soc));
+      if (target_arch) {
+        const bool automatic_arch = explicit_arch.empty() || explicit_arch == "0";
+        if (!automatic_arch && explicit_arch != std::to_string(*target_arch)) {
+          return factory->ort_api.CreateStatus(ORT_INVALID_ARGUMENT, "QNN htp_arch conflicts with the selected virtual-device target.");
+        }
+        if (!explicit_soc.empty() && explicit_soc != "0") {
+          uint32_t model = qnn::soc::MapSocModelFromSocName(explicit_soc);
+          if (model == 0) {
+            const auto parsed = std::from_chars(explicit_soc.data(), explicit_soc.data() + explicit_soc.size(), model, 10);
+            if (parsed.ec != std::errc{} || parsed.ptr != explicit_soc.data() + explicit_soc.size()) model = 0;
+          }
+          if (qnn::soc::MapHtpArchFromSocModel(model) != *target_arch) {
+            return factory->ort_api.CreateStatus(ORT_INVALID_ARGUMENT,
+                                                 "QNN soc_model is unknown or conflicts with the selected virtual-device target.");
+          }
+        }
+        // An explicitly present empty/zero option also requests automatic
+        // selection; replace it with the transported target instead of leaving
+        // QNN to fall back to its HOST-mode default architecture.
+        RETURN_IF_NOT_NULL(factory->ort_api.AddSessionConfigEntry(
+            autoep_session_options.get(), arch_key.c_str(), std::to_string(*target_arch).c_str()));
+      }
+#if defined(_WIN32) && QNN_ARCH_ARM64
+      else if ((explicit_arch.empty() || explicit_arch == "0") &&
+               (explicit_soc.empty() || explicit_soc == "0")) {
+        return factory->ort_api.CreateStatus(ORT_INVALID_ARGUMENT,
+                                             "QNN virtual compilation requires target_architecture metadata or an explicit htp_arch/soc_model.");
+      }
+#endif
 
       RETURN_IF_NOT_NULL(inject_default("ep.context_enable", "1"));
       RETURN_IF_NOT_NULL(inject_default((provider_prefix + "enable_htp_prepare_only").c_str(), "1"));

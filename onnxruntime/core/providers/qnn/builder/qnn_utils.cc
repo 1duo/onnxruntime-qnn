@@ -1865,13 +1865,18 @@ static bool IsNarrowingQuantOutput(Qnn_DataType_t activation_qnn_data_type, Qnn_
          (output_qnn_data_type == QNN_DATATYPE_UFIXED_POINT_8 || output_qnn_data_type == QNN_DATATYPE_SFIXED_POINT_8);
 }
 
-// Every output level maps onto an intermediate level, so the Convert only drops the extra precision and the
-// result matches quantizing directly to the output encoding.
+static bool IsWideningQuantInput(Qnn_DataType_t activation_qnn_data_type, Qnn_DataType_t output_qnn_data_type) {
+  return IsQuant16bit(output_qnn_data_type) &&
+         (activation_qnn_data_type == QNN_DATATYPE_UFIXED_POINT_8 ||
+          activation_qnn_data_type == QNN_DATATYPE_SFIXED_POINT_8);
+}
+
+// Every 8-bit level maps onto a 16-bit level, so the Convert is exact.
 static Ort::Status GetNarrowingIntermediateQuantParams(Qnn_DataType_t activation_qnn_data_type,
                                                        Qnn_DataType_t output_qnn_data_type,
                                                        const QnnQuantParamsWrapper& output_quant_param,
                                                        QnnQuantParamsWrapper& intermediate_quant_param) {
-  RETURN_IF_NOT(output_quant_param.IsPerTensor(), "Narrowing output requires a per-tensor encoding");
+  RETURN_IF_NOT(output_quant_param.IsPerTensor(), "Convert requires a per-tensor encoding");
   const Qnn_ScaleOffset_t& out_encoding = output_quant_param.Get().scaleOffsetEncoding;
 
   int64_t qmin_out = 0;
@@ -1924,17 +1929,40 @@ Ort::Status AddOpWithQuantizedOutput(QnnModelWrapper& qnn_model_wrapper,
   }
 
   std::string op_output_name = output_name;
+  Qnn_DataType_t op_activation_qnn_data_type = activation_qnn_data_type;
+  if (!is_float_act_quant_weight &&
+      IsWideningQuantInput(activation_qnn_data_type, output_qnn_data_type)) {
+    const auto& input_tensor = qnn_model_wrapper.GetQnnTensorWrapper(input_names[0]);
+    QnnQuantParamsWrapper intermediate_quant_param;
+    RETURN_IF_ERROR(GetNarrowingIntermediateQuantParams(output_qnn_data_type, activation_qnn_data_type,
+                                                        input_tensor.GetQnnQuantParams(), intermediate_quant_param));
+    const std::string convert_output_name = UniqueNameGenerator().New(input_names[0], "_converted");
+    QnnTensorWrapper intermediate_tensorwrapper(convert_output_name, QNN_TENSOR_TYPE_NATIVE, output_qnn_data_type,
+                                                std::move(intermediate_quant_param),
+                                                std::vector<uint32_t>(input_tensor.GetTensorDims()));
+    RETURN_IF_NOT(qnn_model_wrapper.AddTensorWrapper(std::move(intermediate_tensorwrapper)), "Failed to add tensor.");
+    RETURN_IF_NOT(qnn_model_wrapper.CreateQnnNode(UniqueNameGenerator().New(convert_output_name, QNN_OP_CONVERT),
+                                                  QNN_OP_PACKAGE_NAME_QTI_AISW,
+                                                  QNN_OP_CONVERT,
+                                                  {input_names[0]},
+                                                  {convert_output_name},
+                                                  {},
+                                                  do_op_validation),
+                  "Failed to add node.");
+    input_names[0] = convert_output_name;
+    op_activation_qnn_data_type = output_qnn_data_type;
+  }
   if (is_float_act_quant_weight) {
     op_output_name = UniqueNameGenerator().New(output_name, "_fp16");
     QnnTensorWrapper fp16_tensorwrapper(op_output_name, QNN_TENSOR_TYPE_NATIVE, QNN_DATATYPE_FLOAT_16,
                                         QnnQuantParamsWrapper(), std::vector<uint32_t>(output_shape));
     RETURN_IF_NOT(qnn_model_wrapper.AddTensorWrapper(std::move(fp16_tensorwrapper)), "Failed to add tensor.");
-  } else if (IsNarrowingQuantOutput(activation_qnn_data_type, output_qnn_data_type)) {
+  } else if (IsNarrowingQuantOutput(op_activation_qnn_data_type, output_qnn_data_type)) {
     QnnQuantParamsWrapper intermediate_quant_param;
-    RETURN_IF_ERROR(GetNarrowingIntermediateQuantParams(activation_qnn_data_type, output_qnn_data_type,
+    RETURN_IF_ERROR(GetNarrowingIntermediateQuantParams(op_activation_qnn_data_type, output_qnn_data_type,
                                                         output_quant_param, intermediate_quant_param));
     op_output_name = UniqueNameGenerator().New(output_name, "_pre_convert");
-    QnnTensorWrapper intermediate_tensorwrapper(op_output_name, QNN_TENSOR_TYPE_NATIVE, activation_qnn_data_type,
+    QnnTensorWrapper intermediate_tensorwrapper(op_output_name, QNN_TENSOR_TYPE_NATIVE, op_activation_qnn_data_type,
                                                 std::move(intermediate_quant_param),
                                                 std::vector<uint32_t>(output_shape));
     RETURN_IF_NOT(qnn_model_wrapper.AddTensorWrapper(std::move(intermediate_tensorwrapper)), "Failed to add tensor.");

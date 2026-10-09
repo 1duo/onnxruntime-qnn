@@ -1078,10 +1078,11 @@ bool OrtSplitNodeGroupSelector::Check(const OrtGraph* graph, const OrtApi& ort_a
   return true;
 }
 
-// A 16-bit activation with an 8-bit per-tensor output is built as a 16-bit op followed by a Convert.
+// 16-bit act with 8-bit out is built as 16-bit op + Convert; 8-bit act with 16-bit out is built as Convert + 16-bit op.
 static bool IsSupportedActivationOutputTypePair(const OrtGraph* graph, const OrtApi& ort_api,
                                                 ONNXTensorElementDataType dt_input,
                                                 ONNXTensorElementDataType dt_output,
+                                                const OrtNode* dq_node,
                                                 const OrtNode* q_node) {
   if (dt_input == dt_output) {
     return true;
@@ -1090,7 +1091,17 @@ static bool IsSupportedActivationOutputTypePair(const OrtGraph* graph, const Ort
                               dt_input == ONNX_TENSOR_ELEMENT_DATA_TYPE_INT16;
   const bool is_8bit_output = dt_output == ONNX_TENSOR_ELEMENT_DATA_TYPE_UINT8 ||
                               dt_output == ONNX_TENSOR_ELEMENT_DATA_TYPE_INT8;
-  return is_16bit_input && is_8bit_output && IsQOrDQScalePositiveConstantScalar(graph, ort_api, q_node);
+  if (is_16bit_input && is_8bit_output) {
+    return IsQOrDQScalePositiveConstantScalar(graph, ort_api, q_node);
+  }
+  const bool is_8bit_input = dt_input == ONNX_TENSOR_ELEMENT_DATA_TYPE_UINT8 ||
+                             dt_input == ONNX_TENSOR_ELEMENT_DATA_TYPE_INT8;
+  const bool is_16bit_output = dt_output == ONNX_TENSOR_ELEMENT_DATA_TYPE_UINT16 ||
+                               dt_output == ONNX_TENSOR_ELEMENT_DATA_TYPE_INT16;
+  if (is_8bit_input && is_16bit_output) {
+    return IsQOrDQScalePositiveConstantScalar(graph, ort_api, dq_node);
+  }
+  return false;
 }
 
 // Float activation with a weight-only DQ of a constant per-channel initializer. QNN takes the weight as a
@@ -1185,7 +1196,8 @@ bool OrtConvNodeGroupSelector::Check(const OrtGraph* graph, const OrtApi& ort_ap
     return false;
   }
 
-  if (!IsSupportedActivationOutputTypePair(graph, ort_api, dt_input.value(), dt_output.value(), q_nodes[0])) {
+  if (!IsSupportedActivationOutputTypePair(graph, ort_api, dt_input.value(), dt_output.value(), dq_nodes[0],
+                                           q_nodes[0])) {
     return false;
   }
 
@@ -1302,7 +1314,8 @@ bool OrtMatMulNodeGroupSelector::Check(const OrtGraph* graph, const OrtApi& ort_
 
   auto dt_output = GetNodeOutputDataType(q_nodes[0], ort_api, 0);
   return dt_output.has_value() &&
-         IsSupportedActivationOutputTypePair(graph, ort_api, dt_input.value(), dt_output.value(), q_nodes[0]);
+         IsSupportedActivationOutputTypePair(graph, ort_api, dt_input.value(), dt_output.value(), dq_nodes[0],
+                                             q_nodes[0]);
 }
 
 bool OrtGemmNodeGroupSelector::Check(const OrtGraph* graph, const OrtApi& ort_api, const OrtNode* node,

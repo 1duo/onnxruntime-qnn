@@ -393,6 +393,30 @@ TEST(QnnUnit_SpillFillUtilsTest, GetMaxSpillFillBufferSizeFromGraphInfo_UsesOnly
   EXPECT_EQ(qnn::GetMaxSpillFillBufferSizeFromGraphInfo(graph_infos, 3), 300u);
   EXPECT_EQ(qnn::GetMaxSpillFillBufferSizeFromGraphInfo(nullptr, 0), 0u);
 }
+
+TEST_F(QnnUnit_BackendSystemDlcPluginTest,
+       LoadCachedQnnContextFromBuffer_StandardOversizedMax_ReturnsError) {
+  GraphSpec graph;
+  graph.spill_fill_buffer_size = 300;
+  AddRecord({graph});
+
+  std::unordered_map<std::string, std::unique_ptr<qnn::QnnModel>> qnn_models;
+  ExpectErrorContains(
+      backend_manager_.GetMutable()->LoadCachedQnnContextFromBuffer(
+          reinterpret_cast<char*>(const_cast<void*>(RecordData(0))),
+          records_[0].size(),
+          "",
+          "node",
+          qnn_models,
+          301,
+          301,
+          qnn::EpContextIoDispatch(nullptr),
+          /*is_multi_soc_buffer=*/false),
+      "exceeds the spill-fill size 300");
+
+  ASSERT_EQ(get_binary_info_buffers.size(), 1u);
+  EXPECT_EQ(get_binary_info_buffers[0], RecordData(0));
+}
 #endif  // QNN_HTP_SPILL_FILL_BUFFER_AVAILABLE
 
 // ---------------------------------------------------------------------------

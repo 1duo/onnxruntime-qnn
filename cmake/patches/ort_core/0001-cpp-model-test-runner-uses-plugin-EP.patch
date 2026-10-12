@@ -1,7 +1,7 @@
-From 1024518f87de3996ee5702938092a22766a4bcd8 Mon Sep 17 00:00:00 2001
+From 04ae6b629cc0e47030e5b3fb3051151c4763f644 Mon Sep 17 00:00:00 2001
 From: ORT QNN EP team <noreply@qualcomm.com>
-Date: Tue, 21 Jul 2026 11:32:21 -0700
-Subject: [PATCH 1/5] cpp model test runner uses plugin EP
+Date: Tue, 21 Jul 2026 00:00:00 +0000
+Subject: [PATCH 1/4] cpp model test runner uses plugin EP
 
 ---
  cmake/CMakeLists.txt                          |   5 +
@@ -1903,7 +1903,7 @@ index 0000000..690a379
 +}  // namespace onnxruntime
 diff --git a/onnxruntime/test/onnx/utils/utils.cc b/onnxruntime/test/onnx/utils/utils.cc
 new file mode 100644
-index 0000000..67d317f
+index 0000000..c926002
 --- /dev/null
 +++ b/onnxruntime/test/onnx/utils/utils.cc
 @@ -0,0 +1,93 @@
@@ -1951,7 +1951,7 @@ index 0000000..67d317f
 +                                      std::vector<std::string>& registered_plugin_eps) {
 +  if (!plugin_ep_names_and_libs.empty()) {
 +    std::unordered_map<std::string, std::string> ep_names_to_libs;
-+    ParseSessionConfigs(onnxruntime::ToUTF8String(plugin_ep_names_and_libs), ep_names_to_libs);
++    test::utils::ParseSessionConfigs(onnxruntime::ToUTF8String(plugin_ep_names_and_libs), ep_names_to_libs);
 +    if (ep_names_to_libs.size() > 0) {
 +      for (auto& pair : ep_names_to_libs) {
 +        const std::filesystem::path library_path = pair.second;

@@ -1,7 +1,7 @@
 From 418fbdd6ebec0240749608ccc7c14f160e153ff2 Mon Sep 17 00:00:00 2001
 From: QNN EP team <noreply@qualcomm.com>
 Date: Tue, 18 Aug 2026 00:00:00 +0000
-Subject: [PATCH 4/5] cmake: guard QNN_LIB_FILES copy in
+Subject: [PATCH 3/5] cmake: guard QNN_LIB_FILES copy in
  onnxruntime_unittests.cmake
 
 In static_lib mode (e.g. Android builds) QNN_LIB_FILES is empty because

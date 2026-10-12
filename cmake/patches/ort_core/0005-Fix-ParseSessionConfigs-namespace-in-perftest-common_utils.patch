@@ -1,7 +1,7 @@
 From 1a2b3c4d5e6f7g8h9i0j1k2l3m4n5o6p Mon Sep 17 00:00:00 2001
 From: ORT QNN EP team <noreply@qualcomm.com>
 Date: Wed, 7 Oct 2026 23:59:00 +0800
-Subject: [PATCH 6/6] Fix ParseSessionConfigs namespace in perftest common_utils
+Subject: [PATCH 5/5] Fix ParseSessionConfigs namespace in perftest common_utils
 
 In ORT 1.30.0, strings_helper.h was moved from perftest to onnx/utils,
 but the namespace wasn't updated in common_utils.cc. The function

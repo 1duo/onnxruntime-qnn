@@ -1,7 +1,7 @@
 From 2c687a07b62a3e540c8b25bd24c291a83ea926db Mon Sep 17 00:00:00 2001
 From: QNN EP team <noreply@qualcomm.com>
 Date: Wed, 9 Sep 2026 00:00:00 +0000
-Subject: [PATCH 5/5] session: deduplicate custom-op domains for AutoEP devices
+Subject: [PATCH 4/5] session: deduplicate custom-op domains for AutoEP devices
 
 AutoEP can expose multiple devices backed by the same EP factory. Each device
 can return the same custom-op domain, such as the QNN qti_aisw domain.

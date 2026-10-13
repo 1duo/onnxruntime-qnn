@@ -2167,9 +2167,12 @@ Ort::Status ResolveExternalDataPath(const std::filesystem::path& model_directory
     RETURN_IF(component == "..", "External initializer location must not leave the model directory.");
   }
 
+  const std::filesystem::path effective_model_directory =
+      model_directory.empty() ? std::filesystem::path{"."} : model_directory;
+
   std::error_code error_code;
   const std::filesystem::path canonical_model_directory =
-      std::filesystem::weakly_canonical(model_directory, error_code);
+      std::filesystem::weakly_canonical(effective_model_directory, error_code);
   RETURN_IF(error_code, "Failed to resolve the model directory: ", error_code.message());
 
   const std::filesystem::path candidate_path =

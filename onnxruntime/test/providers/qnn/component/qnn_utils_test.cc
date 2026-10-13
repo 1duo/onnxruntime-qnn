@@ -1297,7 +1297,7 @@ TEST(QnnUnit_UtilsTest, RequantizeBiasTensor_PerChannel_ScalesUpdated) {
 
 TEST(QnnUnit_UtilsTest, GetQnnErrorMessage_ReturnsNonEmptyString) {
   QnnRealHtpBackendContext backend;
-  ASSERT_TRUE(backend.IsValid()) << "libQnnHtp.so not available";
+  ASSERT_TRUE(backend.IsValid()) << QnnHtpBackendLibraryName() << " not available";
   std::string msg = qnn::utils::GetQnnErrorMessage(backend.qnn_interface,
                                                    static_cast<Qnn_ErrorHandle_t>(1));
   EXPECT_FALSE(msg.empty());
@@ -1305,7 +1305,7 @@ TEST(QnnUnit_UtilsTest, GetQnnErrorMessage_ReturnsNonEmptyString) {
 
 TEST(QnnUnit_UtilsTest, GetVerboseQnnErrorMessage_ReturnsNonEmptyString) {
   QnnRealHtpBackendContext backend;
-  ASSERT_TRUE(backend.IsValid()) << "libQnnHtp.so not available";
+  ASSERT_TRUE(backend.IsValid()) << QnnHtpBackendLibraryName() << " not available";
   std::string msg = qnn::utils::GetVerboseQnnErrorMessage(backend.qnn_interface,
                                                           static_cast<Qnn_ErrorHandle_t>(1));
   EXPECT_FALSE(msg.empty());
@@ -1696,8 +1696,8 @@ TEST(QnnUnit_UtilsTest, ResolveExternalDataPath_SymlinkOutsideModelDirectoryRetu
 #ifdef _WIN32
 TEST(QnnUnit_UtilsTest, ResolveExternalDataPath_RootedWindowsPathsReturnError) {
   for (const std::filesystem::path& path : {std::filesystem::path("\\outside.bin"),
-                                           std::filesystem::path("C:outside.bin"),
-                                           std::filesystem::path("C:\\outside.bin")}) {
+                                            std::filesystem::path("C:outside.bin"),
+                                            std::filesystem::path("C:\\outside.bin")}) {
     std::filesystem::path resolved_path;
     auto status = qnn::utils::ResolveExternalDataPath(std::filesystem::current_path(), path, resolved_path);
     EXPECT_FALSE(status.IsOK()) << path.string();

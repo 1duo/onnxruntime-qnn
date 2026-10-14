@@ -134,6 +134,7 @@ class BuildEpWindowsTask(RunPowershellScriptsTask):
         build_as_x: bool = False,
         build_nuget: bool = False,
         build_archive: bool = False,
+        qnn_internal_ut_symbols: bool = False,
     ) -> None:
         cmd = [
             str(REPO_ROOT / "qcom" / "scripts" / "windows" / "build.ps1"),
@@ -163,6 +164,9 @@ class BuildEpWindowsTask(RunPowershellScriptsTask):
 
         if build_archive:
             cmd.extend(["-BuildArchive", "1"])
+
+        if qnn_internal_ut_symbols:
+            cmd.extend(["-QnnInternalUtSymbols", "1"])
 
         super().__init__(group_name, [cmd], env=ort_build_env_vars())
 
@@ -216,9 +220,12 @@ class RunAsanTask(BashScriptsWithVenvTask):
 class GenerateDiffCoverageTask(CompositeTask):
     """Generate patch/diff coverage report using diff-cover.
 
-    Chains three steps:
-      1. git fetch origin <base_branch>   — ensures the base ref is available locally.
-      2. git diff <base_branch>...HEAD    — captures the PR diff as a unified diff file.
+    Chains three steps. With ``base_commit``, it fetches only that commit at depth 1 and
+    uses a two-tree diff, which supports shallow CI checkouts. Otherwise it retains the
+    local-development behavior of fetching ``base_branch`` and using a merge-base diff.
+
+      1. git fetch origin <base>          — ensures the base ref is available locally.
+      2. git diff <base>[...]HEAD         — captures the PR diff as a unified diff file.
       3. generate_diff_coverage.sh        — converts coverage.xml + patch.diff into an
                                             HTML/text diff-cover report.
 
@@ -233,9 +240,17 @@ class GenerateDiffCoverageTask(CompositeTask):
         build_dir: Path,
         config: str = "RelWithDebInfo",
         base_branch: str = "origin/main",
+        base_commit: str | None = None,
     ) -> None:
         diff_file = build_dir / config / "patch.diff"
         coverage_xml = build_dir / config / "coverage" / "coverage.xml"
+
+        if base_commit:
+            fetch_command = ["git", "fetch", "--no-tags", "--depth=1", "origin", base_commit]
+            diff_command = f"git diff {base_commit} HEAD > {diff_file}"
+        else:
+            fetch_command = ["git", "fetch", "origin", base_branch.removeprefix("origin/")]
+            diff_command = f"git diff {base_branch}...HEAD > {diff_file}"
 
         diff_script_cmd = [
             str(REPO_ROOT / "qcom" / "scripts" / "linux" / "generate_diff_coverage.sh"),
@@ -247,12 +262,12 @@ class GenerateDiffCoverageTask(CompositeTask):
             group_name,
             [
                 RunExecutablesTask(
-                    "Fetching base branch",
-                    [["git", "fetch", "origin", base_branch.removeprefix("origin/")]],
+                    "Fetching diff base",
+                    [fetch_command],
                 ),
                 RunExecutablesTask(
                     "Generating git diff",
-                    [[BASH_EXECUTABLE, "-c", f"git diff {base_branch}...HEAD > {diff_file}"]],
+                    [[BASH_EXECUTABLE, "-c", diff_command]],
                 ),
                 BashScriptsWithVenvTask(
                     "Generating diff coverage report",

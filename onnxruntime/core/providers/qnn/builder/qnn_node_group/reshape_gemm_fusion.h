@@ -3,6 +3,7 @@
 
 #pragma once
 
+#include <algorithm>
 #include <memory>
 #include <string_view>
 #include <unordered_map>
@@ -55,6 +56,12 @@ class ReshapeGemmFusionGroup : public IQnnNodeGroup {
       const std::unordered_map<const OrtNode*, const OrtNodeUnit*>& node_to_node_unit,
       const std::unordered_map<const OrtNodeUnit*, const IQnnNodeGroup*>& node_unit_to_qnn_node_group,
       const Ort::Logger& logger);
+
+  // Used only to identify the targeted performance workaround. This does not
+  // alter Reshape's allowzero attribute or its ONNX semantics.
+  static bool IsZeroFreeReshapeShape(gsl::span<const int64_t> shape) {
+    return std::none_of(shape.begin(), shape.end(), [](int64_t dim) { return dim == 0; });
+  }
 
  private:
   Ort::Status CreateOrValidateOnQnn(QnnModelWrapper& qmw, const Ort::Logger& logger, bool validate) const;

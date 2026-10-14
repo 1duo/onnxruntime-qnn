@@ -514,10 +514,10 @@ Ort::Status QnnBackendManager::SetGlobalConfig() {
   return Ort::Status();
 }
 
-void QnnLogging(const char* format,
-                QnnLog_Level_t level,
-                uint64_t timestamp,
-                va_list argument_parameter) {
+void QnnBackendManager::QnnLogging(const char* format,
+                                   QnnLog_Level_t level,
+                                   uint64_t timestamp,
+                                   va_list argument_parameter) {
   ORT_UNUSED_PARAMETER(level);
   ORT_UNUSED_PARAMETER(timestamp);
 
@@ -823,8 +823,10 @@ Ort::Status QnnBackendManager::CreateDeviceCommon(const QNN_INTERFACE_VER_TYPE& 
   qnn::QnnConfigsBuilder<QnnDevice_Config_t, QnnHtpDevice_CustomConfig_t> device_configs_builder(QNN_DEVICE_CONFIG_INIT,
                                                                                                  {});
 
-  // These will hold device selection data when device_id_ != 0
+  // These hold device selection data until deviceCreate returns.
   DevicePlatformInfoPtr device_platform_info(nullptr, PlatformInfoDeleter(qnn_interface, log_handle));
+  std::vector<QnnDevice_CoreInfo_t> device_core_info_config;
+  std::unique_ptr<QnnDevice_HardwareDeviceInfo_t> device_hw_info_config;
   std::unique_ptr<QnnDevice_PlatformInfo_t> device_platform_info_config;
   std::unique_ptr<QnnDevice_Config_t> device_platform_info_std_config;
 
@@ -855,7 +857,7 @@ Ort::Status QnnBackendManager::CreateDeviceCommon(const QNN_INTERFACE_VER_TYPE& 
 
     QnnDevice_HardwareDeviceInfo_t* selected_device = nullptr;
 
-    if (allow_hw_device_enumeration && device_id_ != 0) {
+    if (allow_hw_device_enumeration && (device_id_ != 0 || htp_num_cores_ > 0)) {
       Qnn_ErrorHandle_t result;
       std::tie(device_platform_info, result) = GetDevicePlatformInfo(qnn_interface, log_handle);
       if (QNN_SUCCESS != result) {
@@ -881,11 +883,46 @@ Ort::Status QnnBackendManager::CreateDeviceCommon(const QNN_INTERFACE_VER_TYPE& 
       }
 
       device_platform_info_config = std::make_unique<QnnDevice_PlatformInfo_t>();
-      device_platform_info_config->version = QNN_DEVICE_PLATFORM_INFO_VERSION_1;
+      *device_platform_info_config = QNN_DEVICE_PLATFORM_INFO_INIT;
       device_platform_info_config->v1.numHwDevices = 1;
-      device_platform_info_config->v1.hwDevices = selected_device;
+
+      if (htp_num_cores_ > 0) {
+        if (htp_num_cores_ > selected_device->v1.numCores) {
+          return MAKE_EP_FAIL(("Requested " + std::to_string(htp_num_cores_) +
+                               " HTP cores for device ID " + std::to_string(device_id_) +
+                               ", but platform reports " + std::to_string(selected_device->v1.numCores) +
+                               " cores.")
+                                  .c_str());
+        }
+
+        device_core_info_config.reserve(htp_num_cores_);
+        std::string selected_core_ids;
+        for (uint32_t core_idx = 0; core_idx < htp_num_cores_; ++core_idx) {
+          device_core_info_config.push_back(selected_device->v1.cores[core_idx]);
+          if (!selected_core_ids.empty()) {
+            selected_core_ids += ",";
+          }
+          selected_core_ids += std::to_string(device_core_info_config.back().v1.coreId);
+        }
+
+        device_hw_info_config = std::make_unique<QnnDevice_HardwareDeviceInfo_t>(*selected_device);
+        device_hw_info_config->v1.numCores = htp_num_cores_;
+        device_hw_info_config->v1.cores = device_core_info_config.data();
+        device_platform_info_config->v1.hwDevices = device_hw_info_config.get();
+
+        ORT_CXX_LOG_PTR(logger_ptr_,
+                        ORT_LOGGING_LEVEL_INFO,
+                        ("Create device with platform info: device_id=" + std::to_string(selected_device->v1.deviceId) +
+                         " num_cores=" + std::to_string(htp_num_cores_) +
+                         " core_ids=[" + selected_core_ids + "]")
+                            .c_str());
+      } else {
+        // Preserve the existing device_id-only behavior and all backend-provided metadata.
+        device_platform_info_config->v1.hwDevices = selected_device;
+      }
 
       device_platform_info_std_config = std::make_unique<QnnDevice_Config_t>();
+      *device_platform_info_std_config = QNN_DEVICE_CONFIG_INIT;
       device_platform_info_std_config->option = QNN_DEVICE_CONFIG_OPTION_PLATFORM_INFO;
       device_platform_info_std_config->hardwareInfo = device_platform_info_config.get();
     }
@@ -930,9 +967,19 @@ Ort::Status QnnBackendManager::CreateDevice() {
     ORT_CXX_LOG_PTR(logger_ptr_, ORT_LOGGING_LEVEL_INFO, "Device initialized already.");
     return Ort::Status();
   }
+
+  // Offline HTP preparation on x86 targets a SoC/architecture but does not have
+  // physical device cores to enumerate. The requested core count is still sent
+  // as a graph config so it is compiled into the generated context binary.
+#if QNN_ARCH_ARM64
+  constexpr bool allow_hw_device_enumeration = true;
+#else
+  constexpr bool allow_hw_device_enumeration = false;
+#endif
+
   return CreateDeviceCommon(qnn_interface_, log_handle_,
                             device_handle_, device_created_,
-                            /*allow_hw_device_enumeration=*/true);
+                            allow_hw_device_enumeration);
 }
 
 Ort::Status QnnBackendManager::CreateValidatorDevice() {
@@ -1098,6 +1145,8 @@ Qnn_ErrorHandle_t QnnBackendManager::MapDmaData(Qnn_ContextBinaryDataRequest_t r
   response->dataStartOffset = 0;
   response->alignedSize = size;
 
+  mapped_fastrpc_buffers_.emplace_back(unaligned_data_ptr, size);
+
   return QNN_SUCCESS;
 }
 
@@ -1147,6 +1196,12 @@ Qnn_ErrorHandle_t QnnBackendManager::ReleaseDmaData(Qnn_ContextBinaryDmaDataMem_
     ORT_CXX_LOG(OrtLoggingManager::GetDefaultLogger(), ORT_LOGGING_LEVEL_ERROR, ("Failed to deregister buffer from RPCMEM: " + utils::PtrToString(unaligned_data_ptr)).c_str());
     return QNN_CONTEXT_ERROR_MEM_ALLOC;
   }
+
+  mapped_fastrpc_buffers_.erase(
+      std::remove_if(mapped_fastrpc_buffers_.begin(), mapped_fastrpc_buffers_.end(), [unaligned_data_ptr](const auto& p) {
+        return p.first == unaligned_data_ptr;
+      }),
+      mapped_fastrpc_buffers_.end());
   return QNN_SUCCESS;
 }
 #endif  // QNN_FILE_MAPPED_WEIGHTS_AVAILABLE
@@ -1315,6 +1370,7 @@ Ort::Status QnnBackendManager::CreateContextHandleFromBinary(
                                                             profile_handle,
                                                             NULL);
     if (rt != QNN_SUCCESS) {
+      DeallocateMappedDmaBuffers();
       ORT_CXX_LOG_PTR(logger_ptr_, ORT_LOGGING_LEVEL_WARNING,
                       ("contextCreateFromBinaryWithCallback failed (" + QnnErrorHandleToString(rt) +
                        "). Retrying with direct read.")
@@ -1597,6 +1653,9 @@ Ort::Status QnnBackendManager::CreateContextFromListAsyncWithCallback(const QnnC
                                                                 context_params_ptr_list.data(),
                                                                 configs,
                                                                 nullptr);
+  if (QNN_CONTEXT_NO_ERROR != result) {
+    DeallocateMappedDmaBuffers();
+  }
 
   RETURN_IF(QNN_CONTEXT_NO_ERROR != result, ("Failed to create context with file mapping enabled. Error: " +
                                              QnnErrorHandleToString(result) + ", Code:" + std::to_string(result))
@@ -1923,15 +1982,10 @@ Ort::Status QnnBackendManager::LoadCachedQnnContextFromBuffer(
                                               graph_count,
                                               &graphs_info));
   } else {
-    // `CreateSystemDlcPlugin` is not suitable here as it creates an empty DLC.
-    // Instead, `QnnBackendSystemDlcPlugin.GetDlcBinaryInfo` creates DLC from binary.
     auto system_dlc_plugin = std::make_unique<QnnBackendSystemDlcPlugin>(this);
-    RETURN_IF_ERROR(system_dlc_plugin->GetDlcBinaryInfo(sys_ctx_handle.get(),
-                                                        static_cast<const uint8_t*>(bin_buffer),
-                                                        buffer_length,
-                                                        blob_version,
-                                                        graph_count,
-                                                        &graphs_info));
+    RETURN_IF_ERROR(system_dlc_plugin->SetupDlcFromBinary(static_cast<const uint8_t*>(bin_buffer), buffer_length));
+    RETURN_IF_ERROR(system_dlc_plugin->GetDlcBinaryInfo(sys_ctx_handle.get(), blob_version, graph_count, &graphs_info));
+    RETURN_IF_ERROR(system_dlc_plugin->Release());
   }
 
 #ifdef QNN_FILE_MAPPED_WEIGHTS_AVAILABLE
@@ -2128,7 +2182,7 @@ Ort::Status QnnBackendManager::SetupBackend(
 
   bool enable_gpu_weight_sharing = false;
   if (share_ep_contexts && !load_from_cached_context) {
-#if defined(__aarch64__) || defined(_M_ARM64)
+#if QNN_ARCH_ARM64
     enable_gpu_weight_sharing = true;
 #endif
   }
@@ -2198,7 +2252,7 @@ Ort::Status QnnBackendManager::SetupBackend(
 
   bool enable_htp_weight_sharing = false;
   if (share_ep_contexts && !load_from_cached_context) {
-#if (defined(__aarch64__) || defined(_M_ARM64)) && \
+#if QNN_ARCH_ARM64 && \
     (QNN_API_VERSION_MAJOR < 2 || (QNN_API_VERSION_MAJOR == 2 && QNN_API_VERSION_MINOR < 34))
     ORT_CXX_LOG_PTR(logger_ptr_,
                     ORT_LOGGING_LEVEL_WARNING,
@@ -2520,6 +2574,10 @@ void QnnBackendManager::ReleaseResources() {
   if (!result.IsOK()) {
     ORT_CXX_LOG_PTR(logger_ptr_, ORT_LOGGING_LEVEL_ERROR, ("Failed to ReleaseContext: " + result.GetErrorMessage()).c_str());
   }
+
+  // Ensure all buffers allocated from file mapping feature are deallocated
+  // Called after QNN Context destruction to clean up leftover buffers
+  DeallocateMappedDmaBuffers();
 
   result = GetProfilingManager().ReleaseProfileHandle();
   if (!result.IsOK()) {
@@ -3190,7 +3248,7 @@ Ort::Status QnnBackendManager::CreateSystemDlcPlugin() {
   }
 
   system_dlc_plugin_ = std::make_shared<QnnBackendSystemDlcPlugin>(this);
-  RETURN_IF_ERROR(system_dlc_plugin_->CreateDlc());
+  RETURN_IF_ERROR(system_dlc_plugin_->SetupDlc());
 
   system_dlc_created_ = true;
   return Ort::Status();
@@ -3201,7 +3259,7 @@ Ort::Status QnnBackendManager::ReleaseSystemDlcPlugin() {
     return Ort::Status();
   }
 
-  RETURN_IF_ERROR(system_dlc_plugin_->ReleaseDlc());
+  RETURN_IF_ERROR(system_dlc_plugin_->Release());
   system_dlc_plugin_.reset();
 
   system_dlc_created_ = false;
@@ -3212,6 +3270,29 @@ Ort::Status QnnBackendManager::AddContextToDlc() {
   RETURN_IF(system_dlc_plugin_ == nullptr, "Unexpected call of this function without DLC initialized.");
   RETURN_IF_NOT(GetQnnContextSize() == 1, "Expecting only one context to be added into DLC.");
   return system_dlc_plugin_->AddContextToDlc(GetQnnContext());
+}
+
+void QnnBackendManager::DeallocateMappedDmaBuffers() {
+  std::vector<std::pair<void*, uint64_t>> failed_deregisters;
+  for (const auto& mem_info : mapped_fastrpc_buffers_) {
+    auto ptr = mem_info.first;
+    auto size = mem_info.second;
+    ORT_CXX_LOG(OrtLoggingManager::GetDefaultLogger(), ORT_LOGGING_LEVEL_VERBOSE, ("Attempting to deregister buffer from RPCMEM: " + utils::PtrToString(ptr)).c_str());
+    // setting third input arg to -1 here indicates a deregistration request
+    rpcmem_library_->Api().register_buf(ptr, size, -1,
+                                        rpcmem::RPCMEM_ATTR_IMPORT_BUFFER | rpcmem::RPCMEM_ATTR_READ_ONLY);
+    auto fd = rpcmem_library_->Api().to_fd(ptr);
+    if (fd != -1) {
+      ORT_CXX_LOG(OrtLoggingManager::GetDefaultLogger(), ORT_LOGGING_LEVEL_ERROR, ("Failed to deregister buffer from RPCMEM: " + utils::PtrToString(ptr)).c_str());
+      failed_deregisters.push_back(mem_info);
+    }
+  }
+  // Capture failed deregistrations.
+  // If the failures occur on failed context creation due to file mapping, a second
+  // deregistration attempt will occur on destruction of QnnBackendManager instance.
+  // If the failures occur on destruction, then there will be a memory leak
+  // and will indicate a more fundamental issue in EP or QNN.
+  mapped_fastrpc_buffers_ = std::move(failed_deregisters);
 }
 
 }  // namespace qnn

@@ -1,0 +1,28 @@
+From 1a2b3c4d5e6f7g8h9i0j1k2l3m4n5o6p Mon Sep 17 00:00:00 2001
+From: ORT QNN EP team <noreply@qualcomm.com>
+Date: Wed, 7 Oct 2026 23:59:00 +0800
+Subject: [PATCH 5/5] Fix ParseSessionConfigs namespace in perftest common_utils
+
+In ORT 1.30.0, strings_helper.h was moved from perftest to onnx/utils,
+but the namespace wasn't updated in common_utils.cc. The function
+ParseSessionConfigs is in onnxruntime::test::utils namespace, so we need
+to use the fully qualified name to avoid C3861 compilation errors.
+---
+ onnxruntime/test/perftest/common_utils.cc | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/onnxruntime/test/perftest/common_utils.cc b/onnxruntime/test/perftest/common_utils.cc
+index 1234567..abcdefg 100644
+--- a/onnxruntime/test/perftest/common_utils.cc
++++ b/onnxruntime/test/perftest/common_utils.cc
+@@ -39,7 +39,7 @@ void ListEpDevices(const Ort::Env& env) {
+ void RegisterExecutionProviderLibrary(Ort::Env& env, PerformanceTestConfig& test_config) {
+   if (!test_config.plugin_ep_names_and_libs.empty()) {
+     std::unordered_map<std::string, std::string> ep_names_to_libs;
+-    ParseSessionConfigs(ToUTF8String(test_config.plugin_ep_names_and_libs), ep_names_to_libs);
++    test::utils::ParseSessionConfigs(ToUTF8String(test_config.plugin_ep_names_and_libs), ep_names_to_libs);
+     if (ep_names_to_libs.size() > 0) {
+       for (auto& pair : ep_names_to_libs) {
+         const std::filesystem::path library_path = pair.second;
+--
+2.53.0.windows.1

@@ -17,6 +17,7 @@ ONNX Runtime QNN EP can be used on Windows devices with Qualcomm Snapdragon SOC'
 - [Configuration Options](#configuration-options)
 - [Flexible Context Binary (FCB) / multi-SoC EP context](#flexible-context-binary-fcb--multi-soc-ep-context)
 - [Supported ONNX operators](#supported-onnx-operators)
+- [QTI AISW block operators](#qti-aisw-block-operators)
 - [Running a model with QNN EP's HTP backend (Python)](#running-a-model-with-qnn-eps-htp-backend-python)
 - [Running a model with QNN EP's GPU backend](#running-a-model-with-qnn-eps-gpu-backend)
 - [Running an LLM model with QNN EP's Genie backend](#running-an-llm-model-with-qnn-eps-genie-backend)
@@ -43,9 +44,11 @@ download the Qualcomm AI Runtime SDK (QAIRT SDK) from [https://qpm.qualcomm.com/
 ONNX Runtime QNN EP has been built and tested with the following SDK version combinations on Windows:
 | QNN EP Version | QAIRT SDK Version | ONNX Runtime Version |
 |----------------|-------------------|----------------------|
-| v2.6.0         | v2.50.40          | v1.27.0              |
+| v2.7.40        | v2.51.40          | v1.29.0              |
 
-> **Note**: ONNX Runtime QNN EP 2.6.0 was built and tested with ORT 1.27.0 but it is compatible with ORT >= 1.24.1
+> **Note**: ONNX Runtime QNN EP 2.7.40 was built for WinML with QAIRT 2.51.40 and is available only through WinML channels. 
+> **Note**: For mainline release of ORT QNN EP please use 2.7.0 which was built with QAIRT 2.51.0.
+> **Note**: ONNX Runtime QNN EP 2.7.0 and 2.7.40 were built and tested with ORT 1.29.0 but are compatible with ORT >= 1.24.1
 
 ## Build (Windows)
 For build instructions, please see the [BUILD page](./build.md).
@@ -70,9 +73,9 @@ For build instructions, please see the [BUILD page](./build.md).
   - This release is validated against the following dependency versions:
     | Dependency | Maven Coordinate | Version |
     |---|---|---|
-    | ONNX Runtime Android | `com.microsoft.onnxruntime:onnxruntime-android` | `1.27.0` |
-    | QNN Runtime | `com.qualcomm.qti:qnn-runtime` | `2.50.0` |
-  - **Version note:** QNN EP v2.6.0 was built and tested with QAIRT SDK 2.50.0; the public Android Maven runtime artifact is versioned `2.50.0`.
+    | ONNX Runtime Android | `com.microsoft.onnxruntime:onnxruntime-android` | `1.29.0` |
+    | QNN Runtime | `com.qualcomm.qti:qnn-runtime` | `2.51.0` |
+  - **Version note:** QNN EP v2.7.0 was built and tested with QAIRT SDK 2.51.0; the public Android Maven runtime artifact is versioned `2.51.0`.
 
 ## Qualcomm AI Hub
 Qualcomm AI Hub can be used to optimize and run models on Qualcomm hosted devices.
@@ -385,6 +388,11 @@ The `enable_htp_prepare_and_load` option performs AOT compilation and context lo
 |---|---|
 |`UINT32_MAX` (default)|Auto-select: `min(max(1, hardware_concurrency), num_splits)`. Only effective when `enable_htp_graph_splitting=1`. Requires QAIRT SDK 2.51+; ignored on older builds.|
 |`N`|Use exactly N threads to prepare split sub-graphs in parallel. Value 0 or 1 means single-threaded. Values > 1 cap the number of splits.|
+
+|`"htp_num_cores"`|Description|
+|---|---|
+|`0` or unset|Default. Do not request a graph core count.|
+|Positive integer|Pass `QNN_HTP_GRAPH_CONFIG_OPTION_NUM_CORES` when creating the graph. On ARM64 devices, also select the first requested HTP cores reported for `device_id`. On x86 hosts, offline AOT generation uses the requested graph core count without enumerating physical devices. It does not override the graph core count of an already compiled context binary.|
 
 |`"GPE_KWAY_PARTITIONS"`|Description|
 |---|---|
@@ -745,8 +753,21 @@ ort.unregister_execution_provider_library(ep_registration_name)
 |com.microsoft:RMSNormalization||
 |com.microsoft:QuickGelu||
 |com.microsoft:SimplifiedLayerNormalization||
+|qti_aisw:Buffer|QTI AISW block op. See [QTI AISW block operators](#qti-aisw-block-operators).|
+|qti_aisw:StatefulGru|QTI AISW block op. See [QTI AISW block operators](#qti-aisw-block-operators).|
+|qti_aisw:StatefulLstm|QTI AISW block op. See [QTI AISW block operators](#qti-aisw-block-operators).|
 
 Supported data types vary by operator and QNN backend. Refer to the [QAIRT SDK documentation](https://docs.qualcomm.com/doc/80-63442-10/topic/operations.html) for more information.
+
+### QTI AISW block operators
+
+QNN EP also supports the following Qualcomm block operators in the `qti_aisw` domain. Their definitions are distinct from standard ONNX operators. Please refer to [this page](https://docs.qualcomm.com/doc/80-63442-10/topic/blockop_definitions.html) for Qualcomm's Block-op definitions.
+
+|Operator|Inputs|Outputs|Attributes|
+|---|---|---|---|
+|`qti_aisw:Buffer`|- `data` (rank N)<br>- Optional scalar-BOOL `reset`|- `out`: same rank and type as `data`, with dimension `buffer_dim` set to `buffer_size`|- Required: `buffer_size`, `buffer_dim`.<br>- Optional: `buffer_padding=0`, `stride=1`, `mode=0` (`BLOCKING`)<br>- HTP backend requires `mode=1` (`NON_BLOCKING_LEFT`) or `mode=2` (`NON_BLOCKING_RIGHT`).|
+|`qti_aisw:StatefulGru`|- `X [seq, batch, input]`<br>- `W [directions, 3×hidden, input]`<br>- `R [directions, 3×hidden, hidden]`<br>- Optional `B [directions, 6×hidden]`<br>- Optional `sequence_lens [batch]`<br>- Optional `initial_h [directions, batch, hidden]`<br>- Optional scalar-BOOL `reset`|- Optional `Y [seq, directions, batch, hidden]`<br>- Optional `Y_h [directions, batch, hidden]`|- Required: `hidden_size`.<br>- Optional: `clip`, `direction=forward`, `linear_before_reset=0`.<br>- The QTI AISW Block-op definition does not define standard ONNX `activations` or `layout` attributes; its signature is sequence-major.|
+|`qti_aisw:StatefulLstm`|- `X [seq, batch, input]`<br>- `W [directions, 4×hidden, input]`<br>- `R [directions, 4×hidden, hidden]`<br>- Optional `B [directions, 8×hidden]`<br>- Optional `sequence_lens [batch]`<br>- Optional `initial_h [directions, batch, hidden]`<br>- Optional `initial_c [directions, batch, hidden]`<br>- Optional `P [directions, 3×hidden]`<br>- Optional scalar-BOOL `reset`|- Optional `Y [seq, directions, batch, hidden]`<br>- Optional `Y_h [directions, batch, hidden]`<br>- Optional `Y_c [directions, batch, hidden]`|- Required: `hidden_size`.<br>- Optional: `clip`, `direction=forward`, `input_forget=0`.<br>- The QTI AISW Block-op definition does not define standard ONNX `activations` or `layout` attributes; its signature is sequence-major.|
 
 ## Supported operator fusions
 

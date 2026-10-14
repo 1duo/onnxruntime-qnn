@@ -130,6 +130,7 @@ struct QnnBackendManagerConfig {
   ContextPriority context_priority;
   std::shared_ptr<QnnSerializerConfig> qnn_serializer_config;
   uint32_t device_id;
+  uint32_t htp_num_cores = 0;
   QnnHtpDevice_Arch_t htp_arch;
   uint32_t soc_model;
   std::vector<OpPackage> op_packages;
@@ -172,6 +173,7 @@ class QnnBackendManager : public std::enable_shared_from_this<QnnBackendManager>
         context_priority_(config.context_priority),
         qnn_serializer_config_(config.qnn_serializer_config),
         device_id_(config.device_id),
+        htp_num_cores_(config.htp_num_cores),
         htp_arch_(config.htp_arch),
         soc_model_(config.soc_model),
         op_packages_(config.op_packages),
@@ -521,6 +523,9 @@ class QnnBackendManager : public std::enable_shared_from_this<QnnBackendManager>
                                                                         std::unique_ptr<std::vector<std::string>>>& context_bin_map);
 #endif
 
+  // Callback function for QNN logging.
+  static void QnnLogging(const char* format, QnnLog_Level_t level, uint64_t timestamp, va_list argument_parameter);
+
   // Shared implementation for InitializeQnnLog / InitializeQnnValidatorLog.
   Ort::Status InitializeQnnLogCommon(const QNN_INTERFACE_VER_TYPE& interface,
                                      Qnn_LogHandle_t& log_handle,
@@ -696,6 +701,8 @@ class QnnBackendManager : public std::enable_shared_from_this<QnnBackendManager>
 
   void InitializeProfilingManager(const QnnBackendManagerConfig& config);
 
+  void DeallocateMappedDmaBuffers();
+
   // Checks if act_ver is >= min_ver. An act_ver of 0.0.0 is considered invalid.
   static bool MinVersionMet(const Qnn_Version_t& act_ver, const Qnn_Version_t& min_ver) {
     if (act_ver.major == 0 && act_ver.minor == 0 && act_ver.patch == 0) {
@@ -788,6 +795,7 @@ class QnnBackendManager : public std::enable_shared_from_this<QnnBackendManager>
 #endif
   const std::shared_ptr<QnnSerializerConfig> qnn_serializer_config_;
   uint32_t device_id_ = 0;
+  uint32_t htp_num_cores_ = 0;
   QnnHtpDevice_Arch_t htp_arch_ = QNN_HTP_DEVICE_ARCH_NONE;
   uint32_t soc_model_ = QNN_SOC_MODEL_UNKNOWN;
   const std::vector<OpPackage> op_packages_;
@@ -811,6 +819,7 @@ class QnnBackendManager : public std::enable_shared_from_this<QnnBackendManager>
 
   // File mapping.
   std::shared_ptr<RpcMemLibrary> rpcmem_library_ = nullptr;
+  std::vector<std::pair<void*, uint64_t>> mapped_fastrpc_buffers_;
 
   // Backend plugin for system DLC APIs.
   bool system_dlc_created_ = false;

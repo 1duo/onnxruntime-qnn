@@ -19,6 +19,10 @@ permissions:
   actions: write        # to dispatch the reviewed workflow via createWorkflowDispatch
 
 on:
+  # This event runs the workflow from the default branch. The gate job below
+  # deliberately reads PR metadata only; it never checks out PR code.
+  pull_request_target:
+    types: [opened, synchronize, reopened, ready_for_review]
   issue_comment:
     types: [created]
   workflow_run:
@@ -30,6 +34,40 @@ on:
     - cron: "23 */6 * * *"
 
 jobs:
+  initialize-full-ci-gate:
+    name: Initialize Full CI gate
+    if: github.event_name == 'pull_request_target'
+    runs-on: ubuntu-latest
+    permissions:
+      checks: write
+      pull-requests: read
+    steps:
+      - name: Mark this PR revision as awaiting full CI
+        uses: actions/github-script@v8
+        with:
+          script: |
+            const pr = context.payload.pull_request;
+            const checkName = 'Full CI gate';
+            const externalId = `full-ci-gate:${pr.number}:${pr.head.sha}`;
+            const { data: checks } = await github.rest.checks.listForRef({
+              ...context.repo,
+              ref: pr.head.sha,
+              check_name: checkName,
+              per_page: 100,
+            });
+            if (checks.check_runs.some(check => check.external_id === externalId)) {
+              core.info(`Full CI gate already exists for PR #${pr.number} at ${pr.head.sha}.`);
+              return;
+            }
+
+            await github.rest.checks.create({
+              ...context.repo,
+              name: checkName,
+              head_sha: pr.head.sha,
+              external_id: externalId,
+              status: 'queued',
+            });
+
   trigger:
     name: Trigger CI from PR comment
     # Only act on PR comments beginning with "/ci" or "/approve-ci".
@@ -194,6 +232,96 @@ jobs:
               issue_number: context.issue.number,
               body: `${message} by @${commenter}. Check the [Actions tab](${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions) for progress.`,
             });
+
+  complete-full-ci-gate:
+    name: Complete Full CI gate
+    if: >-
+      github.event_name == 'workflow_run' &&
+      (github.event.workflow_run.event == 'pull_request' ||
+       github.event.workflow_run.event == 'workflow_dispatch')
+    runs-on: ubuntu-latest
+    permissions:
+      checks: write
+      pull-requests: read
+    steps:
+      # This handler runs from the default branch and never checks out PR code.
+      - name: Publish the full CI result on the PR revision
+        uses: actions/github-script@v8
+        with:
+          script: |
+            const run = context.payload.workflow_run;
+            const checkName = 'Full CI gate';
+            const workflowPath = '.github/workflows/qualcomm-internal-ci.yml';
+            const repositoryName = `${context.repo.owner}/${context.repo.repo}`;
+            let prNumber;
+            let headSha;
+
+            if (run.event === 'workflow_dispatch') {
+              const match = /^ci\/approve-ci\/(\d+)\/([0-9a-f]{40})\/\d+-\d+$/.exec(run.head_branch);
+              if (!match || match[2] !== run.head_sha ||
+                  run.head_repository?.full_name !== repositoryName ||
+                  run.path !== workflowPath) {
+                core.info('Not a matching maintainer-approved full CI run.');
+                return;
+              }
+              prNumber = Number(match[1]);
+              headSha = match[2];
+            } else {
+              const pullRequests = run.pull_requests ?? [];
+              if (pullRequests.length !== 1 ||
+                  run.head_repository?.full_name !== repositoryName ||
+                  run.path !== workflowPath) {
+                core.info('Not a matching internal pull-request full CI run.');
+                return;
+              }
+              prNumber = pullRequests[0].number;
+              headSha = run.head_sha;
+            }
+
+            const externalId = `full-ci-gate:${prNumber}:${headSha}`;
+            const { data: checks } = await github.rest.checks.listForRef({
+              ...context.repo,
+              ref: headSha,
+              check_name: checkName,
+              per_page: 100,
+            });
+            const existingCheck = checks.check_runs.find(check => check.external_id === externalId);
+            // Required checks may treat neutral or skipped as acceptable. Fail closed:
+            // only an explicit success from the full workflow can open the gate.
+            const conclusion = run.conclusion === 'success' ? 'success' : 'failure';
+            const output = {
+              title: checkName,
+              summary: `Full CI completed with conclusion: ${run.conclusion ?? 'unknown'}.`,
+            };
+
+            if (existingCheck) {
+              // A retried run can finish before an older attempt. Never let the
+              // older result overwrite the newer decision for the same PR SHA.
+              if (existingCheck.completed_at &&
+                  Date.parse(run.updated_at) < Date.parse(existingCheck.completed_at)) {
+                core.info(`Ignoring older full CI result from ${run.html_url}.`);
+                return;
+              }
+              await github.rest.checks.update({                ...context.repo,
+                check_run_id: existingCheck.id,
+                status: 'completed',
+                conclusion,
+                details_url: run.html_url,
+                output,
+              });
+            } else {
+              core.warning(`No initial Full CI gate found for ${externalId}; creating the completed gate.`);
+              await github.rest.checks.create({
+                ...context.repo,
+                name: checkName,
+                head_sha: headSha,
+                external_id: externalId,
+                status: 'completed',
+                conclusion,
+                details_url: run.html_url,
+                output,
+              });
+            }
 
   cleanup-approved-ci-branch:
     name: Clean up completed approved-CI branch

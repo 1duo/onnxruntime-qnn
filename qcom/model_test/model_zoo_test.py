@@ -51,8 +51,9 @@ for model_zoo_root in MODEL_ZOO_ROOTS:
             ModelTestCase(test_def).run()
             return
 
-        # The snapshot producer is opt-in and HTP-only. Each successful test
-        # still performs its normal accuracy check before its dump is accepted.
+        # HTP snapshot export is opt-in. Reference-backed models retain their
+        # normal accuracy validation; compile-only models export after successful
+        # session creation.
         snapshot_dir = MODEL_ZOO_SNAPSHOT_DIR / test_def.model_root.parent.name / test_def.model_root.name
         shutil.rmtree(snapshot_dir, ignore_errors=True)
         test_case = ModelTestCase(test_def, json_dump_dir=snapshot_dir)

@@ -732,6 +732,7 @@ struct GpuPackedGqaCase {
   float scale;
   bool use_2d_seqlens{false};
   bool use_shared_memory_allocator{false};
+  bool use_head_sink{false};
 };
 
 template <typename T>
@@ -758,6 +759,10 @@ static void RunGpuPackedGQATest(const GpuPackedGqaCase& test_case) {
                                true, static_cast<T>(-1.0f), static_cast<T>(1.0f));
   config.sin_cache_def.emplace(std::vector<int64_t>{test_case.total_seq_len, test_case.head_size / 2},
                                true, static_cast<T>(-1.0f), static_cast<T>(1.0f));
+  if (test_case.use_head_sink) {
+    config.head_sink_def.emplace(std::vector<int64_t>{test_case.num_heads},
+                                 true, static_cast<T>(-1.0f), static_cast<T>(1.0f));
+  }
   config.do_rotary = 1;
   config.kv_num_heads = test_case.kv_num_heads;
   config.num_heads = test_case.num_heads;
@@ -796,6 +801,11 @@ TEST_F(QnnGPUBackendTests, GroupQueryAttention_Llama3_1_AR64_FP32) {
 
 TEST_F(QnnGPUBackendTests, GroupQueryAttention_Llama3_1_AR64_FP16) {
   RunGpuPackedGQATest<Ort::Float16_t>({32, 8, 64, 64, 1024, 0.125f});
+}
+
+TEST_F(QnnGPUBackendTests, GroupQueryAttention_HeadSink_Large_FP16) {
+  RunGpuPackedGQATest<Ort::Float16_t>({64, 8, 64, 128, 4096, 0.125f,
+                                       false, false, /*use_head_sink*/ true});
 }
 
 #if defined(_WIN32)

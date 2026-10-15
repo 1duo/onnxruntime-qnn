@@ -45,7 +45,8 @@ Ort::Status GroupQueryAttentionOpBuilder::IsOpSupported(QnnModelWrapper& qnn_mod
 
   auto backend_type = qnn_model_wrapper.GetQnnBackendType();
 
-  RETURN_IF_NOT(IsGpuBackend(backend_type) || backend_type == QnnBackendType::HTP,
+  const bool is_gpu_backend = IsGpuBackend(backend_type);
+  RETURN_IF_NOT(is_gpu_backend || backend_type == QnnBackendType::HTP,
                 "GroupQueryAttention is only supported with the GPU and HTP backends");
 
   const size_t num_inputs = node_unit.Inputs().size();
@@ -64,9 +65,11 @@ Ort::Status GroupQueryAttentionOpBuilder::IsOpSupported(QnnModelWrapper& qnn_mod
   const size_t max_num_inputs = 14;
   const size_t max_num_outputs = 4;
 
-  for (size_t i = 10; i < std::min(num_inputs, max_num_inputs); i++) {
-    RETURN_IF(inputs[i].Exists(), "attention_bias, head_sink, k_scale, and v_scale inputs are not supported");
-  }
+  RETURN_IF(num_inputs > 10 && inputs[10].Exists(), "attention_bias input is not supported");
+  RETURN_IF(num_inputs > 11 && inputs[11].Exists() && !is_gpu_backend,
+            "head_sink input is only supported with the GPU backend");
+  RETURN_IF(num_inputs > 12 && inputs[12].Exists(), "k_scale input is not supported");
+  RETURN_IF(num_inputs > 13 && inputs[13].Exists(), "v_scale input is not supported");
   RETURN_IF(num_inputs > max_num_inputs,
             ("More than " + std::to_string(max_num_inputs) + " inputs provided, which is unsupported").c_str());
 
@@ -122,20 +125,24 @@ Ort::Status GroupQueryAttentionOpBuilder::ProcessInputs(QnnModelWrapper& qnn_mod
   const auto& onnx_inputs = node_unit.Inputs();
 
   constexpr auto qnn_idx_to_onnx = std::array{
-      0u,  // query
-      5u,  // seqlens_K
-      6u,  // total_sequence_length
-      1u,  // key
-      2u,  // value
-      3u,  // past_key
-      4u,  // past_value
-      7u,  // cos_cache
-      8u,  // sin_cache
-      9u   // position_ids
+      0u,   // query
+      5u,   // seqlens_K
+      6u,   // total_sequence_length
+      1u,   // key
+      2u,   // value
+      3u,   // past_key
+      4u,   // past_value
+      7u,   // cos_cache
+      8u,   // sin_cache
+      9u,   // position_ids
+      10u,  // attention_bias
+      11u   // head_sink
   };
   constexpr size_t kQnnTotalSeqLenIdx = 2;  // index of total_sequence_length in qnn_idx_to_onnx
+  const size_t qnn_input_count =
+      IsGpuBackend(qnn_model_wrapper.GetQnnBackendType()) ? qnn_idx_to_onnx.size() : 10;
 
-  for (size_t qnn_idx = 0; qnn_idx < qnn_idx_to_onnx.size(); ++qnn_idx) {
+  for (size_t qnn_idx = 0; qnn_idx < qnn_input_count; ++qnn_idx) {
     const auto onnx_idx = qnn_idx_to_onnx[qnn_idx];
     if (onnx_inputs.size() > onnx_idx && onnx_inputs[onnx_idx].Exists()) {
       // QNN requires total_sequence_length as a 0D scalar, but ONNX provides it as shape [1].

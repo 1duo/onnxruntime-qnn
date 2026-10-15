@@ -1334,6 +1334,19 @@ QnnEp::QnnEp(const QnnEpFactory& factory,
                                          FormatEPConfigKey("dump_json_qnn_graph"),
                                          false,
                                          logger_);
+  static constexpr const char* kDumpQnnGraphGoldenMetadata = "dump_qnn_graph_golden_metadata";
+  dump_qnn_graph_golden_metadata_ = ParseBoolOption(ort_api,
+                                                    session_options_,
+                                                    FormatEPConfigKey(kDumpQnnGraphGoldenMetadata),
+                                                    false,
+                                                    logger_);
+  if (dump_qnn_graph_golden_metadata_ &&
+      (!dump_json_qnn_graph_ || !qnn::IsNpuBackend(qnn_backend_manager_->GetQnnBackendType()))) {
+    ORT_CXX_LOG(logger_,
+                ORT_LOGGING_LEVEL_WARNING,
+                "QNN graph golden metadata requires an HTP JSON graph dump. Disabling golden metadata.");
+    dump_qnn_graph_golden_metadata_ = false;
+  }
 
   static const std::string QNN_GRAPH_DUMP_DIR = "json_qnn_graph_dir";
   std::string json_graph_dir_str;
@@ -2627,7 +2640,9 @@ OrtStatus* QnnEp::CompileOnnxModel(const OrtGraph** graphs,
       namespace fs = std::filesystem;
       context.json_qnn_graph_path =
           (fs::path(json_qnn_graph_dir_) / fs::path(fused_node_name + ".json")).string();
-      context.htp_graph_configs = &htp_graph_configs;
+      if (dump_qnn_graph_golden_metadata_) {
+        context.htp_graph_configs = &htp_graph_configs;
+      }
     }
 
     RETURN_IF_NOT_OK(qnn_model->ComposeGraph(context));

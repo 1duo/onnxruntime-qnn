@@ -46,7 +46,8 @@ struct QnnModelContext {
   OpTraceInfo* op_trace_output = nullptr;
 
   // Non-null only for a JSON graph dump produced while compiling an HTP graph.
-  // The serialized values make graph-affecting HTP options part of a snapshot.
+  // The values are written to an ORT-owned golden metadata sidecar so the QNN
+  // graph JSON remains compatible with QNN Netron.
   const HtpGraphConfigs_t* htp_graph_configs = nullptr;
 };
 

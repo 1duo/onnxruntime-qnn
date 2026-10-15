@@ -8,7 +8,7 @@ from pathlib import Path
 from typing import cast, get_args
 
 import pytest
-from graph_snapshot import normalize_qnn_graph_dump_dir
+from graph_golden import finalize_qnn_graph_golden_dir
 from model_test import BackendT, ModelTestCase, ModelTestDef, ModelTestSuite
 
 MODEL_ZOO_ROOTS = [Path(p) for p in os.getenv("ORT_MODEL_ZOO_TEST_ROOTS", "").split(os.pathsep) if len(p) > 0]
@@ -16,8 +16,8 @@ MODEL_ZOO_BACKEND = cast(BackendT, os.getenv("ORT_MODEL_ZOO_BACKEND", "htp"))
 assert MODEL_ZOO_BACKEND in get_args(BackendT)
 MODEL_ZOO_ENABLE_CONTEXT = os.getenv("ORT_MODEL_ZOO_ENABLE_CONTEXT", "1") == "1"
 MODEL_ZOO_ENABLE_CPU_FALLBACK = os.getenv("ORT_MODEL_ZOO_ENABLE_CPU_FALLBACK", "0") == "1"
-_model_zoo_snapshot_dir = os.getenv("ORT_MODEL_ZOO_SNAPSHOT_DIR", "")
-MODEL_ZOO_SNAPSHOT_DIR = Path(_model_zoo_snapshot_dir) if _model_zoo_snapshot_dir else None
+_model_zoo_qnn_graph_golden_dir = os.getenv("ORT_MODEL_ZOO_QNN_GRAPH_GOLDEN_DIR", "")
+MODEL_ZOO_QNN_GRAPH_GOLDEN_DIR = Path(_model_zoo_qnn_graph_golden_dir) if _model_zoo_qnn_graph_golden_dir else None
 
 
 def get_xfails(env_var: str) -> dict[str, str]:
@@ -47,16 +47,21 @@ for model_zoo_root in MODEL_ZOO_ROOTS:
         if test_def.model_root.name in xfails:
             pytest.xfail(xfails[test_def.model_root.name])
 
-        if MODEL_ZOO_SNAPSHOT_DIR is None or MODEL_ZOO_BACKEND != "htp":
+        if MODEL_ZOO_QNN_GRAPH_GOLDEN_DIR is None or MODEL_ZOO_BACKEND != "htp":
             ModelTestCase(test_def).run()
             return
 
-        # HTP snapshot export is opt-in. Reference-backed models retain their
+        # HTP graph golden export is opt-in. Reference-backed models retain their
         # normal accuracy validation; compile-only models export after successful
         # session creation.
-        snapshot_dir = MODEL_ZOO_SNAPSHOT_DIR / test_def.model_root.parent.name / test_def.model_root.name
-        shutil.rmtree(snapshot_dir, ignore_errors=True)
-        test_case = ModelTestCase(test_def, json_dump_dir=snapshot_dir)
+        golden_dir = MODEL_ZOO_QNN_GRAPH_GOLDEN_DIR / test_def.model_root.parent.name / test_def.model_root.name
+        shutil.rmtree(golden_dir, ignore_errors=True)
+        test_case = ModelTestCase(test_def, qnn_graph_golden_dir=golden_dir)
         test_case.run()
-        graph_files = normalize_qnn_graph_dump_dir(snapshot_dir)
-        logging.info("Wrote %d normalized QNN graph snapshot(s) for %s", len(graph_files), test_def.model_root.name)
+        graph_files, manifest_path = finalize_qnn_graph_golden_dir(golden_dir)
+        logging.info(
+            "Wrote %d normalized QNN graph golden(s) and %s for %s",
+            len(graph_files),
+            manifest_path.name,
+            test_def.model_root.name,
+        )

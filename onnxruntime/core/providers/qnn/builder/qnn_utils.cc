@@ -713,9 +713,9 @@ static nlohmann::json GetQnnClientBufJSON(const Qnn_ClientBuffer_t& buf, Qnn_Dat
   return curr[0];
 }
 
-// SHA-256 is used only to fingerprint static tensor bytes in diagnostic graph
-// snapshots. Keeping the digest in the JSON avoids serializing model weights
-// while still making a content-only weight change observable to a consumer.
+// SHA-256 is used only to fingerprint static tensor bytes for graph golden
+// metadata. The digest is extracted into an ORT-owned sidecar before the QNN
+// graph JSON is written, avoiding serialized model weights and custom fields.
 class Sha256 final {
  public:
   void Update(const uint8_t* data, size_t size) {
@@ -933,7 +933,7 @@ static nlohmann::json GetQnnTensorJSON(const Qnn_Tensor_t& tensor,
       if (client_buffer.data != nullptr) {
         static_data_hash["digest"] = Sha256Hex(client_buffer.data, client_buffer.dataSize);
       } else {
-        // A graph snapshot must not treat an opaque/static memory handle as a
+        // A graph golden must not treat an opaque/static memory handle as a
         // verified match. The future gate will fall back to real execution.
         static_data_hash["status"] = "unavailable";
       }

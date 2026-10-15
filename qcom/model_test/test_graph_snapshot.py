@@ -41,7 +41,7 @@ def test_normalize_qnn_graph_rejects_unknown_schema() -> None:
         normalize_qnn_graph({"qnn_json_graph_schema_version": 2})
 
 
-def test_normalize_qnn_graph_dump_dir_excludes_tensor_logs(tmp_path: Path) -> None:
+def test_normalize_qnn_graph_dump_dir_removes_tensor_logs(tmp_path: Path) -> None:
     graph_path = tmp_path / "subgraph.json"
     tensor_log_path = tmp_path / "subgraph_tensor_log.json"
     graph_path.write_text(json.dumps(_graph_dump()), encoding="utf-8")
@@ -52,4 +52,4 @@ def test_normalize_qnn_graph_dump_dir_excludes_tensor_logs(tmp_path: Path) -> No
     assert graph_files == [graph_path]
     normalized = json.loads(graph_path.read_text(encoding="utf-8"))
     assert "id" not in normalized["graph"]["tensors"]["weights"]
-    assert json.loads(tensor_log_path.read_text(encoding="utf-8")) == {"id": 99}
+    assert not tensor_log_path.exists()

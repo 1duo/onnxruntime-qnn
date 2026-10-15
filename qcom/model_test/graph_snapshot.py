@@ -40,7 +40,7 @@ def normalize_qnn_graph(graph: dict[str, Any]) -> dict[str, Any]:
 
 
 def normalize_qnn_graph_dump_dir(dump_dir: Path) -> list[Path]:
-    """Normalize graph dumps in place and return their deterministic file list."""
+    """Normalize graph dumps, remove auxiliary tensor logs, and return the graph files."""
     graph_files = sorted(path for path in dump_dir.glob("*.json") if not path.name.endswith("_tensor_log.json"))
     if not graph_files:
         raise RuntimeError(f"No QNN graph JSON files were created in {dump_dir}.")
@@ -51,5 +51,11 @@ def normalize_qnn_graph_dump_dir(dump_dir: Path) -> list[Path]:
             json.dumps(normalized, sort_keys=True, separators=(",", ":")) + "\n",
             encoding="utf-8",
         )
+
+    # Tensor logs are diagnostic sidecars, not part of the snapshot golden.
+    # Remove them only after every graph dump was normalized successfully so
+    # they remain available to diagnose a normalization failure.
+    for tensor_log_file in dump_dir.glob("*_tensor_log.json"):
+        tensor_log_file.unlink()
 
     return graph_files

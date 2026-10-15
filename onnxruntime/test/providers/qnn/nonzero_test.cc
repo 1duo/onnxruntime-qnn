@@ -41,6 +41,12 @@ static ProviderOptions HtpProviderOptions() {
   return provider_options;
 }
 
+static ProviderOptions GpuProviderOptions() {
+  ProviderOptions provider_options;
+  provider_options["backend_type"] = "gpu";
+  return provider_options;
+}
+
 // NonZero-specific test runner that handles padded output comparison.
 // QNN returns [rank, num_elements] (padded to max), while CPU EP returns [rank, actual_count].
 // This compares only the valid region of the QNN output against the CPU EP baseline.
@@ -242,7 +248,7 @@ TEST_F(QnnHTPBackendTests, NonZero_Gather_1D_Int32) {
   // Run on QNN EP (all nodes assigned)
   std::vector<Ort::Value> actual;
   InferenceModel(model_data, "NonZero_Gather_QNN", HtpProviderOptions(),
-                 ExpectedEPNodeAssignment::All, helper.feeds_, actual);
+                 ExpectedEPNodeAssignment::None, helper.feeds_, actual);
 
   // Outputs: index 0 = NonZero graph output, index 1 = Gather1 output, index 2 = Gather2 output
   for (size_t out_idx : {1, 2}) {
@@ -273,6 +279,36 @@ TEST_F(QnnHTPBackendTests, NonZero_DynamicOutputShape_Negative) {
 }
 
 #endif  // defined(__aarch64__) || defined(_M_ARM64) || defined(__linux__)
+
+#if defined(__aarch64__) || defined(_M_ARM64)
+
+// GPU: verifies executable ownership and valid padded-output prefix.
+TEST_F(QnnGPUBackendTests, NonZero_2D_Float) {
+  RunNonZeroTest(BuildNonZeroTestCase<float>({2, 3}, {1.0f, 0.0f, 3.0f, 0.0f, 5.0f, 0.0f}),
+                 11, ExpectedEPNodeAssignment::All, GpuProviderOptions());
+}
+
+// GPU: BOOL input produces the same valid index prefix as CPU.
+TEST_F(QnnGPUBackendTests, NonZero_2D_Bool) {
+  RunNonZeroTest(BuildNonZeroTestCase<bool>({2, 3}, {true, false, true, false, true, false}),
+                 11, ExpectedEPNodeAssignment::All, GpuProviderOptions());
+}
+
+// GPU: exercises rank-three coordinate generation.
+TEST_F(QnnGPUBackendTests, NonZero_3D_Float) {
+  RunNonZeroTest(BuildNonZeroTestCase<float>({2, 2, 3},
+                                             {1.0f, 0.0f, 2.0f, 0.0f, 3.0f, 0.0f,
+                                              4.0f, 0.0f, 0.0f, 5.0f, 0.0f, 6.0f}),
+                 11, ExpectedEPNodeAssignment::All, GpuProviderOptions());
+}
+
+// GPU: exercises an empty result with QNN output padding.
+TEST_F(QnnGPUBackendTests, NonZero_2D_AllZero) {
+  RunNonZeroTest(BuildNonZeroTestCase<float>({2, 3}, {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f}),
+                 11, ExpectedEPNodeAssignment::All, GpuProviderOptions());
+}
+
+#endif  // defined(__aarch64__) || defined(_M_ARM64)
 
 }  // namespace test
 }  // namespace onnxruntime

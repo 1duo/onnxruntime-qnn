@@ -41,10 +41,9 @@ class NonZeroOpBuilder : public BaseOpBuilder {
 Ort::Status NonZeroOpBuilder::IsOpSupported(QnnModelWrapper& qnn_model_wrapper,
                                             const OrtNodeUnit& node_unit,
                                             const Ort::Logger& logger) const {
-  // NonZero is only supported on HTP backend.
-  RETURN_IF_NOT(qnn_model_wrapper.GetQnnBackendType() == QnnBackendType::HTP,
-                "NonZero is only supported on HTP backend.");
-
+  const auto backend_type = qnn_model_wrapper.GetQnnBackendType();
+  RETURN_IF_NOT(backend_type == QnnBackendType::HTP || backend_type == QnnBackendType::GPU,
+                "NonZero is only supported on HTP and GPU backends.");
   // NonZero output must have a static shape (no dynamic dims).
   // The ONNX model should set the output shape to [rank, num_elements] where num_elements
   // is the total number of elements in the input.
@@ -56,10 +55,10 @@ Ort::Status NonZeroOpBuilder::IsOpSupported(QnnModelWrapper& qnn_model_wrapper,
   const std::string& output_name = output.name;
   if (qnn_model_wrapper.IsGraphOutput(output_name)) {
     ORT_CXX_LOG(logger, ORT_LOGGING_LEVEL_WARNING,
-                "NonZero output is a graph output. QNN HTP pads unused elements with -1.");
+                "NonZero output is a graph output. QNN pads unused elements with -1.");
   }
 
-  // QNN HTP NonZero pads unused output elements with -1. Only these consumer ops handle -1 indices correctly.
+  // QNN NonZero pads unused output elements with -1. Only these consumer ops handle -1 indices correctly.
   static const std::unordered_set<std::string> allowed_consumers = {
       "Gather", "GatherElements", "GatherND", "ScatterElements", "ScatterND", "Reshape", "Transpose"};
 
@@ -69,7 +68,6 @@ Ort::Status NonZeroOpBuilder::IsOpSupported(QnnModelWrapper& qnn_model_wrapper,
     RETURN_IF_NOT(allowed_consumers.count(op) == 1,
                   ("NonZero consumer op '" + op + "' does not support -1 padded indices.").c_str());
   }
-
   // QNN HTP NonZero supported input types:
   //   FLOAT_16, UFIXED_POINT_16, UFIXED_POINT_8, BOOL_8
   // FLOAT_32 is also accepted here because ProcessInputs inserts a Cast(fp32 -> fp16).

@@ -547,8 +547,18 @@ Ort::Status MatMulNBitsOpBuilder::ProcessInputs(QnnModelWrapper& qnn_model_wrapp
             }
           }
 
-          quantize_param = QnnQuantParamsWrapper::BwBlockMapped(per_block_float_scale,
-                                                                per_block_int32_offset,
+          // Weight was transposed [N,K] → [1,1,K,N], so transpose scales/offsets [N,k_blocks] → [k_blocks,N].
+          std::vector<float> transposed_scales(total_blocks);
+          std::vector<int32_t> transposed_offsets(total_blocks);
+          for (int64_t n = 0; n < N; ++n) {
+            for (int64_t b = 0; b < k_blocks; ++b) {
+              transposed_scales[b * N + n] = per_block_float_scale[n * k_blocks + b];
+              transposed_offsets[b * N + n] = per_block_int32_offset[n * k_blocks + b];
+            }
+          }
+
+          quantize_param = QnnQuantParamsWrapper::BwBlockMapped(transposed_scales,
+                                                                transposed_offsets,
                                                                 gsl::narrow_cast<uint32_t>(bits),
                                                                 block_sizes,
                                                                 mapping);

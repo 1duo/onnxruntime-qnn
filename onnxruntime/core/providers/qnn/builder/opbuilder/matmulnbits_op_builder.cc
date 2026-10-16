@@ -528,51 +528,39 @@ Ort::Status MatMulNBitsOpBuilder::ProcessInputs(QnnModelWrapper& qnn_model_wrapp
 
         bool used_bw_block_mapped = false;
 #ifdef QNN_W2A16_BW_BLOCK_MAPPED_AVAILABLE
-        // 2-bit BW_BLOCK_MAPPED: keeps int16 activations natively (no DQ needed).
-        // Gated to SDK >= 2.51: the native W2A16 HTP kernel is not available until 2.51.
-        // Symmetric → STANDARD_SYMMETRIC (offsets=0), Asymmetric → ASYMMETRIC_PLUS_ONE (offsets from ZP tensor).
-        if (bits == 2 && is_act_16bitquant) {
+        // 2-bit standard-symmetric BW_BLOCK_MAPPED: keeps int16 activations natively (no DQ needed).
+        // Native W2A16 requires v81+, block size 32/64/128, and N a multiple of 32.
+        // Asymmetric 2-bit quantization continues to use the existing BW_FLOAT_BLOCK fallback.
+        if (bits == 2 && is_act_16bitquant && zp_is_symmetric &&
+            qnn_model_wrapper.GetHtpArch() >= QNN_HTP_DEVICE_ARCH_V81 &&
+            (block_size == 32 || block_size == 64 || block_size == 128) && N % 32 == 0) {
           const std::vector<uint32_t> block_sizes = {1, 1, gsl::narrow_cast<uint32_t>(block_size), 1};
+          const std::vector<int32_t> per_block_int32_offset(total_blocks, 0);
 
-          Qnn_QuantizationEncodingMapping_t mapping;
-          std::vector<int32_t> per_block_int32_offset;
-          if (zp_is_symmetric) {
-            mapping = QNN_QUANTIZATION_ENCODING_MAPPING_STANDARD_SYMMETRIC;
-            per_block_int32_offset.assign(total_blocks, 0);
-          } else {
-            mapping = QNN_QUANTIZATION_ENCODING_MAPPING_ASYMMETRIC_PLUS_ONE;
-            per_block_int32_offset.reserve(per_block_float_zp.size());
-            for (float zp : per_block_float_zp) {
-              per_block_int32_offset.push_back(static_cast<int32_t>(zp));
-            }
-          }
+          // BW_BLOCK_MAPPED consumes the unpacked buffer as SFIXED_POINT_8. Recover the signed
+          // two's-complement values (-2/-1) that UnpackWeightData left masked as 0x02/0x03.
+          utils::SignExtendUnpackedSubByteData(ONNX_TENSOR_ELEMENT_DATA_TYPE_INT2, weight_data);
 
-          // Weight was transposed [N,K] → [1,1,K,N], so transpose scales/offsets [N,k_blocks] → [k_blocks,N].
-          std::vector<float> transposed_scales(total_blocks);
-          std::vector<int32_t> transposed_offsets(total_blocks);
-          for (int64_t n = 0; n < N; ++n) {
-            for (int64_t b = 0; b < k_blocks; ++b) {
-              transposed_scales[b * N + n] = per_block_float_scale[n * k_blocks + b];
-              transposed_offsets[b * N + n] = per_block_int32_offset[n * k_blocks + b];
-            }
-          }
-
-          quantize_param = QnnQuantParamsWrapper::BwBlockMapped(transposed_scales,
-                                                                transposed_offsets,
+          // HTP Conv2d expects block scales in output-channel-major order [N,k_blocks],
+          // as in the ONNX initializer, even though the weights are transposed to [1,1,K,N].
+          // Transposing scales mixes the scale assignments between channels and blocks.
+          quantize_param = QnnQuantParamsWrapper::BwBlockMapped(per_block_float_scale,
+                                                                per_block_int32_offset,
                                                                 gsl::narrow_cast<uint32_t>(bits),
                                                                 block_sizes,
-                                                                mapping);
+                                                                QNN_QUANTIZATION_ENCODING_MAPPING_STANDARD_SYMMETRIC);
           used_bw_block_mapped = true;
-          const char* mapping_str = zp_is_symmetric ? "STANDARD_SYMMETRIC" : "ASYMMETRIC_PLUS_ONE";
           ORT_CXX_LOG(logger, ORT_LOGGING_LEVEL_VERBOSE,
-                      ("MatMulNBits weight encoding: BW_BLOCK_MAPPED (" + std::string(mapping_str) + ") for " + weight_tensor_name).c_str());
+                      ("MatMulNBits weight encoding: BW_BLOCK_MAPPED (STANDARD_SYMMETRIC) for " + weight_tensor_name).c_str());
         }
 #endif  // QNN_W2A16_BW_BLOCK_MAPPED_AVAILABLE
 
         if (!used_lpbq && !used_bw_block_mapped) {
           // Non-LPBQ, non-BW_BLOCK_MAPPED path: native BQ (BLOCK) or BW_FLOAT_BLOCK, decided below.
           const char* reason = !is_act_16bitquant ? "activation not 16-bit quantized"
-                               : bits == 2        ? "BW_BLOCK_MAPPED unavailable (SDK < 2.51)"
+                               : bits == 2 && !zp_is_symmetric
+                                   ? "asymmetric 2-bit quantization uses BW_FLOAT_BLOCK"
+                               : bits == 2 ? "BW_BLOCK_MAPPED SDK, architecture, or shape requirements not met"
                                : bits != 4        ? "unsupported bit-width for LPBQ"
                                : !zp_is_symmetric ? "zero-points not symmetric"
                                                   : "LPBQ conversion failed (enable_block_quant_weight_optimization=0)";

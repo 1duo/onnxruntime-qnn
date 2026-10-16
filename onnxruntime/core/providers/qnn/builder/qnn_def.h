@@ -51,9 +51,9 @@ namespace qnn {
 #define QNN_HTP_GRAPH_SPLITTING_NUM_THREADS_AVAILABLE
 #endif
 
-// W2A16 BW_BLOCK_MAPPED encoding (native 2-bit block-quantized int16 compute) requires QAIRT SDK 2.51+.
+// W2A16 BW_BLOCK_MAPPED encoding (native 2-bit block-quantized int16 compute) requires QAIRT SDK 2.52+.
 #if defined(QNN_SDK_VERSION_MAJOR) && defined(QNN_SDK_VERSION_MINOR) && \
-    (QNN_SDK_VERSION_MAJOR > 2 || (QNN_SDK_VERSION_MAJOR == 2 && QNN_SDK_VERSION_MINOR >= 51))
+    (QNN_SDK_VERSION_MAJOR > 2 || (QNN_SDK_VERSION_MAJOR == 2 && QNN_SDK_VERSION_MINOR >= 52))
 #define QNN_W2A16_BW_BLOCK_MAPPED_AVAILABLE
 #endif
 

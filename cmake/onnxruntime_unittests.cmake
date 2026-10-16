@@ -367,6 +367,11 @@ block()
     # uniform across all TUs in a binary. Suppress the define so the genie TUs match
     # the rest of the test binary.
     target_compile_definitions(onnxruntime_provider_test PRIVATE ORT_UNIT_TEST_BUILD)
+    if(QNN_SDK_VERSION_MAJOR AND QNN_SDK_VERSION_MINOR)
+      target_compile_definitions(onnxruntime_provider_test PRIVATE
+        QNN_SDK_VERSION_MAJOR=${QNN_SDK_VERSION_MAJOR}
+        QNN_SDK_VERSION_MINOR=${QNN_SDK_VERSION_MINOR})
+    endif()
     if(onnxruntime_BUILD_QNN_UDO_TEST)
       target_compile_definitions(onnxruntime_provider_test PRIVATE BUILD_QNN_UDO_TEST)
     endif()

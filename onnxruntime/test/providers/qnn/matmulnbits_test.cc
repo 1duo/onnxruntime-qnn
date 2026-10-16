@@ -210,8 +210,18 @@ static void RunHtpQDQMatMulNBitsTest(const TestParams params,
 #ifndef QNN_HTP_NATIVE_BQ_AVAILABLE
   // HTP native BQ support starts from QAIRT 2.51 (QNN API 2.40).
   // Disable here to avoid guarding everywhere.
-  if (expect_native_bq.has_value()) {
+  if (bits != 2 && expect_native_bq.has_value()) {
     *expect_native_bq = false;
+  }
+#endif
+
+  // W2A16 was introduced after native W4A16, despite sharing QNN API 2.40.
+#if !defined(QNN_SDK_VERSION_MAJOR) || !defined(QNN_SDK_VERSION_MINOR) || \
+    (QNN_SDK_VERSION_MAJOR < 2 || (QNN_SDK_VERSION_MAJOR == 2 && QNN_SDK_VERSION_MINOR < 52))
+  if constexpr (bits == 2) {
+    if (expect_native_bq.value_or(false)) {
+      GTEST_SKIP() << "Native W2A16 BW_BLOCK_MAPPED tests require QAIRT SDK 2.52+.";
+    }
   }
 #endif
 
@@ -573,6 +583,27 @@ TEST_F(QnnHTPBackendTests, MatMulNBits_M1_N2_K64_B8_BS64_ZP) {
 
 // QDQ MatMulNBits with UINT16 (UFIXED_POINT_16) activations/output.
 
+// Unsupported native shapes must retain the FP16 BQ fallback, even on v81+.
+TEST_F(QnnHTPBackendTests, MatMulNBits_QDQ_U16_M1_N32_K64_B2_BS16) {
+  SKIP_HTP_TEST_ON_ARCH_LESS_THAN_OR_EQUAL_TO(QNN_HTP_DEVICE_ARCH_V68);
+  TestParams params;
+  params.M = 1;
+  params.N = 32;
+  params.K = 64;
+  params.block_size = 16;
+  RunHtpQDQMatMulNBitsTest<2, uint16_t>(params, /*expect_native_bq=*/false);
+}
+
+TEST_F(QnnHTPBackendTests, MatMulNBits_QDQ_U16_M1_N16_K64_B2_BS32) {
+  SKIP_HTP_TEST_ON_ARCH_LESS_THAN_OR_EQUAL_TO(QNN_HTP_DEVICE_ARCH_V68);
+  TestParams params;
+  params.M = 1;
+  params.N = 16;
+  params.K = 64;
+  params.block_size = 32;
+  RunHtpQDQMatMulNBitsTest<2, uint16_t>(params, /*expect_native_bq=*/false);
+}
+
 TEST_F(QnnHTPBackendTests, MatMulNBits_QDQ_U16_M1_N32_K64_B2_BS32) {
   SKIP_HTP_TEST_ON_ARCH_LESS_THAN_OR_EQUAL_TO(QNN_HTP_DEVICE_ARCH_V68);
 
@@ -582,7 +613,11 @@ TEST_F(QnnHTPBackendTests, MatMulNBits_QDQ_U16_M1_N32_K64_B2_BS32) {
   params.K = 64;
   params.block_size = 32;
   params.has_zero_point = false;
-  RunHtpQDQMatMulNBitsTest<2, uint16_t>(params, /*expect_native_bq=*/false);
+  QNN_SKIP_TEST_IF_NO_PLATFORM_ATTRS();
+  if (!IsNativeBqExpected(GetPlatformAttributes().htp_arch)) {
+    GTEST_SKIP() << "Native W2A16 BW_BLOCK_MAPPED tests require HTP v81+.";
+  }
+  RunHtpQDQMatMulNBitsTest<2, uint16_t>(params, /*expect_native_bq=*/true);
 }
 
 TEST_F(QnnHTPBackendTests, MatMulNBits_QDQ_U16_M1_N32_K64_B2_BS32_ZP) {
@@ -594,7 +629,12 @@ TEST_F(QnnHTPBackendTests, MatMulNBits_QDQ_U16_M1_N32_K64_B2_BS32_ZP) {
   params.K = 64;
   params.block_size = 32;
   params.has_zero_point = true;
-  RunHtpQDQMatMulNBitsTest<2, uint16_t>(params, /*expect_native_bq=*/false);
+  params.is_zp_symmetric = true;
+  QNN_SKIP_TEST_IF_NO_PLATFORM_ATTRS();
+  if (!IsNativeBqExpected(GetPlatformAttributes().htp_arch)) {
+    GTEST_SKIP() << "Native W2A16 BW_BLOCK_MAPPED tests require HTP v81+.";
+  }
+  RunHtpQDQMatMulNBitsTest<2, uint16_t>(params, /*expect_native_bq=*/true);
 }
 
 TEST_F(QnnHTPBackendTests, MatMulNBits_QDQ_U16_M1_N32_K128_B2_BS64) {
@@ -606,7 +646,11 @@ TEST_F(QnnHTPBackendTests, MatMulNBits_QDQ_U16_M1_N32_K128_B2_BS64) {
   params.K = 128;
   params.block_size = 64;
   params.has_zero_point = false;
-  RunHtpQDQMatMulNBitsTest<2, uint16_t>(params, /*expect_native_bq=*/false);
+  QNN_SKIP_TEST_IF_NO_PLATFORM_ATTRS();
+  if (!IsNativeBqExpected(GetPlatformAttributes().htp_arch)) {
+    GTEST_SKIP() << "Native W2A16 BW_BLOCK_MAPPED tests require HTP v81+.";
+  }
+  RunHtpQDQMatMulNBitsTest<2, uint16_t>(params, /*expect_native_bq=*/true);
 }
 
 TEST_F(QnnHTPBackendTests, MatMulNBits_QDQ_U16_M1_N32_K128_B2_BS64_ZP) {
@@ -630,7 +674,11 @@ TEST_F(QnnHTPBackendTests, MatMulNBits_QDQ_U16_M1_N64_K256_B2_BS128) {
   params.K = 256;
   params.block_size = 128;
   params.has_zero_point = false;
-  RunHtpQDQMatMulNBitsTest<2, uint16_t>(params, /*expect_native_bq=*/false);
+  QNN_SKIP_TEST_IF_NO_PLATFORM_ATTRS();
+  if (!IsNativeBqExpected(GetPlatformAttributes().htp_arch)) {
+    GTEST_SKIP() << "Native W2A16 BW_BLOCK_MAPPED tests require HTP v81+.";
+  }
+  RunHtpQDQMatMulNBitsTest<2, uint16_t>(params, /*expect_native_bq=*/true);
 }
 
 TEST_F(QnnHTPBackendTests, MatMulNBits_QDQ_U16_M1_N64_K256_B2_BS128_ZP) {
@@ -830,7 +878,11 @@ TEST_F(QnnHTPBackendTests, MatMulNBits_QDQ_S16_M1_N32_K64_B2_BS32) {
   params.K = 64;
   params.block_size = 32;
   params.has_zero_point = false;
-  RunHtpQDQMatMulNBitsTest<2, int16_t>(params, /*expect_native_bq=*/false);
+  QNN_SKIP_TEST_IF_NO_PLATFORM_ATTRS();
+  if (!IsNativeBqExpected(GetPlatformAttributes().htp_arch)) {
+    GTEST_SKIP() << "Native W2A16 BW_BLOCK_MAPPED tests require HTP v81+.";
+  }
+  RunHtpQDQMatMulNBitsTest<2, int16_t>(params, /*expect_native_bq=*/true);
 }
 
 TEST_F(QnnHTPBackendTests, MatMulNBits_QDQ_S16_M1_N32_K64_B2_BS32_ZP) {
@@ -854,7 +906,11 @@ TEST_F(QnnHTPBackendTests, MatMulNBits_QDQ_S16_M1_N32_K128_B2_BS64) {
   params.K = 128;
   params.block_size = 64;
   params.has_zero_point = false;
-  RunHtpQDQMatMulNBitsTest<2, int16_t>(params, /*expect_native_bq=*/false);
+  QNN_SKIP_TEST_IF_NO_PLATFORM_ATTRS();
+  if (!IsNativeBqExpected(GetPlatformAttributes().htp_arch)) {
+    GTEST_SKIP() << "Native W2A16 BW_BLOCK_MAPPED tests require HTP v81+.";
+  }
+  RunHtpQDQMatMulNBitsTest<2, int16_t>(params, /*expect_native_bq=*/true);
 }
 
 TEST_F(QnnHTPBackendTests, MatMulNBits_QDQ_S16_M1_N32_K128_B2_BS64_ZP) {
@@ -878,7 +934,11 @@ TEST_F(QnnHTPBackendTests, MatMulNBits_QDQ_S16_M1_N64_K256_B2_BS128) {
   params.K = 256;
   params.block_size = 128;
   params.has_zero_point = false;
-  RunHtpQDQMatMulNBitsTest<2, int16_t>(params, /*expect_native_bq=*/false);
+  QNN_SKIP_TEST_IF_NO_PLATFORM_ATTRS();
+  if (!IsNativeBqExpected(GetPlatformAttributes().htp_arch)) {
+    GTEST_SKIP() << "Native W2A16 BW_BLOCK_MAPPED tests require HTP v81+.";
+  }
+  RunHtpQDQMatMulNBitsTest<2, int16_t>(params, /*expect_native_bq=*/true);
 }
 
 TEST_F(QnnHTPBackendTests, MatMulNBits_QDQ_S16_M1_N64_K256_B2_BS128_ZP) {
@@ -1186,59 +1246,6 @@ TEST_F(QnnHTPBackendTests, MatMulNBits_LPBQ_M1_N4_K64_B4_BS16_AZP) {
   params.has_zero_point = true;
   params.enable_lpbq = true;
   RunHtpQDQMatMulNBitsTest<4, int16_t>(params);
-}
-
-// W2A16 Standard Symmetric BW_BLOCK_MAPPED (bits=2, 16-bit activation, symmetric zero-point).
-// On SDK >= 2.51 uses BW_BLOCK_MAPPED encoding; on older SDKs falls back to BW_FLOAT_BLOCK.
-TEST_F(QnnHTPBackendTests, MatMulNBits_BwBlockMapped_W2A16_StdSym_M1_N4_K64_BS16) {
-  SKIP_HTP_TEST_ON_ARCH_LESS_THAN_OR_EQUAL_TO(QNN_HTP_DEVICE_ARCH_V68);
-
-  TestParams params;
-  params.M = 1;
-  params.N = 4;
-  params.K = 64;
-  params.block_size = 16;
-  params.has_zero_point = false;
-  RunHtpQDQMatMulNBitsTest<2, int16_t>(params, /*expect_native_bq=*/true, ExpectedEPNodeAssignment::All, QDQTolerance(0.02f));
-}
-
-TEST_F(QnnHTPBackendTests, MatMulNBits_BwBlockMapped_W2A16_StdSym_M1_N8_K128_BS32_ZP) {
-  SKIP_HTP_TEST_ON_ARCH_LESS_THAN_OR_EQUAL_TO(QNN_HTP_DEVICE_ARCH_V68);
-
-  TestParams params;
-  params.M = 1;
-  params.N = 8;
-  params.K = 128;
-  params.block_size = 32;
-  params.has_zero_point = true;
-  params.is_zp_symmetric = true;
-  RunHtpQDQMatMulNBitsTest<2, uint16_t>(params, /*expect_native_bq=*/true, ExpectedEPNodeAssignment::All, QDQTolerance(0.02f));
-}
-
-// W2A16 Asymmetric BW_BLOCK_MAPPED (bits=2, 16-bit activation, asymmetric zero-point).
-// Uses ASYMMETRIC_PLUS_ONE mapping: {0,1,2,3} → {-1,0,1,2}.
-TEST_F(QnnHTPBackendTests, MatMulNBits_BwBlockMapped_W2A16_AsymPlusOne_M1_N4_K64_BS16_ZP) {
-  SKIP_HTP_TEST_ON_ARCH_LESS_THAN_OR_EQUAL_TO(QNN_HTP_DEVICE_ARCH_V68);
-
-  TestParams params;
-  params.M = 1;
-  params.N = 4;
-  params.K = 64;
-  params.block_size = 16;
-  params.has_zero_point = true;
-  RunHtpQDQMatMulNBitsTest<2, int16_t>(params, /*expect_native_bq=*/true, ExpectedEPNodeAssignment::All, QDQTolerance(0.02f));
-}
-
-TEST_F(QnnHTPBackendTests, MatMulNBits_BwBlockMapped_W2A16_AsymPlusOne_M1_N8_K128_BS32_ZP) {
-  SKIP_HTP_TEST_ON_ARCH_LESS_THAN_OR_EQUAL_TO(QNN_HTP_DEVICE_ARCH_V68);
-
-  TestParams params;
-  params.M = 1;
-  params.N = 8;
-  params.K = 128;
-  params.block_size = 32;
-  params.has_zero_point = true;
-  RunHtpQDQMatMulNBitsTest<2, uint16_t>(params, /*expect_native_bq=*/true, ExpectedEPNodeAssignment::All, QDQTolerance(0.02f));
 }
 
 #endif  // defined(__aarch64__) || defined(_M_ARM64) || defined(__linux__)

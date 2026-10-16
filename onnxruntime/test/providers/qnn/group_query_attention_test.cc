@@ -443,7 +443,8 @@ static void RunHTPPackedGQATest(int32_t num_heads,
                                 float scale,
                                 int32_t do_rotary,
                                 float fp32_abs_err = 1e-2f,
-                                int32_t max_seq_len = 0) {
+                                int32_t max_seq_len = 0,
+                                bool with_position_ids = false) {
   // GQA op validation fails on HTP (QNN_OP_PACKAGE_ERROR_VALIDATION_FAILURE) on V68 and below.
   SKIP_HTP_TEST_ON_ARCH_LESS_THAN_OR_EQUAL_TO(QNN_HTP_DEVICE_ARCH_V68);
 
@@ -471,6 +472,15 @@ static void RunHTPPackedGQATest(int32_t num_heads,
                                  static_cast<T>(-1.0f), static_cast<T>(1.0f));
     config.sin_cache_def.emplace(std::vector<int64_t>{max_seq_len, head_size / 2}, true,
                                  static_cast<T>(-1.0f), static_cast<T>(1.0f));
+  }
+
+  if (with_position_ids) {
+    std::vector<int64_t> position_ids(batch_size * sequence_length);
+    for (int32_t i = 0; i < sequence_length; ++i) {
+      position_ids[i] = total_seq_len - sequence_length + i;
+    }
+    config.position_ids_def.emplace(std::vector<int64_t>{batch_size, sequence_length},
+                                    false, std::move(position_ids));
   }
 
   config.do_rotary = do_rotary;
@@ -573,8 +583,19 @@ TEST_F(QnnHTPBackendTests, GroupQueryAttention_Rotary_FP32) {
   RunHTPPackedGQATest<float>(8, 4, 32, 1, 1024, /*scale*/ 0.0f, /*do_rotary*/ 1);
 }
 
+TEST_F(QnnHTPBackendTests, GroupQueryAttention_PositionIdsInt64_FP32) {
+  RunHTPPackedGQATest<float>(8, 4, 32, 1, 1024, /*scale*/ 0.0f, /*do_rotary*/ 1,
+                             /*fp32_abs_err*/ 1e-2f, /*max_seq_len*/ 0, /*with_position_ids*/ true);
+}
+
 TEST_F(QnnHTPBackendTests, GroupQueryAttention_Basic_FP16) {
   RunHTPPackedGQATest<Ort::Float16_t>(8, 4, 32, 1, 1024, /*scale*/ 0.0f, /*do_rotary*/ 0);
+}
+
+TEST_F(QnnHTPBackendTests, GroupQueryAttention_PositionIdsInt64_FP16) {
+  RunHTPPackedGQATest<Ort::Float16_t>(8, 4, 32, 1, 1024, /*scale*/ 0.0f, /*do_rotary*/ 1,
+                                      /*fp32_abs_err*/ 1e-2f, /*max_seq_len*/ 0,
+                                      /*with_position_ids*/ true);
 }
 
 TEST_F(QnnHTPBackendTests, GroupQueryAttention_Unpacked_Basic_FP32) {

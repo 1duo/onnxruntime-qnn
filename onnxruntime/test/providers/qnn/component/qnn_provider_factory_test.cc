@@ -29,7 +29,9 @@
 #include <cstdint>
 #include <cstring>
 #include <string>
+#include <string_view>
 #include <unordered_map>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -118,6 +120,7 @@ class FactoryStubContext {
   std::unordered_map<const OrtHardwareDevice*, OrtHardwareDeviceType> device_type_map;
   std::unordered_map<const OrtHardwareDevice*, uint32_t> device_vendor_map;
   std::unordered_map<const OrtHardwareDevice*, uint32_t> device_id_map;
+  std::unordered_set<const OrtHardwareDevice*> virtual_devices;
   std::unordered_map<std::string, std::string> env_config;
   bool fail_get_env_config = false;
   uint32_t synthesized_device_id = 0;
@@ -249,14 +252,24 @@ class FactoryStubContext {
       }
     };
     stub_ort_api.ReleaseKeyValuePairs = [](OrtKeyValuePairs*) noexcept {};
+    stub_ort_api.GetKeyValuePairs = [](const OrtKeyValuePairs*, const char* const** keys,
+                                      const char* const** values, size_t* num_entries) noexcept {
+      static const char* metadata_keys[] = {kOrtHardwareDevice_MetadataKey_IsVirtual};
+      static const char* metadata_values[] = {"1"};
+      *keys = metadata_keys;
+      *values = metadata_values;
+      *num_entries = 1;
+    };
     stub_ort_api.GetKeyValue = [](const OrtKeyValuePairs*, const char* key) noexcept -> const char* {
       auto* self = current_;
       if (self == nullptr || key == nullptr) return nullptr;
       const auto it = self->env_config.find(key);
       return it == self->env_config.end() ? nullptr : it->second.c_str();
     };
-    stub_ort_api.HardwareDevice_Metadata = [](const OrtHardwareDevice*) noexcept -> const OrtKeyValuePairs* {
-      return nullptr;
+    stub_ort_api.HardwareDevice_Metadata = [](const OrtHardwareDevice* device) noexcept -> const OrtKeyValuePairs* {
+      auto* self = current_;
+      if (!self || !self->virtual_devices.count(device)) return nullptr;
+      return reinterpret_cast<const OrtKeyValuePairs*>(kFakeToken);
     };
 
     stub_ort_api.HardwareDevice_Type =
@@ -1595,6 +1608,49 @@ TEST_F(QnnUnit_ProviderFactoryHtpTest,
 // Multi-device autoep: NPU + GPU present, no backend_type/backend_path — the
 // factory should pick the NPU (and log a warning). Covers the multi-device
 // std::find_if(is_npu) branch of CreateEpImpl.
+TEST_F(QnnUnit_ProviderFactoryHtpTest,
+       CreateEp_VirtualNpu_InjectsLockdownAotDefaultsAndTarget) {
+  FactoryStubContext ctx;
+  UseGlobalFactoryStubs use(ctx);
+  QnnEpFactory factory("QNNExecutionProvider", ctx.MakeApiPtrs());
+
+  OrtHardwareDevice* virtual_npu = MakeFakeHwDevice(25);
+  ctx.device_type_map[virtual_npu] = OrtHardwareDeviceType_NPU;
+  ctx.device_vendor_map[virtual_npu] = kQualcommVendorId;
+  ctx.virtual_devices.insert(virtual_npu);
+  ctx.env_config["target_architecture"] = "htp-v73";
+
+  auto* fake_session_opts = reinterpret_cast<OrtSessionOptions*>(kFakeToken);
+  auto* fake_logger = reinterpret_cast<OrtLogger*>(kFakeToken);
+  auto* fake_metadata = reinterpret_cast<const OrtKeyValuePairs*>(kFakeToken);
+  OrtEp* ep = nullptr;
+  const OrtHardwareDevice* devices[] = {virtual_npu};
+  const OrtKeyValuePairs* metadata[] = {fake_metadata};
+
+  OrtStatus* status = factory.CreateEp(&factory, devices, metadata, 1,
+                                       fake_session_opts, fake_logger, &ep);
+
+  const auto has_entry = [&ctx](std::string_view suffix, std::string_view value) {
+    return std::any_of(ctx.added_config_entries.begin(), ctx.added_config_entries.end(),
+                       [suffix, value](const auto& entry) {
+                         const std::string_view key = entry.first;
+                         return key.size() >= suffix.size() &&
+                                key.substr(key.size() - suffix.size()) == suffix && entry.second == value;
+                       });
+  };
+  EXPECT_TRUE(has_entry("htp_arch", "73"));
+  EXPECT_TRUE(has_entry("ep.context_enable", "1"));
+  EXPECT_TRUE(has_entry("enable_htp_prepare_only", "1"));
+  EXPECT_TRUE(has_entry("enable_htp_cross_device_prepare", "1"));
+
+  if (status == nullptr) {
+    EXPECT_NE(ep, nullptr);
+    factory.ReleaseEp(&factory, ep);
+  } else {
+    ctx.stub_ort_api.ReleaseStatus(status);
+  }
+}
+
 TEST_F(QnnUnit_ProviderFactoryHtpTest,
        CreateEp_AutoepMultiDeviceNpuAndGpu_PicksNpu) {
   FactoryStubContext ctx;

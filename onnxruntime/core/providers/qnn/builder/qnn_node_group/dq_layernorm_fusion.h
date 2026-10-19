@@ -22,14 +22,11 @@ class QnnModelWrapper;
 /// static scale (and, when also 8-bit and mismatched, its static bias) so the node can run as a
 /// native QNN LayerNorm on HTP.
 ///
-/// QNN's HTP LayerNorm validator only supports these INT8 combinations:
-///   UFIXED_POINT_8 / UFIXED_POINT_8 / UFIXED_POINT_8  -> UFIXED_POINT_8
-///   UFIXED_POINT_8 / UFIXED_POINT_8 / SFIXED_POINT_32 -> UFIXED_POINT_8
-///   SFIXED_POINT_8 / SFIXED_POINT_8 / SFIXED_POINT_32 -> SFIXED_POINT_8
-/// None of them mix an UFIXED_POINT_8 operand with a SFIXED_POINT_8 operand. Standard QDQ
-/// quantization tooling commonly produces exactly that mix -- an asymmetric unsigned X (uint8)
-/// with a symmetric signed scale (int8) -- which fails QNN validation and falls back to CPU EP
-/// for the whole node, even though the underlying math is fully representable in 8 bits.
+/// QNN's HTP LayerNorm validator does not support mixing an UFIXED_POINT_8 operand with a
+/// SFIXED_POINT_8 operand between X and its scale/bias. Standard QDQ quantization tooling
+/// commonly produces exactly that mix -- an asymmetric unsigned X (uint8) with a symmetric signed
+/// scale (int8) -- which fails QNN validation and falls back to CPU EP for the whole node, even
+/// though the underlying math is fully representable in 8 bits.
 ///
 /// This fusion requantizes the mismatched static operand(s) to match X's family via an exact,
 /// lossless zero-point shift (+/-128): for a per-tensor 8-bit quantized tensor, flipping between

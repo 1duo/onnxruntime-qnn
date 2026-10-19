@@ -25,6 +25,32 @@ bool IsFixedPoint8(Qnn_DataType_t dtype) {
   return dtype == QNN_DATATYPE_SFIXED_POINT_8 || dtype == QNN_DATATYPE_UFIXED_POINT_8;
 }
 
+// LayerNormalizationOpBuilder decomposes LN into LN+Mul+Add (BuildDecomposedLayerNorm) whenever
+// scale/bias has non-1 dims before the normalization axis (broadcast from an outer dim rather
+// than just the normalized trailing dims). This fusion only emits a single native LN node and has
+// no equivalent decomposition, so TryFusion uses this to defer such shapes to the default
+// op-builder path. Caller has already confirmed the LayerNorm axis is the last one, so any
+// position before `shape`'s own last element lies before that axis.
+bool HasNonOneDimBeforeLastAxis(const std::vector<uint32_t>& shape) {
+  for (size_t i = 0; i + 1 < shape.size(); ++i) {
+    if (shape[i] != 1) {
+      return true;
+    }
+  }
+  return false;
+}
+
+#if QNN_API_VERSION_MAJOR == 2 && QNN_API_VERSION_MINOR >= 17 && QNN_API_VERSION_MINOR <= 20
+// Mirrors LayerNormalizationOpBuilder's predicate for the QNN SDK 2.24-2.27 (API 2.17-2.20)
+// implicit-bias validation bug: an NPU-targeted LN without an explicit bias intermittently fails
+// graph finalize. The op-builder works around it by synthesizing a zero int32 bias
+// (BaseOpBuilder::AddZeroBiasInput), which isn't reachable from this IQnnNodeGroup, so TryFusion
+// defers to the default op-builder path instead of reproducing the bug.
+bool RequiresNpuImplicitBiasWorkaround(const TensorInfo& x_info, const TensorInfo& scale_info) {
+  return x_info.quant_param.IsPerTensor(/*include_bw*/ true) && scale_info.quant_param.IsQuantized();
+}
+#endif
+
 // Requantizes a per-tensor-quantized 8-bit static initializer from SFIXED_POINT_8 to
 // UFIXED_POINT_8 (or vice versa) via an exact +/-128 zero-point shift. For an 8-bit per-tensor
 // quantized tensor, real = scale * (q - offset); shifting both q and offset by the same constant
@@ -151,11 +177,20 @@ std::unique_ptr<IQnnNodeGroup> DQLayerNormFusion::TryFusion(
     return reject("scale quant params are not per-tensor");
   }
 
+  // Defer rank/shape combinations that require LayerNormalizationOpBuilder's own handling (see
+  // HasNonOneDimBeforeLastAxis above) instead of silently skipping it.
+  if (scale_info.shape.size() > input_rank || HasNonOneDimBeforeLastAxis(scale_info.shape)) {
+    return reject("scale shape requires the default op-builder's rank/decomposition handling");
+  }
+
   const bool has_bias = inputs.size() > 2 && inputs[2].Exists();
   if (has_bias) {
     TensorInfo bias_info{};
     if (!qnn_model_wrapper.GetTensorInfo(inputs[2], bias_info).IsOK()) {
       return reject("failed to get TensorInfo for bias");
+    }
+    if (bias_info.shape.size() > input_rank || HasNonOneDimBeforeLastAxis(bias_info.shape)) {
+      return reject("bias shape requires the default op-builder's rank/decomposition handling");
     }
     // Bias is usually SFIXED_POINT_32, which QNN's LayerNorm already accepts regardless of X's
     // sign and this fusion leaves untouched. Only a mismatched 8-bit bias needs resigning too.
@@ -168,6 +203,11 @@ std::unique_ptr<IQnnNodeGroup> DQLayerNormFusion::TryFusion(
       }
     }
   }
+#if QNN_API_VERSION_MAJOR == 2 && QNN_API_VERSION_MINOR >= 17 && QNN_API_VERSION_MINOR <= 20
+  else if (RequiresNpuImplicitBiasWorkaround(x_info, scale_info)) {
+    return reject("no-bias LayerNorm on affected QAIRT 2.24-2.27 range; defer to default op-builder");
+  }
+#endif
 
   // Validate the resigned path before committing to the fusion.
   auto fused = std::unique_ptr<DQLayerNormFusion>(new DQLayerNormFusion(layer_norm_node_unit));

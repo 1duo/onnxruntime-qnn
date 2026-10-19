@@ -46,8 +46,9 @@ enum class BiasKind { kNone,
                       kMismatched8Bit };
 
 GetTestModelFn BuildDQLayerNormSignFixupTestCase(bool x_signed, bool scale_signed, bool scale_per_channel,
-                                                 BiasKind bias_kind = BiasKind::kInt32) {
-  return [x_signed, scale_signed, scale_per_channel, bias_kind](ModelTestBuilder& builder) -> void {
+                                                 BiasKind bias_kind = BiasKind::kInt32,
+                                                 bool boundary_gamma = false) {
+  return [x_signed, scale_signed, scale_per_channel, bias_kind, boundary_gamma](ModelTestBuilder& builder) -> void {
     constexpr int64_t N = 1;
     constexpr int64_t S = 8;
     constexpr int64_t C = 16;
@@ -68,12 +69,20 @@ GetTestModelFn BuildDQLayerNormSignFixupTestCase(bool x_signed, bool scale_signe
     }
     x_f32_name = "x_f32";
 
-    // Scale (gamma): per-channel values in [0.8, 1.2].
+    constexpr float kScaleScale = 0.01f;
+    // Scale (gamma): per-channel values in [0.8, 1.2]. When `boundary_gamma` is set, the first
+    // and last channel are pushed to +/-1.28 instead -- at kScaleScale=0.01 that's exactly the
+    // raw-byte extremes (q=-128 signed / q=0 unsigned, q=127 signed / q=255 unsigned), so the
+    // +/-128 zero-point shift in FlipFixedPoint8Sign gets exercised at both ends of the 8-bit
+    // range instead of only the narrow mid-range values the other tests use.
     std::vector<float> gamma_values(static_cast<size_t>(C));
     for (int64_t i = 0; i < C; ++i) {
       gamma_values[static_cast<size_t>(i)] = 0.8f + 0.4f * (static_cast<float>(i) / static_cast<float>(C - 1));
     }
-    constexpr float kScaleScale = 0.01f;
+    if (boundary_gamma) {
+      gamma_values.front() = -1.28f;
+      gamma_values.back() = 1.27f;
+    }
     if (scale_signed) {
       std::vector<int8_t> q_values(static_cast<size_t>(C));
       for (int64_t i = 0; i < C; ++i) {
@@ -324,7 +333,7 @@ TEST_F(QnnHTPBackendTests, DQLayerNormFusion_Skip_PerChannelScale) {
 // Unsigned X + mismatched signed scale + mismatched signed bias: resigning both scale and bias to
 // UFIXED_POINT_8 lands on UFIXED_POINT_8/UFIXED_POINT_8/UFIXED_POINT_8, a QNN-supported INT8
 // config. Exercises the bias-resign branch in CreateOrValidateOnQnn (the scale-only tests above
-// never touch it, since their bias is always the already-accepted SFIXED_POINT_32).
+// never touch it, since their bias is a matched 8-bit pass-through via BiasKind::kMatched8Bit).
 TEST_F(QnnHTPBackendTests, DQLayerNormFusion_UnsignedX_MismatchedBias) {
   const std::filesystem::path json_dir = "DQLayerNormFusion_UnsignedX_MismatchedBias";
   std::filesystem::remove_all(json_dir);
@@ -344,12 +353,9 @@ TEST_F(QnnHTPBackendTests, DQLayerNormFusion_UnsignedX_MismatchedBias) {
   AssertOpInQnnGraph(json_dir, "LayerNorm", 1);
 }
 
-// Signed X + mismatched unsigned scale + mismatched unsigned bias: resigning both to
-// SFIXED_POINT_8 lands on SFIXED_POINT_8/SFIXED_POINT_8/SFIXED_POINT_8. This combination doesn't
-// appear in the validator's own dumped "Supported I/O datatype sets" list, but real HTP hardware
-// accepts and correctly computes it anyway (verified: no output mismatch, only an EP-assignment
-// mismatch, when this test was first written expecting a CPU fallback) -- so the fusion firing
-// here is correct.
+// Signed X + mismatched unsigned scale + mismatched unsigned bias: resigning both lands on
+// SFIXED_POINT_8/SFIXED_POINT_8/SFIXED_POINT_8. Real HTP hardware accepts and correctly computes
+// this combination (verified: no output mismatch), so the fusion firing here is correct.
 TEST_F(QnnHTPBackendTests, DQLayerNormFusion_SignedX_MismatchedBias) {
   const std::filesystem::path json_dir = "DQLayerNormFusion_SignedX_MismatchedBias";
   std::filesystem::remove_all(json_dir);
@@ -364,6 +370,49 @@ TEST_F(QnnHTPBackendTests, DQLayerNormFusion_SignedX_MismatchedBias) {
   RunAndVerifyLayerNormOutput(
       BuildDQLayerNormSignFixupTestCase(/*x_signed=*/true, /*scale_signed=*/false, /*scale_per_channel=*/false,
                                         BiasKind::kMismatched8Bit),
+      opts, 17, ExpectedEPNodeAssignment::All);
+
+  AssertOpInQnnGraph(json_dir, "LayerNorm", 1);
+}
+
+// Boundary coverage for the exact +/-128 zero-point shift: forces the first/last channel's gamma
+// to quantize to the raw-byte extremes (q=-128/0 and q=127/255 -- see BuildDQLayerNormSignFixupTestCase's
+// `boundary_gamma`), so a wrong shift direction or an off-by-one at the saturation edge would
+// surface as an output mismatch instead of being masked by the other tests' narrow mid-range values.
+TEST_F(QnnHTPBackendTests, DQLayerNormFusion_Boundary_UnsignedX_SignedScale) {
+  const std::filesystem::path json_dir = "DQLayerNormFusion_Boundary_UnsignedX_SignedScale";
+  std::filesystem::remove_all(json_dir);
+  SKIP_HTP_TEST_ON_ARCH_LESS_THAN_OR_EQUAL_TO(QNN_HTP_DEVICE_ARCH_V68);
+  ASSERT_TRUE(std::filesystem::create_directory(json_dir));
+  auto cleanup = gsl::finally([&json_dir]() { std::filesystem::remove_all(json_dir); });
+
+  ProviderOptions opts = GetProviderOptions();
+  opts["dump_json_qnn_graph"] = "1";
+  opts["json_qnn_graph_dir"] = json_dir.string();
+
+  RunAndVerifyLayerNormOutput(
+      BuildDQLayerNormSignFixupTestCase(/*x_signed=*/false, /*scale_signed=*/true, /*scale_per_channel=*/false,
+                                        BiasKind::kMatched8Bit, /*boundary_gamma=*/true),
+      opts, 17, ExpectedEPNodeAssignment::All);
+
+  AssertOpInQnnGraph(json_dir, "LayerNorm", 1);
+}
+
+// Reverse direction of the boundary test above: signed X + unsigned scale, same gamma extremes.
+TEST_F(QnnHTPBackendTests, DQLayerNormFusion_Boundary_SignedX_UnsignedScale) {
+  const std::filesystem::path json_dir = "DQLayerNormFusion_Boundary_SignedX_UnsignedScale";
+  std::filesystem::remove_all(json_dir);
+  SKIP_HTP_TEST_ON_ARCH_LESS_THAN_OR_EQUAL_TO(QNN_HTP_DEVICE_ARCH_V68);
+  ASSERT_TRUE(std::filesystem::create_directory(json_dir));
+  auto cleanup = gsl::finally([&json_dir]() { std::filesystem::remove_all(json_dir); });
+
+  ProviderOptions opts = GetProviderOptions();
+  opts["dump_json_qnn_graph"] = "1";
+  opts["json_qnn_graph_dir"] = json_dir.string();
+
+  RunAndVerifyLayerNormOutput(
+      BuildDQLayerNormSignFixupTestCase(/*x_signed=*/true, /*scale_signed=*/false, /*scale_per_channel=*/false,
+                                        BiasKind::kMatched8Bit, /*boundary_gamma=*/true),
       opts, 17, ExpectedEPNodeAssignment::All);
 
   AssertOpInQnnGraph(json_dir, "LayerNorm", 1);

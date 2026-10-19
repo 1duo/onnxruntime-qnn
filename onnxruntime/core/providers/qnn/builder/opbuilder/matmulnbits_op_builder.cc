@@ -560,7 +560,7 @@ Ort::Status MatMulNBitsOpBuilder::ProcessInputs(QnnModelWrapper& qnn_model_wrapp
           const char* reason = !is_act_16bitquant ? "activation not 16-bit quantized"
                                : bits == 2 && !zp_is_symmetric
                                    ? "asymmetric 2-bit quantization uses BW_FLOAT_BLOCK"
-                               : bits == 2 ? "BW_BLOCK_MAPPED SDK, architecture, or shape requirements not met"
+                               : bits == 2        ? "BW_BLOCK_MAPPED SDK, architecture, or shape requirements not met"
                                : bits != 4        ? "unsupported bit-width for LPBQ"
                                : !zp_is_symmetric ? "zero-points not symmetric"
                                                   : "LPBQ conversion failed (enable_block_quant_weight_optimization=0)";

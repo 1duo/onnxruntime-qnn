@@ -421,6 +421,19 @@ TEST_F(QnnHTPBackendTests, GatherNDOp_IndicesDynamicInt64) {
       ExpectedEPNodeAssignment::All);
 }
 
+// Test that bool GatherND runs on HTP backend with bool input/output.
+TEST_F(QnnHTPBackendTests, GatherNDOp_BoolInputOutput) {
+  RunOpTest<bool, int64_t>(
+      "GatherND",
+      TestInputDef<bool>({1, 4}, false,
+                         {false, true, false, true}),
+      TestInputDef<int64_t>({1, 1, 1, 2, 2}, true,
+                            {0, 0, 0, 3}),
+      {},  // No attributes for GatherND
+      13,  // Opset version
+      ExpectedEPNodeAssignment::All);
+}
+
 // Static negative int64 indices with negative values and batch_dims = 0
 TEST_F(QnnHTPBackendTests, GatherNDOp_Negative_IndicesInt64_BatchDims0) {
   RunOpTest<float, int64_t>(

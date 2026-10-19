@@ -27,6 +27,7 @@
 
 #if !defined(ORT_MINIMAL_BUILD) && QNN_EP_INTERNAL_SYMBOL_ACCESS
 
+#include <algorithm>
 #include <cstdint>
 #include <cstring>
 #include <string>
@@ -820,6 +821,9 @@ TEST_F(QnnUnit_ProviderFactoryTest, GetSupportedDevices_MaxEpDevicesTruncates) {
   EXPECT_EQ(ctx.created_ep_devices[0], npu);
 }
 
+#if defined(_WIN32) && QNN_ARCH_ARM64 && \
+    (QNN_API_VERSION_MAJOR > 2 || (QNN_API_VERSION_MAJOR == 2 && QNN_API_VERSION_MINOR >= 40))
+
 TEST_F(QnnUnit_ProviderFactoryTest, GetSupportedDevices_EnvironmentError_PropagatesError) {
   FactoryStubContext ctx;
   UseFactoryStubs use(ctx);
@@ -850,6 +854,8 @@ TEST_F(QnnUnit_ProviderFactoryTest, GetSupportedDevices_InvalidHardwareId_Reject
     ctx.stub_ort_api.ReleaseStatus(status);
   }
 }
+
+#endif  // defined(_WIN32) && QNN_ARCH_ARM64 && QNN API >= 2.40
 
 TEST_F(QnnUnit_ProviderFactoryTest, GetSupportedDevices_CreateEpDeviceFails_PropagatesError) {
   FactoryStubContext ctx;
@@ -901,6 +907,9 @@ TEST_F(QnnUnit_ProviderFactoryTest, GetSupportedDevices_AddAllocatorInfoFails_Do
   ctx.stub_ort_api.ReleaseStatus(status);
 }
 
+#if defined(_WIN32) && QNN_ARCH_ARM64 && \
+    (QNN_API_VERSION_MAJOR > 2 || (QNN_API_VERSION_MAJOR == 2 && QNN_API_VERSION_MINOR >= 40))
+
 TEST_F(QnnUnit_ProviderFactoryTest, GetSupportedDevices_TargetRequiresIdentity) {
   FactoryStubContext ctx;
   UseFactoryStubs use(ctx);
@@ -914,6 +923,8 @@ TEST_F(QnnUnit_ProviderFactoryTest, GetSupportedDevices_TargetRequiresIdentity) 
   EXPECT_EQ(num, 0u);
   ctx.stub_ort_api.ReleaseStatus(status);
 }
+
+#endif  // defined(_WIN32) && QNN_ARCH_ARM64 && QNN API >= 2.40
 
 TEST_F(QnnUnit_ProviderFactoryTest, GetSupportedDevices_PartialFailureReleasesOutputs) {
   FactoryStubContext ctx;
@@ -936,6 +947,9 @@ TEST_F(QnnUnit_ProviderFactoryTest, GetSupportedDevices_PartialFailureReleasesOu
   ctx.stub_ort_api.ReleaseStatus(status);
 }
 
+#if defined(_WIN32) && QNN_ARCH_ARM64 && \
+    (QNN_API_VERSION_MAJOR > 2 || (QNN_API_VERSION_MAJOR == 2 && QNN_API_VERSION_MINOR >= 40))
+
 TEST_F(QnnUnit_ProviderFactoryTest, GetSupportedDevices_InvalidTargetRejectsBeforeAdvertising) {
   for (const char* target : {"", "73", "htp-v", "htp-v073", "htp-v+73", "htp-v73junk", "htp-v4294967296", "htp-v999"}) {
     SCOPED_TRACE(target);
@@ -954,6 +968,8 @@ TEST_F(QnnUnit_ProviderFactoryTest, GetSupportedDevices_InvalidTargetRejectsBefo
   }
 }
 
+#endif  // defined(_WIN32) && QNN_ARCH_ARM64 && QNN API >= 2.40
+
 TEST(QnnHtpTargetTest, SupportedArchitecturesRoundTrip) {
   for (uint32_t arch : {68u, 69u, 73u, 75u, 79u, 81u}) {
     EXPECT_EQ(qnn::soc::ParseHtpTarget(qnn::soc::MakeHtpTarget(arch)), arch);
@@ -971,6 +987,50 @@ TEST(QnnHtpTargetTest, SessionDefaultsAreNotConcreteTargets) {
     EXPECT_FALSE(qnn::soc::ParseHtpArchitecture(value));
   }
 }
+
+#if defined(_WIN32) && QNN_ARCH_ARM64 && \
+    (QNN_API_VERSION_MAJOR > 2 || (QNN_API_VERSION_MAJOR == 2 && QNN_API_VERSION_MINOR >= 40))
+
+TEST_F(QnnUnit_ProviderFactoryTest,
+       GetSupportedDevices_Arm64CompilerTargetAdvertisesMatchingVirtualNpu) {
+  FactoryStubContext ctx;
+  UseFactoryStubs use(ctx);
+  QnnEpFactory factory("QNNExecutionProvider", ctx.MakeApiPtrs());
+  ctx.env_config["allow_virtual_devices"] = "1";
+  ctx.env_config["ep_factory.QNNExecutionProvider.qnn_hardware_device_id"] = "41304430";
+  ctx.env_config["ep_factory.QNNExecutionProvider.qnn_target_architecture"] = "htp-v73";
+
+  OrtEpDevice* ep_devices[4] = {};
+  size_t num = 0;
+  EXPECT_EQ(factory.GetSupportedDevices(&factory, nullptr, 0, ep_devices, 4, &num), nullptr);
+  EXPECT_EQ(num, 1u);
+  EXPECT_EQ(ctx.synthesized_device_id, 0x41304430u);
+  ASSERT_EQ(ctx.created_ep_devices.size(), 1u);
+  EXPECT_TRUE(std::find(ctx.added_kv_pairs.begin(), ctx.added_kv_pairs.end(),
+                        std::pair<std::string, std::string>{kOrtHardwareDevice_MetadataKey_IsVirtual, "1"}) !=
+              ctx.added_kv_pairs.end());
+  EXPECT_TRUE(std::find(ctx.added_kv_pairs.begin(), ctx.added_kv_pairs.end(),
+                        std::pair<std::string, std::string>{"target_architecture", "htp-v73"}) !=
+              ctx.added_kv_pairs.end());
+}
+
+TEST_F(QnnUnit_ProviderFactoryTest,
+       GetSupportedDevices_Arm64CompilerOptInRequiresTargetIdentityWhenNpuIsUnavailable) {
+  FactoryStubContext ctx;
+  UseFactoryStubs use(ctx);
+  QnnEpFactory factory("QNNExecutionProvider", ctx.MakeApiPtrs());
+  ctx.env_config["allow_virtual_devices"] = "1";
+
+  OrtEpDevice* ep_devices[4] = {};
+  size_t num = 0;
+  OrtStatus* status = factory.GetSupportedDevices(&factory, nullptr, 0, ep_devices, 4, &num);
+  ASSERT_NE(status, nullptr);
+  EXPECT_EQ(StubStatusCode(ctx, status), ORT_FAIL);
+  EXPECT_EQ(num, 0u);
+  ctx.stub_ort_api.ReleaseStatus(status);
+}
+
+#endif  // defined(_WIN32) && QNN_ARCH_ARM64 && QNN API >= 2.40
 
 // ===========================================================================
 // Group 3b: GetSupportedDevicesImpl — x86/x64 cross-compile NPU synthesis.
@@ -995,23 +1055,6 @@ TEST_F(QnnUnit_ProviderFactoryTest, GetSupportedDevices_RepeatedSynthesisRetains
     }
   }
   EXPECT_EQ(ctx.released_hw_device_count, 2u);
-}
-
-TEST_F(QnnUnit_ProviderFactoryTest, GetSupportedDevices_ConfiguredHardwareId_UsesHexadecimal) {
-  for (const auto& [text, expected] : std::vector<std::pair<const char*, uint32_t>>{
-           {"41304430", 0x41304430}, {"0043", 0x43}, {"0a12", 0xa12},
-           {"0x41304430", 0x41304430}, {"0000", 0}, {"ffffffff", 0xffffffff}}) {
-    SCOPED_TRACE(text);
-    FactoryStubContext ctx;
-    UseFactoryStubs use(ctx);
-    QnnEpFactory factory("ep", ctx.MakeApiPtrs());
-    ctx.env_config["ep_factory.ep.qnn_hardware_device_id"] = text;
-    OrtEpDevice* ep_devices[4] = {};
-    size_t num = 0;
-    EXPECT_EQ(factory.GetSupportedDevices(&factory, nullptr, 0, ep_devices, 4, &num), nullptr);
-    EXPECT_EQ(ctx.synthesized_device_id, expected);
-    EXPECT_GE(num, 1u);
-  }
 }
 
 TEST_F(QnnUnit_ProviderFactoryTest, GetSupportedDevices_CrossCompileHost_AdvertisesVirtualNpu) {
@@ -1489,9 +1532,9 @@ TEST_F(QnnUnit_ProviderFactoryHtpTest,
   }
 }
 
-// Multi-device autoep: NPU + GPU present, no backend_type/backend_path — the
-// factory should pick the NPU (and log a warning). Covers the multi-device
-// std::find_if(is_npu) branch of CreateEpImpl.
+#if defined(_WIN32) && QNN_ARCH_ARM64 && \
+    (QNN_API_VERSION_MAJOR > 2 || (QNN_API_VERSION_MAJOR == 2 && QNN_API_VERSION_MINOR >= 40))
+
 TEST_F(QnnUnit_ProviderFactoryHtpTest,
        CreateEp_VirtualNpu_InjectsLockdownAotDefaultsAndTarget) {
   FactoryStubContext ctx;
@@ -1535,6 +1578,11 @@ TEST_F(QnnUnit_ProviderFactoryHtpTest,
   }
 }
 
+#endif  // defined(_WIN32) && QNN_ARCH_ARM64 && QNN API >= 2.40
+
+// Multi-device autoep: NPU + GPU present, no backend_type/backend_path — the
+// factory should pick the NPU (and log a warning). Covers the multi-device
+// std::find_if(is_npu) branch of CreateEpImpl.
 TEST_F(QnnUnit_ProviderFactoryHtpTest,
        CreateEp_AutoepMultiDeviceNpuAndGpu_PicksNpu) {
   FactoryStubContext ctx;

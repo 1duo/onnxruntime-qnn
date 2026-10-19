@@ -29,7 +29,7 @@ jobs:
         shell: cmd
         run: >
           python.exe qcom/build_and_test.py --target-py-version 3.12 --config Release
-          build_ort_windows_arm64 create_venv test_ort_windows_arm64_pyhtp --only
+          create_venv build_ort_windows_arm64 test_ort_windows_arm64_pyhtp --only
       - name: Verify graph dump artifacts
         if: ${{ success() }}
         shell: pwsh

@@ -34,6 +34,14 @@ jobs:
           $dumpRoot = $env:ORT_MODEL_ZOO_QNN_GRAPH_GOLDEN_DIR
           $manifests = Get-ChildItem -LiteralPath $dumpRoot -Recurse -Filter qnn_graph_golden_manifest.json
           if ($manifests.Count -eq 0) { throw "No QNN graph golden manifests were produced." }
+          $graphs = Get-ChildItem -LiteralPath $dumpRoot -Recurse -Filter *.json |
+            Where-Object { $_.Name -ne 'qnn_graph_golden_manifest.json' }
+          if ($graphs.Count -eq 0) { throw "No QNN graph JSON files were produced." }
+          Write-Host "[HTP ModelZoo dump] Produced $($graphs.Count) graph JSON file(s) and $($manifests.Count) manifest(s)."
+          $graphs | ForEach-Object {
+            $relativePath = $_.FullName.Substring($dumpRoot.Length).TrimStart('\\')
+            Write-Host "[HTP ModelZoo dump] JSON: $relativePath ($($_.Length) bytes)"
+          }
           $sidecars = Get-ChildItem -LiteralPath $dumpRoot -Recurse -Filter *.golden_metadata.json
           if ($sidecars.Count -ne 0) { throw "Golden metadata sidecars were not cleaned up." }
           $tensorLogs = Get-ChildItem -LiteralPath $dumpRoot -Recurse -Filter *_tensor_log.json
@@ -43,7 +51,9 @@ jobs:
             if ($manifest.target.backend -ne 'htp' -or $manifest.target.htp_arch -ne 'v73') {
               throw "Unexpected target in $($_.FullName): $($manifest.target | ConvertTo-Json -Compress)"
             }
+            Write-Host "[HTP ModelZoo dump] Manifest: $($_.FullName) (backend=$($manifest.target.backend), htp_arch=$($manifest.target.htp_arch), graphs=$($manifest.graphs.PSObject.Properties.Count))"
           }
+          Write-Host "[HTP ModelZoo dump] Validation succeeded on Windows ARM64 HTP v73."
       - name: Upload graph dump artifacts
         if: ${{ always() }}
         uses: actions/upload-artifact@v7

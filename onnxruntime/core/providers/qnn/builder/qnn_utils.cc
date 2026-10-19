@@ -940,7 +940,10 @@ static nlohmann::json GetQnnTensorJSON(const Qnn_Tensor_t& tensor,
       tensor_json["static_data_hash"] = std::move(static_data_hash);
     }
 
-    if (include_static_data) {
+    // A static tensor may be backed by opaque memory. Keep the graph dump valid
+    // without dereferencing a missing client buffer; its golden hash records
+    // the unavailable state above.
+    if (include_static_data && client_buffer.data != nullptr) {
       tensor_json["data"] = GetQnnClientBufJSON(client_buffer, GetQnnTensorDataType(tensor), dims);
     } else {
       std::stringstream ss;

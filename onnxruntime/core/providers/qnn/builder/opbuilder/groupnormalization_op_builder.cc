@@ -111,7 +111,10 @@ Ort::Status GroupNormalizationOpBuilder::IsOpSupported(QnnModelWrapper& qnn_mode
     return MAKE_EP_FAIL("QNN GroupNorm requires num_channels to be divisible by num_groups");
   }
 
-  // Validate the full QNN graph (internal transposes + GroupNorm) via the QNN validation API.
+  // Validate the full QNN graph (internal transposes + GroupNorm) via the QNN validation API:
+  // Steps 1 and 5 below validate their Transpose nodes internally (AddTransposeNode threads
+  // do_op_validation into CreateQnnNode), while GroupNorm is validated explicitly in Step 4
+  // since its inputs/output don't fit AddTransposeNode's signature.
   return CreateOrValidate(qnn_model_wrapper, node_unit, logger, /*do_op_validation=*/true);
 }
 
@@ -165,11 +168,12 @@ Ort::Status GroupNormalizationOpBuilder::CreateOrValidate(QnnModelWrapper& qnn_m
   const std::string& output_name = outputs[0].name;
   const bool is_graph_output = qnn_model_wrapper.IsGraphOutput(output_name);
 
-  // Step 1: Transpose input NCHW -> NHWC.
+  // Step 1: Transpose input NCHW -> NHWC. Quant params (if any) attached on both ends, mirroring
+  // QLinearConvOpBuilder's handling of its activation input transpose.
   const std::string x_nhwc_name = node_base + "_x_nhwc";
   RETURN_IF_ERROR(qnn_model_wrapper.AddTransposeNode(node_unit.Index(), x_name, x_nhwc_name,
                                                      nchw_shape, cf_to_cl, nhwc_in_shape,
-                                                     input_info.qnn_data_type, QnnQuantParamsWrapper(),
+                                                     input_info.qnn_data_type, input_info.quant_param,
                                                      do_op_validation,
                                                      /*is_for_input=*/qnn_model_wrapper.IsGraphInput(x_name),
                                                      /*is_for_output=*/false));
@@ -195,13 +199,13 @@ Ort::Status GroupNormalizationOpBuilder::CreateOrValidate(QnnModelWrapper& qnn_m
   const std::string group_norm_out_name = node_base + "_y_nhwc";
   if (do_op_validation) {
     QnnTensorWrapper x_nhwc_tensor(x_nhwc_name, QNN_TENSOR_TYPE_NATIVE, input_info.qnn_data_type,
-                                   QnnQuantParamsWrapper(), std::vector<uint32_t>(nhwc_in_shape));
+                                   input_info.quant_param.Copy(), std::vector<uint32_t>(nhwc_in_shape));
     QnnTensorWrapper scale_tensor;
     RETURN_IF_ERROR(qnn_model_wrapper.MakeTensorWrapper(inputs[1], scale_tensor));
     QnnTensorWrapper bias_tensor;
     RETURN_IF_ERROR(qnn_model_wrapper.MakeTensorWrapper(inputs[2], bias_tensor));
     QnnTensorWrapper group_norm_out_tensor(group_norm_out_name, QNN_TENSOR_TYPE_NATIVE, output_info.qnn_data_type,
-                                           QnnQuantParamsWrapper(), std::vector<uint32_t>(nhwc_out_shape));
+                                           output_info.quant_param.Copy(), std::vector<uint32_t>(nhwc_out_shape));
 
     Qnn_Scalar_t epsilon_scalar = QNN_SCALAR_INIT;
     epsilon_scalar.dataType = QNN_DATATYPE_FLOAT_32;
@@ -223,7 +227,7 @@ Ort::Status GroupNormalizationOpBuilder::CreateOrValidate(QnnModelWrapper& qnn_m
                                                       {epsilon_param.GetQnnParam(), group_param.GetQnnParam()}));
   } else {
     QnnTensorWrapper group_norm_out_tensor(group_norm_out_name, QNN_TENSOR_TYPE_NATIVE, output_info.qnn_data_type,
-                                           QnnQuantParamsWrapper(), std::vector<uint32_t>(nhwc_out_shape));
+                                           output_info.quant_param.Copy(), std::vector<uint32_t>(nhwc_out_shape));
     RETURN_IF_NOT(qnn_model_wrapper.AddTensorWrapper(std::move(group_norm_out_tensor)),
                   "Failed to add GroupNorm output tensor.");
     RETURN_IF_NOT(qnn_model_wrapper.CreateQnnNode(group_norm_out_name, QNN_OP_PACKAGE_NAME_QTI_AISW,
@@ -235,10 +239,10 @@ Ort::Status GroupNormalizationOpBuilder::CreateOrValidate(QnnModelWrapper& qnn_m
                   "Failed to create GroupNorm node.");
   }
 
-  // Step 5: Transpose output NHWC -> NCHW.
+  // Step 5: Transpose output NHWC -> NCHW. Quant params attached on both ends (see Step 1).
   RETURN_IF_ERROR(qnn_model_wrapper.AddTransposeNode(node_unit.Index(), group_norm_out_name, output_name,
                                                      nhwc_out_shape, cl_to_cf, output_info.shape,
-                                                     output_info.qnn_data_type, QnnQuantParamsWrapper(),
+                                                     output_info.qnn_data_type, output_info.quant_param,
                                                      do_op_validation,
                                                      /*is_for_input=*/false,
                                                      /*is_for_output=*/is_graph_output));

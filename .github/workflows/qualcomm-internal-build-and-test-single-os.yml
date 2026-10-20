@@ -42,7 +42,7 @@ on:
         default: "Release"
         type: string
       qnn_internal_ut_symbols:
-        description: "Enable QNN EP internal unit-test symbols for supported targets."
+        description: "Enable QNN EP internal unit-test symbols for supported targets. Test archives are not supported in this mode."
         default: false
         type: boolean
       version_suffix:
@@ -170,7 +170,7 @@ jobs:
           ${{ inputs.build_nuget == true && '--build-nuget' || '' }}
           ${{ inputs.build_archive == true && '--build-archive' || '' }}
           ${{ inputs.build_aar == true && '--build-aar' || '' }}
-          ${{ inputs.qnn_internal_ut_symbols && 'build' || (inputs.upload_test_archive == true && 'archive' || 'build') }}_ort_${{inputs.target_os}}_${{ inputs.target_arch }}${{ inputs.qnn_internal_ut_symbols && '_internal_symbols' || '' }}
+          ${{ inputs.upload_test_archive == true && 'archive' || 'build' }}_ort_${{inputs.target_os}}_${{ inputs.target_arch }}${{ inputs.qnn_internal_ut_symbols && '_internal_symbols' || '' }}
 
       - name: Test ${{inputs.target_os}} ${{ inputs.target_arch }} py${{ inputs.target_py_vsn != 'None' && inputs.target_py_vsn || 'none'}}
         if: ${{ inputs.has_code_changes && inputs.run_tests && inputs.build_test_same_runner }}

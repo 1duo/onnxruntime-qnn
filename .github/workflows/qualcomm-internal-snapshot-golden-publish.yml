@@ -81,6 +81,19 @@ jobs:
       - name: Initialize submodules
         run: git submodule update --init --recursive
 
+      - name: Clean selected build directory
+        env:
+          BUILD_DIR_INPUT: ${{ inputs.build_dir }}
+        run: |
+          if [[ ! "${BUILD_DIR_INPUT}" =~ ^build/[A-Za-z0-9][A-Za-z0-9._-]*(/[A-Za-z0-9][A-Za-z0-9._-]*)*$ ]]; then
+            echo "Invalid build_dir: ${BUILD_DIR_INPUT}" >&2
+            exit 1
+          fi
+
+          # Self-hosted runners may retain outputs from an earlier producer run.
+          # The selected directory also owns this run's ephemeral golden store.
+          rm -rf -- "${BUILD_DIR_INPUT}"
+
       - name: Build snapshot/accuracy test binary
         run: |
           # The selected build task must enable the snapshot/accuracy tiers through

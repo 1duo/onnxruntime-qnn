@@ -12,6 +12,12 @@ from pathlib import Path
 
 import pytest
 
+QCOM_ROOT = Path(__file__).resolve().parents[3]
+sys.path.insert(0, str(QCOM_ROOT))
+
+from build_and_test import TaskLibrary  # noqa: E402
+from ep_build.plan import Plan  # noqa: E402
+
 SCRIPT = Path(__file__).resolve().parent.parent / "build.sh"
 MODE_FLAGS = {
     "normal": [],
@@ -82,7 +88,9 @@ if args.build:
     return tmp_path
 
 
-def run_build(repo: Path, mode: str, *, fail: bool = False) -> subprocess.CompletedProcess[str]:
+def run_build(
+    repo: Path, mode: str, *, fail: bool = False, build_dir_suffix: str | None = None
+) -> subprocess.CompletedProcess[str]:
     env = os.environ | {
         "PATH": f"{repo / 'fake-tools'}{os.pathsep}{os.environ['PATH']}",
         "ORT_BUILD_PRUNE_PACKAGES": "0",
@@ -91,18 +99,22 @@ def run_build(repo: Path, mode: str, *, fail: bool = False) -> subprocess.Comple
         "ORT_VERSION_SUFFIX": "",
         "FAKE_BUILD_FAIL": "1" if fail else "0",
     }
+    args = [
+        "bash",
+        str(SCRIPT),
+        "--target-platform=linux",
+        "--target-arch=x86_64",
+        "--config=RelWithDebInfo",
+        "--mode=build",
+        "--no-use-cache",
+        f"--qairt-sdk-root={repo / 'fake-qairt'}",
+        *MODE_FLAGS[mode],
+    ]
+    if build_dir_suffix is not None:
+        args.append(f"--build-dir-suffix={build_dir_suffix}")
+
     return subprocess.run(
-        [
-            "bash",
-            str(SCRIPT),
-            "--target-platform=linux",
-            "--target-arch=x86_64",
-            "--config=RelWithDebInfo",
-            "--mode=build",
-            "--no-use-cache",
-            f"--qairt-sdk-root={repo / 'fake-qairt'}",
-            *MODE_FLAGS[mode],
-        ],
+        args,
         cwd=repo,
         env=env,
         capture_output=True,
@@ -177,3 +189,46 @@ def test_failed_switch_forces_reconfigure_on_retry(
     calls = (root / "calls.jsonl").read_text().splitlines()
     assert len(calls) == 3
     assert all(json.loads(call) == {"update": True, "marker_exists": False} for call in calls)
+
+
+def test_internal_symbol_public_task_passes_required_build_flags(tmp_path: Path) -> None:
+    task_library = TaskLibrary(
+        python_executable=Path(sys.executable),
+        venv_path=tmp_path / "venv",
+        config="Release",
+        target_py_version=None,
+        ort_prebuilt_root=None,
+        qairt_sdk_root=None,
+        docker_ccache_root=None,
+        build_nuget=False,
+        build_archive=False,
+        build_aar=False,
+    )
+    plan = Plan()
+    task_library.build_ort_linux_x86_64_internal_symbols(plan)
+
+    planned_tasks = []
+    plan.for_each(lambda step_id, task: planned_tasks.append((step_id, task)))
+    assert len(planned_tasks) == 1
+    step_id, task = planned_tasks[0]
+    assert step_id == "build_ort_linux_x86_64_internal_symbols"
+    command = task.executables_and_args[0]
+    assert "--enable-qnn-internal-ut-symbols" in command
+    assert "--build-dir-suffix=internal-symbols" in command
+
+
+def test_build_dir_suffix_uses_isolated_directory(build_repo: Path) -> None:
+    result = run_build(build_repo, "internal", build_dir_suffix="internal-symbols")
+    assert result.returncode == 0, result.stderr
+
+    root = build_repo / "build/linux-x86_64-internal-symbols"
+    assert (root / "RelWithDebInfo/built-mode.json").is_file()
+    assert not (build_repo / "build/linux-x86_64").exists()
+
+
+@pytest.mark.parametrize("suffix", ["../escape", "bad suffix", "/absolute"])
+def test_build_dir_suffix_rejects_unsafe_values(build_repo: Path, suffix: str) -> None:
+    result = run_build(build_repo, "internal", build_dir_suffix=suffix)
+    assert result.returncode != 0
+    assert f"Invalid --build-dir-suffix: {suffix}" in result.stderr
+    assert not (build_repo / "build").exists()

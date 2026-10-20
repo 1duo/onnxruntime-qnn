@@ -17,6 +17,7 @@ jobs:
     name: Validate HTP ModelZoo graph dumps (v73)
     runs-on: [self-hosted, Windows, ARM64, Test]
     env:
+      ORT_NIGHTLY_BUILD: "1"
       ORT_MODEL_ZOO_QNN_GRAPH_GOLDEN_DIR: ${{ github.workspace }}\build\modelzoo_graph_dumps\v73
     steps:
       - uses: actions/checkout@v6

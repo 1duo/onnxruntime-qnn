@@ -2577,10 +2577,6 @@ OrtStatus* QnnEp::CompileOnnxModel(const OrtGraph** graphs,
                                    OrtNodeComputeInfo** node_compute_infos,
                                    const qnn::HtpGraphConfigs_t& htp_graph_configs,
                                    bool collect_subgraph_traces) {
-  ORT_CXX_LOG(logger_, ORT_LOGGING_LEVEL_WARNING,
-              "[QAIRT C++ API] >>> CompileOnnxModel ENTRY <<<");
-  fprintf(stderr, "[QAIRT C++ API] >>> CompileOnnxModel ENTRY (stderr) <<<\n");
-  fflush(stderr);
 #if defined(_WIN32) && (defined(__aarch64__) || defined(_M_ARM64))
   // Initialize now for possible reuse in loop
   auto finalize_start = std::chrono::steady_clock::time_point::min();
@@ -2607,13 +2603,7 @@ OrtStatus* QnnEp::CompileOnnxModel(const OrtGraph** graphs,
 
     std::unique_ptr<qnn::QnnModel> qnn_model;
 #ifdef USE_QAIRT_API
-    ORT_CXX_LOG(logger_, ORT_LOGGING_LEVEL_WARNING,
-                ("[QAIRT C++ API] CompileOnnxModel entered — qairt_backend_manager_ is " +
-                 std::string(qairt_backend_manager_ ? "SET" : "NULL"))
-                    .c_str());
     if (qairt_backend_manager_) {
-      ORT_CXX_LOG(logger_, ORT_LOGGING_LEVEL_INFO,
-                  ("[QAIRT C++ API] Creating QairtGraphEmitter for graph: " + fused_node_name).c_str());
       auto qairt_emitter = std::make_unique<qnn::QairtGraphEmitter>(
           qairt_backend_manager_->GetApi(), qairt_backend_manager_->GetContext());
       qnn_model = std::make_unique<qnn::QnnModel>(
@@ -3219,10 +3209,6 @@ OrtStatus* ORT_API_CALL QnnEp::CompileImpl(_In_ OrtEp* this_ptr,
                                            _Out_writes_all_(count) OrtNodeComputeInfo** node_compute_infos,
                                            _Out_writes_(count) OrtNode** ep_context_nodes) noexcept {
   QnnEp* ep = static_cast<QnnEp*>(this_ptr);
-  ORT_CXX_LOG(ep->logger_, ORT_LOGGING_LEVEL_WARNING,
-              "[QAIRT C++ API] >>> CompileImpl ENTRY <<<");
-  fprintf(stderr, "[QAIRT C++ API] >>> CompileImpl ENTRY (stderr) <<<\n");
-  fflush(stderr);
 
   if (qnn::IsOrtGraphHasCtxNode(graphs, count, ep->ort_api)) {
     if (ep->prepare_and_load_) {

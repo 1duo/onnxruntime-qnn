@@ -6,7 +6,6 @@
 #include "core/providers/qnn/builder/qairt_backend_manager.h"
 
 #include "QairtCpp/QairtApi.hpp"
-#include <cstdio>
 
 namespace onnxruntime {
 namespace qnn {
@@ -27,8 +26,6 @@ std::unique_ptr<QairtBackendManager> QairtBackendManager::Create(const Config& c
 }
 
 Ort::Status QairtBackendManager::Initialize(const Config& config) {
-  fprintf(stderr, "[QAIRT C++ API] QairtBackendManager::Initialize — loading backend: %s\n", config.backend_lib_path.c_str());
-  fflush(stderr);
   backend_type_ = config.backend_type;
 
   try {
@@ -76,9 +73,6 @@ Ort::Status QairtBackendManager::Initialize(const Config& config) {
                             .c_str());
   }
 
-  fprintf(stderr, "[QAIRT C++ API] QairtBackendManager::Initialize — SUCCESS (backend=%s, context created)\n",
-          config.backend_lib_path.c_str());
-  fflush(stderr);
   return Ort::Status();
 }
 

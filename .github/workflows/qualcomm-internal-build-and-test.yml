@@ -232,6 +232,7 @@ jobs:
       build_test_same_runner: true
       # This is validation-only; do not publish a non-shipping wheel or test archive.
       upload_wheel: false
+      upload_test_archive: false
 
   lint:
     if: ${{ inputs.do_all }}

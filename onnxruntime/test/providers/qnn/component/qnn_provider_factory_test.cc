@@ -55,6 +55,9 @@ OrtStatus* CreateEpFactories(const char* registration_name,
                              size_t max_factories,
                              size_t* num_factories);
 OrtStatus* ReleaseEpFactory(OrtEpFactory* factory);
+#ifdef _WIN32
+const OrtLogger* ORT_API_CALL QnnUnit_SetDefaultLoggerForTesting(const OrtLogger* logger) noexcept;
+#endif
 }
 
 namespace onnxruntime {
@@ -397,6 +400,35 @@ class UseFactoryStubs {
   FactoryStubContext* prev_;
 };
 
+// Keeps the test executable and, on Windows, the provider DLL's module-local
+// default logger state synchronized and restores both on scope exit.
+class ScopedDefaultLoggerOverride {
+ public:
+  explicit ScopedDefaultLoggerOverride(const OrtLogger* logger)
+      : previous_exe_(OrtLoggingManager::GetDefaultLoggerPtr()) {
+    OrtLoggingManager::SetDefaultLogger(logger);
+#ifdef _WIN32
+    previous_dll_ = QnnUnit_SetDefaultLoggerForTesting(logger);
+#endif
+  }
+
+  ~ScopedDefaultLoggerOverride() {
+#ifdef _WIN32
+    QnnUnit_SetDefaultLoggerForTesting(previous_dll_);
+#endif
+    OrtLoggingManager::SetDefaultLogger(previous_exe_);
+  }
+
+  ScopedDefaultLoggerOverride(const ScopedDefaultLoggerOverride&) = delete;
+  ScopedDefaultLoggerOverride& operator=(const ScopedDefaultLoggerOverride&) = delete;
+
+ private:
+  const OrtLogger* previous_exe_;
+#ifdef _WIN32
+  const OrtLogger* previous_dll_;
+#endif
+};
+
 // Builds a fake OrtApiBase whose GetVersionString / GetApi route through the
 // active FactoryStubContext (via the thread-local current_). Used by the
 // CreateEpFactories tests that must stay on error paths that return BEFORE
@@ -417,14 +449,11 @@ static OrtApiBase MakeFakeApiBase() {
   return base;
 }
 
-// Base fixture: resets the process-wide default logger to nullptr at the start
-// of each test so that HasDefaultLogger()==false is the default state. Tests
-// that need a non-null default logger call OrtLoggingManager::SetDefaultLogger
-// themselves.
+// Base fixture: make HasDefaultLogger()==false in both the test executable and
+// provider DLL by default, then restore their previous state after each test.
 class QnnUnit_ProviderFactoryTest : public ::testing::Test {
  protected:
-  void SetUp() override { OrtLoggingManager::SetDefaultLogger(nullptr); }
-  void TearDown() override { OrtLoggingManager::SetDefaultLogger(nullptr); }
+  ScopedDefaultLoggerOverride default_logger_scope_{nullptr};
 };
 
 // Convenience: Qualcomm vendor ID computed the same way as in the factory
@@ -504,6 +533,9 @@ TEST_F(QnnUnit_ProviderFactoryTest, CreateAllocator_HostAccessible_DoesNotLoadRp
   EXPECT_NE(allocator->Info, nullptr);
   EXPECT_EQ(allocator->Reserve, allocator->Alloc);
   EXPECT_EQ(allocator->Info(allocator), reinterpret_cast<const OrtMemoryInfo*>(kFakeToken));
+#ifndef _WIN32
+  EXPECT_EQ(allocator->Alloc, qnn::HtpSharedMemoryAllocator::AllocImpl);
+#endif
   factory.ReleaseAllocator(&factory, allocator);
 }
 
@@ -540,35 +572,6 @@ static OrtErrorCode StubStatusCode(const FactoryStubContext& ctx, const OrtStatu
 }
 static std::string StubStatusMsg(const FactoryStubContext& ctx, const OrtStatus* s) {
   return ctx.stub_ort_api.GetErrorMessage(s);
-}
-
-// On Windows, the test executable and provider DLL have separate copies of
-// OrtLoggingManager's header-local state. Initialize the DLL copy through the
-// public factory entry point instead of adding a test-only production hook.
-static void SetDefaultLoggerForTest(FactoryStubContext& ctx, const OrtLogger* logger) {
-  OrtLoggingManager::SetDefaultLogger(logger);
-
-#ifdef _WIN32
-  // The caller must already hold UseFactoryStubs. OrtGlobalApiOverride
-  // is intentionally non-nestable because it restores the real ORT API.
-  OrtApiBase base = MakeFakeApiBase();
-  OrtEpFactory* factories[1] = {nullptr};
-  size_t num_factories = 0;
-  OrtStatus* status = CreateEpFactories("QNNExecutionProvider", &base, logger,
-                                        factories, 1, &num_factories);
-  if (status != nullptr) {
-    ADD_FAILURE() << "CreateEpFactories failed while setting the provider DLL logger: "
-                  << StubStatusMsg(ctx, status);
-    ctx.stub_ort_api.ReleaseStatus(status);
-    return;
-  }
-
-  ASSERT_EQ(num_factories, 1u);
-  ASSERT_NE(factories[0], nullptr);
-  EXPECT_EQ(ReleaseEpFactory(factories[0]), nullptr);
-#else
-  (void)ctx;
-#endif
 }
 
 TEST_F(QnnUnit_ProviderFactoryTest, CreateEpFactories_NullBase_ReturnsNull) {
@@ -861,8 +864,6 @@ TEST_F(QnnUnit_ProviderFactoryTest, IncompatibilityDetails_SupportedNpu_NoDefaul
   FactoryStubContext ctx;
   UseFactoryStubs use(ctx);
   QnnEpFactory factory("ep", ctx.MakeApiPtrs());
-  SetDefaultLoggerForTest(ctx, nullptr);
-
   OrtHardwareDevice* npu = MakeFakeHwDevice(21);
   ctx.device_type_map[npu] = OrtHardwareDeviceType_NPU;
   ctx.device_vendor_map[npu] = kQualcommVendorId;  // supported → past SetDetails.
@@ -898,8 +899,6 @@ TEST_F(QnnUnit_ProviderFactoryTest, ValidateCompatibility_NpuDevice_NoDefaultLog
   FactoryStubContext ctx;
   UseFactoryStubs use(ctx);
   QnnEpFactory factory("ep", ctx.MakeApiPtrs());
-  SetDefaultLoggerForTest(ctx, nullptr);
-
   OrtHardwareDevice* npu = MakeFakeHwDevice(23);
   ctx.device_type_map[npu] = OrtHardwareDeviceType_NPU;
 
@@ -942,8 +941,6 @@ TEST_F(QnnUnit_ProviderFactoryTest, CreateEp_NullLogger_NoDefaultLogger_ReturnsE
   FactoryStubContext ctx;
   UseFactoryStubs use(ctx);
   QnnEpFactory factory("ep", ctx.MakeApiPtrs());
-  SetDefaultLoggerForTest(ctx, nullptr);
-
   OrtEp* ep = reinterpret_cast<OrtEp*>(0xDEAD);
   OrtStatus* status = factory.CreateEp(&factory, /*devices*/ nullptr, /*ep_metadata*/ nullptr,
                                        /*num_devices*/ 0,
@@ -1128,14 +1125,13 @@ TEST_F(QnnUnit_ProviderFactoryTest, ReleaseEpFactory_NullPointer_ReturnsNull) {
 class QnnUnit_ProviderFactoryHtpTest : public ::testing::Test {
  protected:
   void SetUp() override {
-    OrtLoggingManager::SetDefaultLogger(nullptr);
     QnnRealHtpBackendContext htp_check;
     if (!htp_check.IsValid()) {
       GTEST_SKIP() << QnnHtpBackendLibraryName() << " not available";
     }
   }
 
-  void TearDown() override { OrtLoggingManager::SetDefaultLogger(nullptr); }
+  ScopedDefaultLoggerOverride default_logger_scope_{nullptr};
 };
 
 // Verifies that CreateEpImpl enters the autoep branch when neither
@@ -1241,11 +1237,11 @@ TEST_F(QnnUnit_ProviderFactoryHtpTest,
        ValidateCompatibilityInfo_NpuNoQnnEp_WiresHtpBackendType) {
   FactoryStubContext ctx;
   UseFactoryStubs use(ctx);
-  QnnEpFactory factory("QNNExecutionProvider", ctx.MakeApiPtrs());
 
   // ValidateCompiledModelCompatibilityInfoImpl requires HasDefaultLogger().
   auto* fake_logger = reinterpret_cast<OrtLogger*>(kFakeToken);
-  SetDefaultLoggerForTest(ctx, fake_logger);
+  ScopedDefaultLoggerOverride logger_scope(fake_logger);
+  QnnEpFactory factory("QNNExecutionProvider", ctx.MakeApiPtrs());
 
   OrtHardwareDevice* npu = MakeFakeHwDevice(23);
   ctx.device_type_map[npu] = OrtHardwareDeviceType_NPU;
@@ -1277,10 +1273,9 @@ TEST_F(QnnUnit_ProviderFactoryHtpTest,
        GetHardwareDeviceIncompatibilityDetails_NpuQualcomm_WiresHtpBackendType) {
   FactoryStubContext ctx;
   UseFactoryStubs use(ctx);
-  QnnEpFactory factory("QNNExecutionProvider", ctx.MakeApiPtrs());
-
   auto* fake_logger = reinterpret_cast<OrtLogger*>(kFakeToken);
-  SetDefaultLoggerForTest(ctx, fake_logger);
+  ScopedDefaultLoggerOverride logger_scope(fake_logger);
+  QnnEpFactory factory("QNNExecutionProvider", ctx.MakeApiPtrs());
 
   OrtHardwareDevice* npu = MakeFakeHwDevice(24);
   ctx.device_type_map[npu] = OrtHardwareDeviceType_NPU;

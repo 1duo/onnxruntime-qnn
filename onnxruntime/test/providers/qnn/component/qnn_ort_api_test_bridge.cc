@@ -8,8 +8,8 @@
 // onnxruntime_providers_qnn.dll each get their own copy. Fake OrtNode/FakeGraph
 // tests therefore need a small entry point compiled into the provider DLL so the
 // DLL's copy can be pointed at the fake OrtApi table for the duration of a test.
-// The SharedContext singleton has the same per-module behavior, so tests that
-// exercise shared backend state must also update the provider DLL's copy.
+// OrtLoggingManager and the SharedContext singleton have the same per-module
+// behavior, so tests must also update and restore the provider DLL's copies.
 
 #include "core/providers/qnn/ort_api.h"
 
@@ -26,6 +26,13 @@ extern "C" const OrtApi* ORT_API_CALL QnnUnit_SetOrtApiForTesting(const OrtApi* 
 
 extern "C" void ORT_API_CALL QnnUnit_RestoreOrtApiForTesting(const OrtApi* previous) noexcept {
   Ort::detail::Global::Api(previous);
+}
+
+extern "C" const OrtLogger* ORT_API_CALL QnnUnit_SetDefaultLoggerForTesting(
+    const OrtLogger* logger) noexcept {
+  const OrtLogger* previous = onnxruntime::OrtLoggingManager::GetDefaultLoggerPtr();
+  onnxruntime::OrtLoggingManager::SetDefaultLogger(logger);
+  return previous;
 }
 
 extern "C" bool ORT_API_CALL QnnUnit_SetSharedBackendManagerAllocatorForTesting(

@@ -33,7 +33,7 @@ jobs:
           create_venv build_ort_windows_arm64 test_ort_windows_arm64_pyhtp --only
       - name: Verify graph dump artifacts
         if: ${{ success() }}
-        shell: pwsh
+        shell: powershell
         run: |
           $dumpRoot = $env:ORT_MODEL_ZOO_QNN_GRAPH_GOLDEN_DIR
           $manifests = Get-ChildItem -LiteralPath $dumpRoot -Recurse -Filter qnn_graph_golden_manifest.json

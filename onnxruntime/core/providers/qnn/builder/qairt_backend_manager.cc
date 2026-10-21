@@ -100,11 +100,14 @@ QnnBackendType QairtBackendManager::GetQnnBackendType() const {
   return backend_type_;
 }
 
-Ort::Status QairtBackendManager::GetContextBinaryBuffer(bool /*is_multi_soc_buffer*/,
+Ort::Status QairtBackendManager::GetContextBinaryBuffer(bool is_multi_soc_buffer,
                                                         unsigned char** context_buffer,
                                                         uint64_t& buffer_size) {
   buffer_size = 0;
   *context_buffer = nullptr;
+  if (is_multi_soc_buffer) {
+    return MAKE_EP_FAIL("Multi-SoC export is not implemented in QairtBackendManager.");
+  }
   if (contexts_.empty()) {
     return Ort::Status();
   }
@@ -113,9 +116,9 @@ Ort::Status QairtBackendManager::GetContextBinaryBuffer(bool /*is_multi_soc_buff
     if (binary_size == 0) {
       return Ort::Status();
     }
-    auto buffer = new unsigned char[binary_size];
-    buffer_size = contexts_[0]->getBinary(buffer, binary_size);
-    *context_buffer = buffer;
+    auto buffer = std::make_unique<unsigned char[]>(binary_size);
+    buffer_size = contexts_[0]->getBinary(buffer.get(), binary_size);
+    *context_buffer = buffer.release();
     return Ort::Status();
   } catch (const qairt::Exception& e) {
     buffer_size = 0;

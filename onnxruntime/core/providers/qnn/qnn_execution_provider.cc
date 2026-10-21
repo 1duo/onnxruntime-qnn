@@ -87,6 +87,11 @@ constexpr const char* kQnnOpAffinityKey = "op_affinity";
 static std::optional<qnn::QnnBackendType> InferBackendTypeFromPath(const std::string& backend_path) {
   const std::string filename = std::filesystem::path(backend_path).filename().string();
 
+#ifdef USE_QAIRT_API
+  if (filename == MakeSharedLibraryPath("QairtCpu")) return qnn::QnnBackendType::CPU;
+  if (filename == MakeSharedLibraryPath("QairtGpu")) return qnn::QnnBackendType::GPU;
+  if (filename == MakeSharedLibraryPath("QairtHtp")) return qnn::QnnBackendType::HTP;
+#endif
   if (filename == kDefaultCpuBackendPath) {
     return qnn::QnnBackendType::CPU;
   }
@@ -98,6 +103,17 @@ static std::optional<qnn::QnnBackendType> InferBackendTypeFromPath(const std::st
   }
   return std::nullopt;
 }
+
+#ifdef USE_QAIRT_API
+static std::string GetQairtBackendPath(const std::string& backend_path) {
+  std::filesystem::path path(backend_path);
+  const auto filename = path.filename().string();
+  if (filename == kDefaultCpuBackendPath) path.replace_filename(MakeSharedLibraryPath("QairtCpu"));
+  if (filename == kDefaultGpuBackendPath) path.replace_filename(MakeSharedLibraryPath("QairtGpu"));
+  if (filename == kDefaultHtpBackendPath) path.replace_filename(MakeSharedLibraryPath("QairtHtp"));
+  return path.string();
+}
+#endif
 // Strictly parses an integer without throwing or modifying `out` on failure.
 // std::from_chars rejects leading whitespace and reports overflow for the target type.
 template <typename T>
@@ -1576,11 +1592,16 @@ QnnEp::QnnEp(const QnnEpFactory& factory,
                                      enable_htp_cross_device_prepare},
         static_cast<const ApiPtrs&>(*this), logger_);
 #ifdef USE_QAIRT_API
-    {
+    // Serializer and test backends expose QNN C interfaces, not QAIRT interfaces.
+    const auto backend_filename = std::filesystem::path(backend_path).filename().string();
+    if (!qnn_backend_manager_->GetQnnSerializerConfig() &&
+        backend_filename != kDefaultIrBackendPath &&
+        backend_filename != kDefaultSaverBackendPath &&
+        backend_filename != MakeSharedLibraryPath("QnnMockSSR")) {
       Ort::Status qairt_status;
       const auto inferred_type = InferBackendTypeFromPath(backend_path);
       qairt_backend_manager_ = qnn::QairtBackendManager::Create(
-          qnn::QairtBackendManager::Config{backend_path,
+          qnn::QairtBackendManager::Config{GetQairtBackendPath(backend_path),
                                            inferred_type.value_or(qnn::QnnBackendType::HTP),
                                            profiling_level != qnn::ProfilingLevel::OFF},
           qairt_status);
@@ -3029,7 +3050,11 @@ OrtStatus* QnnEp::CreateEPContextNodes(const OrtGraph* graph,
   // All partitioned graph share single QNN context, included in the same context binary
   unsigned char* raw_context_buffer = nullptr;
   uint64_t buffer_size = 0;
-  RETURN_IF_NOT_OK(qnn_backend_manager_->GetContextBinaryBuffer(enable_multi_soc_ep_context_,
+  qnn::IBackendManager* export_backend = qnn_backend_manager_.get();
+#ifdef USE_QAIRT_API
+  if (qairt_backend_manager_) export_backend = qairt_backend_manager_.get();
+#endif
+  RETURN_IF_NOT_OK(export_backend->GetContextBinaryBuffer(enable_multi_soc_ep_context_,
                                                                 &raw_context_buffer,
                                                                 buffer_size));
   std::unique_ptr<unsigned char[]> context_buffer(raw_context_buffer);

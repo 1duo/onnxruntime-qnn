@@ -3,6 +3,9 @@
 
 #ifdef USE_QAIRT_API
 
+#include <algorithm>
+#include <limits>
+
 #include "core/providers/qnn/builder/qairt_type_convert.h"
 #include "core/providers/qnn/builder/qnn_def.h"
 
@@ -132,13 +135,31 @@ Ort::Status ConvertScalarPublic(const Qnn_Scalar_t& qnn_scalar,
 }
 
 Ort::Status ApplyQuantizeParams(const Qnn_QuantizeParams_t& qnn_qp,
-                                const qairt::Api& /*api*/,
+                                const qairt::Api& api,
                                 qairt::Tensor& out) {
   if (qnn_qp.encodingDefinition == QNN_DEFINITION_UNDEFINED) {
     return Ort::Status();
   }
 
-  auto& qp = out.getQuantizeParams();
+  auto qp = api.make<qairt::QuantizeParams>();
+  const auto& dimensions = out.getDimensions();
+  auto block_count = [&](const uint32_t* sizes, size_t& count) -> Ort::Status {
+    if (sizes == nullptr || dimensions.empty()) {
+      return MAKE_EP_FAIL("Block quantization requires dimensions and block sizes.");
+    }
+    count = 1;
+    for (size_t i = 0; i < dimensions.size(); ++i) {
+      if (sizes[i] == 0 || dimensions[i] == 0) {
+        return MAKE_EP_FAIL("Block quantization requires nonzero dimensions and block sizes.");
+      }
+      const size_t blocks = dimensions[i] / sizes[i] + (dimensions[i] % sizes[i] != 0);
+      if (count > std::numeric_limits<uint32_t>::max() / blocks) {
+        return MAKE_EP_FAIL("Block quantization scale count exceeds the QAIRT API limit.");
+      }
+      count *= blocks;
+    }
+    return Ort::Status();
+  };
 
   switch (qnn_qp.quantizationEncoding) {
     case QNN_QUANTIZATION_ENCODING_UNDEFINED:
@@ -146,18 +167,23 @@ Ort::Status ApplyQuantizeParams(const Qnn_QuantizeParams_t& qnn_qp,
 
     case QNN_QUANTIZATION_ENCODING_SCALE_OFFSET: {
       const auto& so = qnn_qp.scaleOffsetEncoding;
-      qp.setScaleOffsetEncoding(qairt::ScaleOffset(so.scale, so.offset));
+      auto scale_offset = api.make<qairt::ScaleOffset>();
+      scale_offset.setScale(so.scale);
+      scale_offset.setOffset(so.offset);
+      qp.setScaleOffsetEncoding(scale_offset);
       break;
     }
 
     case QNN_QUANTIZATION_ENCODING_AXIS_SCALE_OFFSET: {
       const auto& aso = qnn_qp.axisScaleOffsetEncoding;
-      qairt::AxisScaleOffset axis_so;
+      auto axis_so = api.make<qairt::AxisScaleOffset>();
       axis_so.setAxis(aso.axis);
       std::vector<qairt::ScaleOffset> scale_offsets;
       scale_offsets.reserve(aso.numScaleOffsets);
       for (uint32_t i = 0; i < aso.numScaleOffsets; ++i) {
-        scale_offsets.emplace_back(aso.scaleOffset[i].scale, aso.scaleOffset[i].offset);
+        auto& scale_offset = scale_offsets.emplace_back(api.make<qairt::ScaleOffset>());
+        scale_offset.setScale(aso.scaleOffset[i].scale);
+        scale_offset.setOffset(aso.scaleOffset[i].offset);
       }
       axis_so.setScaleOffsets(scale_offsets);
       qp.setAxisScaleOffsetEncoding(std::move(axis_so));
@@ -166,45 +192,108 @@ Ort::Status ApplyQuantizeParams(const Qnn_QuantizeParams_t& qnn_qp,
 
     case QNN_QUANTIZATION_ENCODING_BW_SCALE_OFFSET: {
       const auto& bso = qnn_qp.bwScaleOffsetEncoding;
-      qp.setBwScaleOffsetEncoding(qairt::BwScaleOffset(bso.bitwidth, bso.scale, bso.offset));
+      auto scale_offset = api.make<qairt::BwScaleOffset>();
+      scale_offset.setBitwidth(bso.bitwidth);
+      scale_offset.setScale(bso.scale);
+      scale_offset.setOffset(bso.offset);
+      qp.setBwScaleOffsetEncoding(scale_offset);
       break;
     }
 
     case QNN_QUANTIZATION_ENCODING_BW_AXIS_SCALE_OFFSET: {
       const auto& baso = qnn_qp.bwAxisScaleOffsetEncoding;
       std::vector<float> scales(baso.scales, baso.scales + baso.numElements);
-      std::vector<int32_t> offsets(baso.offsets, baso.offsets + baso.numElements);
-      qp.setBwAxisScaleOffsetEncoding(
-          qairt::BwAxisScaleOffset(baso.bitwidth, baso.axis, scales, offsets));
+      std::vector<int32_t> offsets(baso.numElements, 0);
+      if (baso.offsets != nullptr) {
+        std::copy_n(baso.offsets, baso.numElements, offsets.begin());
+      }
+      auto scale_offset = api.make<qairt::BwAxisScaleOffset>();
+      scale_offset.setBitwidth(baso.bitwidth);
+      scale_offset.setAxis(baso.axis);
+      scale_offset.setScales(std::move(scales));
+      scale_offset.setOffsets(std::move(offsets));
+      qp.setBwAxisScaleOffsetEncoding(scale_offset);
       break;
     }
 
     case QNN_QUANTIZATION_ENCODING_BLOCK: {
       const auto& blk = qnn_qp.blockEncoding;
-      // ponytail: block encoding has blockSize array + scaleOffset array.
-      // QAIRT BlockEncoding API not fully explored — use shallowCopy pattern.
-      // Deferring full implementation until we have a model that actually uses BLOCK encoding
-      // through this path. EP uses it only for weight tensors which are pre-quantized.
-      (void)blk;
-      return MAKE_EP_FAIL("qairt_convert::ApplyQuantizeParams: BLOCK encoding not yet implemented");
+      size_t count;
+      QAIRT_RETURN_IF_ERROR(block_count(blk.blockSize, count));
+      if (!blk.scaleOffset) return MAKE_EP_FAIL("Missing block scale offsets.");
+      auto encoding = api.make<qairt::BlockEncoding>();
+      encoding.setBlockSizes(std::vector<uint32_t>(blk.blockSize, blk.blockSize + dimensions.size()));
+      std::vector<qairt::ScaleOffset> scales;
+      scales.reserve(count);
+      for (size_t i = 0; i < count; ++i) {
+        auto& scale = scales.emplace_back(api.make<qairt::ScaleOffset>());
+        scale.setScale(blk.scaleOffset[i].scale);
+        scale.setOffset(blk.scaleOffset[i].offset);
+      }
+      encoding.setScaleOffsets(std::move(scales));
+      qp.setBlockEncoding(std::move(encoding));
+      break;
     }
 
     case QNN_QUANTIZATION_ENCODING_BW_FLOAT_BLOCK: {
       const auto& bfb = qnn_qp.bwFloatBlockEncoding;
-      (void)bfb;
-      return MAKE_EP_FAIL("qairt_convert::ApplyQuantizeParams: BW_FLOAT_BLOCK encoding not yet implemented");
+      size_t count;
+      QAIRT_RETURN_IF_ERROR(block_count(bfb.blockSize, count));
+      if (!bfb.floatScaleOffset) return MAKE_EP_FAIL("Missing float block scale offsets.");
+      auto encoding = api.make<qairt::BwFloatBlockEncoding>();
+      encoding.setBitwidth(bfb.bitwidth);
+      encoding.setBlockSizes(std::vector<uint32_t>(bfb.blockSize, bfb.blockSize + dimensions.size()));
+      std::vector<qairt::FloatScaleOffset> scales;
+      scales.reserve(count);
+      for (size_t i = 0; i < count; ++i) {
+        auto& scale = scales.emplace_back(api.make<qairt::FloatScaleOffset>());
+        scale.setScale(bfb.floatScaleOffset[i].scale);
+        scale.setOffset(bfb.floatScaleOffset[i].offset);
+      }
+      encoding.setFloatScaleOffsets(std::move(scales));
+      qp.setBwFloatBlockEncoding(std::move(encoding));
+      break;
     }
 
     case QNN_QUANTIZATION_ENCODING_BLOCKWISE_EXPANSION: {
       const auto* bwe = qnn_qp.blockwiseExpansion;
-      (void)bwe;
-      return MAKE_EP_FAIL("qairt_convert::ApplyQuantizeParams: BLOCKWISE_EXPANSION encoding not yet implemented");
+      if (!bwe || bwe->axis < 0 || static_cast<size_t>(bwe->axis) >= dimensions.size() ||
+          !bwe->scaleOffsets || bwe->numBlocksPerAxis == 0) {
+        return MAKE_EP_FAIL("Invalid blockwise expansion parameters.");
+      }
+      const size_t axis_size = dimensions[bwe->axis];
+      if (axis_size == 0 || axis_size > std::numeric_limits<uint32_t>::max() / bwe->numBlocksPerAxis) {
+        return MAKE_EP_FAIL("Invalid blockwise expansion scale count.");
+      }
+      const size_t count = axis_size * bwe->numBlocksPerAxis;
+      auto encoding = api.make<qairt::BlockwiseExpansion>();
+      encoding.setAxis(bwe->axis);
+      encoding.setNumBlocksPerAxis(bwe->numBlocksPerAxis);
+      encoding.setBlockScaleBitwidth(bwe->blockScaleBitwidth);
+      std::vector<qairt::ScaleOffset> scales;
+      scales.reserve(axis_size);
+      for (size_t i = 0; i < axis_size; ++i) {
+        auto& scale = scales.emplace_back(api.make<qairt::ScaleOffset>());
+        scale.setScale(bwe->scaleOffsets[i].scale);
+        scale.setOffset(bwe->scaleOffsets[i].offset);
+      }
+      encoding.setScaleOffsets(scales);
+      if (bwe->blockScaleStorageType == QNN_BLOCKWISE_EXPANSION_BITWIDTH_SCALE_STORAGE_8 && bwe->blocksScale8) {
+        encoding.setBlocksScale8(std::vector<uint8_t>(bwe->blocksScale8, bwe->blocksScale8 + count));
+      } else if (bwe->blockScaleStorageType == QNN_BLOCKWISE_EXPANSION_BITWIDTH_SCALE_STORAGE_16 && bwe->blocksScale16) {
+        encoding.setBlocksScale16(std::vector<uint16_t>(bwe->blocksScale16, bwe->blocksScale16 + count));
+      } else {
+        return MAKE_EP_FAIL("Invalid blockwise expansion scale storage.");
+      }
+      qp.setBlockwiseExpansion(std::move(encoding));
+      break;
     }
 
     default:
       return MAKE_EP_FAIL("qairt_convert::ApplyQuantizeParams: unknown quantization encoding");
   }
 
+  out.setQuantizeParams(qp);
   return Ort::Status();
 }
 
@@ -235,20 +324,17 @@ Ort::Status FromQnnTensor(const Qnn_Tensor_t& qnn_tensor,
     out.setDimensions(std::vector<uint32_t>(dims, dims + rank));
   }
 
-  // ponytail: attach client buffer for STATIC (weight data at graph build) and
-  // APP_WRITE/APP_READ (inference data at execute time). Only skip for NATIVE
-  // intermediate tensors which have no external buffer.
-  Qnn_TensorType_t tensor_type = GetQnnTensorType(qnn_tensor);
+  // Establish RAW memory even when graph I/O has no data bound yet. Accessing
+  // getClientBuffer() on an uninitialized TensorMemory does not create a binding.
   Qnn_TensorMemType_t mem_type = GetQnnTensorMemType(qnn_tensor);
-  bool needs_buffer = (tensor_type != QNN_TENSOR_TYPE_NATIVE &&
-                       tensor_type != QNN_TENSOR_TYPE_NULL);
-  if (needs_buffer && mem_type == QNN_TENSORMEMTYPE_RAW) {
+  if (mem_type == QNN_TENSORMEMTYPE_RAW) {
     const auto& buf = GetQnnTensorClientBuf(qnn_tensor);
-    if (buf.data && buf.dataSize > 0) {
-      auto& cb = out.getClientBuffer();
-      cb.setData(const_cast<void*>(static_cast<const void*>(buf.data)));
-      cb.setDataSize(buf.dataSize);
-    }
+    auto client_buffer = api.make<qairt::ClientBuffer>();
+    client_buffer.setData(buf.data);
+    client_buffer.setDataSize(buf.dataSize);
+    auto memory = api.make<qairt::TensorMemory>();
+    memory.setClientBuffer(client_buffer);
+    out.setTensorMemory(memory);
   }
 
   QAIRT_RETURN_IF_ERROR(ApplyQuantizeParams(GetQnnTensorQParams(qnn_tensor), api, out));

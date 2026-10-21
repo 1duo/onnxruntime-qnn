@@ -74,9 +74,46 @@ Ort::Status ProcessGatherNDIndices(QnnModelWrapper& qnn_model_wrapper,
     }
   }
 
-  return utils::AddNormalizedIndicesTensor(qnn_model_wrapper, std::move(indices_info),
-                                           indices_tensor_name, std::move(qnn_indices_bytes),
-                                           logger, input_names, do_op_validation);
+  RETURN_IF_ERROR(utils::AddNormalizedIndicesTensor(qnn_model_wrapper, std::move(indices_info),
+                                                     indices_tensor_name, std::move(qnn_indices_bytes),
+                                                     logger, input_names, do_op_validation));
+
+  // QNN GatherNd on HTP cannot finalize with indices whose rank is greater than 4. With no batch
+  // dimensions, flattening indices[:-1] preserves the index tuples; the output is reshaped back to
+  // the ONNX shape in ProcessAttributesAndOutputs.
+  const auto& indices_tensor = qnn_model_wrapper.GetQnnTensorWrapper(input_names[1]);
+  const auto& indices_shape = indices_tensor.GetTensorDims();
+  if (qnn_model_wrapper.GetQnnBackendType() == QnnBackendType::HTP &&
+      batch_dims == 0 && indices_shape.size() > 4) {
+    SafeInt<uint32_t> num_index_tuples = 1;
+    for (size_t i = 0; i + 1 < indices_shape.size(); ++i) {
+      num_index_tuples *= indices_shape[i];
+    }
+
+    const std::vector<uint32_t> reshaped_indices_shape{
+        static_cast<uint32_t>(num_index_tuples), indices_shape.back()};
+    const std::string reshaped_indices_name =
+        utils::UniqueNameGenerator().New(input_names[1], "_rank2");
+    QnnTensorWrapper reshaped_indices(reshaped_indices_name,
+                                      QNN_TENSOR_TYPE_NATIVE,
+                                      indices_tensor.GetTensorDataType(),
+                                      indices_tensor.GetQnnQuantParams().Copy(),
+                                      std::vector<uint32_t>(reshaped_indices_shape));
+    RETURN_IF_NOT(qnn_model_wrapper.AddTensorWrapper(std::move(reshaped_indices)),
+                  "Failed to add reshaped GatherND indices tensor.");
+    RETURN_IF_NOT(qnn_model_wrapper.CreateQnnNode(
+                      utils::UniqueNameGenerator().New(reshaped_indices_name, QNN_OP_RESHAPE),
+                      QNN_OP_PACKAGE_NAME_QTI_AISW,
+                      QNN_OP_RESHAPE,
+                      {input_names[1]},
+                      {reshaped_indices_name},
+                      {},
+                      do_op_validation),
+                  "Failed to reshape GatherND indices.");
+    input_names[1] = reshaped_indices_name;
+  }
+
+  return Ort::Status();
 }
 
 }  // namespace
@@ -116,45 +153,8 @@ Ort::Status GatherNDOpBuilder::ProcessInputs(QnnModelWrapper& qnn_model_wrapper,
   OrtNodeAttrHelper node_helper(node_unit);
   const int64_t batch_dims = node_helper.Get("batch_dims", static_cast<int64_t>(0));
 
-  RETURN_IF_ERROR(ProcessGatherNDIndices(qnn_model_wrapper, inputs[1], data_info.shape, batch_dims,
-                                         logger, input_names, do_op_validation));
-
-  // QNN GatherNd on HTP cannot finalize with indices whose rank is greater than 4. With no batch
-  // dimensions, flattening indices[:-1] preserves the index tuples; the output is reshaped back to
-  // the ONNX shape in ProcessAttributesAndOutputs.
-  const auto& indices_tensor = qnn_model_wrapper.GetQnnTensorWrapper(input_names[1]);
-  const auto& indices_shape = indices_tensor.GetTensorDims();
-  if (qnn_model_wrapper.GetQnnBackendType() == QnnBackendType::HTP &&
-      batch_dims == 0 && indices_shape.size() > 4) {
-    SafeInt<uint32_t> num_index_tuples = 1;
-    for (size_t i = 0; i + 1 < indices_shape.size(); ++i) {
-      num_index_tuples *= indices_shape[i];
-    }
-
-    const std::vector<uint32_t> reshaped_indices_shape{
-        static_cast<uint32_t>(num_index_tuples), indices_shape.back()};
-    const std::string reshaped_indices_name =
-        utils::UniqueNameGenerator().New(input_names[1], "_rank2");
-    QnnTensorWrapper reshaped_indices(reshaped_indices_name,
-                                      QNN_TENSOR_TYPE_NATIVE,
-                                      indices_tensor.GetTensorDataType(),
-                                      indices_tensor.GetQnnQuantParams().Copy(),
-                                      std::vector<uint32_t>(reshaped_indices_shape));
-    RETURN_IF_NOT(qnn_model_wrapper.AddTensorWrapper(std::move(reshaped_indices)),
-                  "Failed to add reshaped GatherND indices tensor.");
-    RETURN_IF_NOT(qnn_model_wrapper.CreateQnnNode(
-                      utils::UniqueNameGenerator().New(reshaped_indices_name, QNN_OP_RESHAPE),
-                      QNN_OP_PACKAGE_NAME_QTI_AISW,
-                      QNN_OP_RESHAPE,
-                      {input_names[1]},
-                      {reshaped_indices_name},
-                      {},
-                      do_op_validation),
-                  "Failed to reshape GatherND indices.");
-    input_names[1] = reshaped_indices_name;
-  }
-
-  return Ort::Status();
+  return ProcessGatherNDIndices(qnn_model_wrapper, inputs[1], data_info.shape, batch_dims,
+                                logger, input_names, do_op_validation);
 }
 
 Ort::Status GatherNDOpBuilder::ProcessAttributesAndOutputs(QnnModelWrapper& qnn_model_wrapper,

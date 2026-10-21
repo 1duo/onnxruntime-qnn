@@ -14,6 +14,17 @@ namespace onnxruntime {
 namespace test {
 #if defined(__aarch64__) || defined(_M_ARM64) || defined(__linux__)
 
+static void AddFloatValueInfo(ModelTestBuilder& builder, const std::string& name,
+                              const std::vector<int64_t>& shape) {
+  auto* value_info = builder.graph_->add_value_info();
+  value_info->set_name(name);
+  auto* tensor_type = value_info->mutable_type()->mutable_tensor_type();
+  tensor_type->set_elem_type(ONNX_NAMESPACE::TensorProto_DataType_FLOAT);
+  for (const int64_t dim : shape) {
+    tensor_type->mutable_shape()->add_dim()->set_dim_value(dim);
+  }
+}
+
 // Test GroupNormalization operator on HTP backend with default parameters
 TEST_F(QnnHTPBackendTests, GroupNorm_Float_Default) {
   std::vector<float> input_data = {
@@ -253,6 +264,7 @@ TEST_F(QnnHTPBackendTests, GroupNorm_Float_OutputFanout) {
     gn_attrs.push_back(builder.MakeScalarAttribute("num_groups", static_cast<int64_t>(1)));
     gn_attrs.push_back(builder.MakeScalarAttribute("epsilon", 1e-05f));
     builder.AddNode("group_norm", "GroupNormalization", {"X", "scale", "bias"}, {"gn_out"}, "", gn_attrs);
+    AddFloatValueInfo(builder, "gn_out", {1, 2, 3, 4});
 
     std::vector<ONNX_NAMESPACE::AttributeProto> pool_attrs;
     pool_attrs.push_back(test::MakeAttribute("kernel_shape", std::vector<int64_t>{1, 1}));
@@ -300,6 +312,7 @@ static GetTestQDQModelFn<QuantType> BuildQDQGroupNormInputFanoutTestCase(
                                                       bias_qparams.zero_point);
 
     builder.AddNode("group_norm", "GroupNormalization", {x_qdq, scale_qdq, bias_qdq}, {"gn_out"}, "", gn_attrs);
+    AddFloatValueInfo(builder, "gn_out", {1, 2, 3, 4});
     AddQDQNodePairWithOutputAsGraphOutput<QuantType>(builder, "gn_out_qdq", "gn_out", output_qparams[0].scale,
                                                       output_qparams[0].zero_point);
 
@@ -308,6 +321,7 @@ static GetTestQDQModelFn<QuantType> BuildQDQGroupNormInputFanoutTestCase(
     std::vector<ONNX_NAMESPACE::AttributeProto> pool_attrs;
     pool_attrs.push_back(test::MakeAttribute("kernel_shape", std::vector<int64_t>{1, 1}));
     builder.AddNode("max_pool", "MaxPool", {x_qdq}, {"pool_out"}, "", pool_attrs);
+    AddFloatValueInfo(builder, "pool_out", {1, 2, 3, 4});
     AddQDQNodePairWithOutputAsGraphOutput<QuantType>(builder, "pool_out_qdq", "pool_out", output_qparams[1].scale,
                                                       output_qparams[1].zero_point);
   };
@@ -346,6 +360,7 @@ TEST_F(QnnHTPBackendTests, GroupNorm_QDQ_U8_InputFanout) {
 
   ProviderOptions provider_options;
   provider_options["backend_type"] = "htp";
+  provider_options["offload_graph_io_quantization"] = "0";
 #if defined(__linux__) && !defined(__aarch64__)
   provider_options["soc_model"] = std::to_string(QNN_SOC_MODEL_SM8850);
 #endif

@@ -366,7 +366,7 @@ Qnn_Version_t GetHtpUsrDrvVersion() {
 Ort::Status IsHtpUsrDrvEnabled(const std::string& backend_lib_dir, const uint32_t htp_arch, bool& enabled) {
   enabled = false;
 
-  // Since prepare/stub/skel libraries may not be packaged for x86 release (e.g., Windows x86 or Linux x86), their
+  // Since stub/skel libraries may not be packaged for x86 release (e.g., Windows x86 or Linux x86), their
   // absence does not indicate HNRD path will be adopted. Furthermore, non-QCOM devices do not support HNRD and thus no
   // need to check for it. Due to the difficulty of determining whether QCOM devices here, exploit whether HNRD library
   // exists at the expected path to indicate if we need to take HNRD into consideration.
@@ -400,18 +400,16 @@ Ort::Status IsHtpUsrDrvEnabled(const std::string& backend_lib_dir, const uint32_
 
   const std::filesystem::path backend_lib_dir_path(backend_lib_dir);
 
+  // The prepare library is required for compilation, not cached-context execution.
   auto has_htp_libs = [&](const std::string& prefix) {
 #ifdef _WIN32
-    const std::string prepare = prefix + "HtpPrepare.dll";
     const std::string stub = prefix + "Htp" + htp_arch_string + "Stub.dll";
     const std::string skel = "lib" + prefix + "Htp" + htp_arch_string + "Skel.so";
 #else
-    const std::string prepare = "lib" + prefix + "HtpPrepare.so";
     const std::string stub = "lib" + prefix + "Htp" + htp_arch_string + "Stub.so";
     const std::string skel = "lib" + prefix + "Htp" + htp_arch_string + "Skel.so";
 #endif
-    return std::filesystem::exists(backend_lib_dir_path / prepare) &&
-           std::filesystem::exists(backend_lib_dir_path / stub) &&
+    return std::filesystem::exists(backend_lib_dir_path / stub) &&
            std::filesystem::exists(backend_lib_dir_path / skel);
   };
 

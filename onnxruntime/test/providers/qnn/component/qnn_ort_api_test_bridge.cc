@@ -11,12 +11,7 @@
 // OrtLoggingManager and the SharedContext singleton have the same per-module
 // behavior, so tests must also update and restore the provider DLL's copies.
 
-#include "core/providers/qnn/ort_api.h"
-
-#include "test/providers/qnn/infra/qnn_test_windows_compat.h"
-
-#include "core/providers/qnn/builder/qnn_backend_manager.h"
-#include "core/providers/qnn/shared_context.h"
+#include "test/providers/qnn/infra/qnn_module_state_test_utils.h"
 
 extern "C" const OrtApi* ORT_API_CALL QnnUnit_SetOrtApiForTesting(const OrtApi* api) noexcept {
   const OrtApi* previous = Ort::detail::Global::Api();

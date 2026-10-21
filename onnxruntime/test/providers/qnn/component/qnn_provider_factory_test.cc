@@ -55,9 +55,6 @@ OrtStatus* CreateEpFactories(const char* registration_name,
                              size_t max_factories,
                              size_t* num_factories);
 OrtStatus* ReleaseEpFactory(OrtEpFactory* factory);
-#ifdef _WIN32
-const OrtLogger* ORT_API_CALL QnnUnit_SetDefaultLoggerForTesting(const OrtLogger* logger) noexcept;
-#endif
 }
 
 namespace onnxruntime {
@@ -398,35 +395,6 @@ class UseFactoryStubs {
  private:
   OrtGlobalApiOverride global_override_;
   FactoryStubContext* prev_;
-};
-
-// Keeps the test executable and, on Windows, the provider DLL's module-local
-// default logger state synchronized and restores both on scope exit.
-class ScopedDefaultLoggerOverride {
- public:
-  explicit ScopedDefaultLoggerOverride(const OrtLogger* logger)
-      : previous_exe_(OrtLoggingManager::GetDefaultLoggerPtr()) {
-    OrtLoggingManager::SetDefaultLogger(logger);
-#ifdef _WIN32
-    previous_dll_ = QnnUnit_SetDefaultLoggerForTesting(logger);
-#endif
-  }
-
-  ~ScopedDefaultLoggerOverride() {
-#ifdef _WIN32
-    QnnUnit_SetDefaultLoggerForTesting(previous_dll_);
-#endif
-    OrtLoggingManager::SetDefaultLogger(previous_exe_);
-  }
-
-  ScopedDefaultLoggerOverride(const ScopedDefaultLoggerOverride&) = delete;
-  ScopedDefaultLoggerOverride& operator=(const ScopedDefaultLoggerOverride&) = delete;
-
- private:
-  const OrtLogger* previous_exe_;
-#ifdef _WIN32
-  const OrtLogger* previous_dll_;
-#endif
 };
 
 // Builds a fake OrtApiBase whose GetVersionString / GetApi route through the

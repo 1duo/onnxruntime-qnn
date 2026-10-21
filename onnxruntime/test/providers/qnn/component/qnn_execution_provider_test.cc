@@ -43,12 +43,6 @@
 #include "core/providers/qnn/shared_context.h"
 #include "test/providers/qnn/infra/qnn_unit_test_utils.h"
 
-#ifdef _WIN32
-extern "C" bool ORT_API_CALL QnnUnit_SetSharedBackendManagerAllocatorForTesting(
-    uint32_t allocator_type) noexcept;
-extern "C" void ORT_API_CALL QnnUnit_ResetSharedBackendManagerForTesting() noexcept;
-#endif
-
 namespace onnxruntime {
 namespace test {
 
@@ -270,28 +264,6 @@ static std::unique_ptr<QnnEp> MakeEp(QnnEpFactory& factory, EpStubContext& ctx) 
   auto* fake_logger = reinterpret_cast<OrtLogger*>(kFakeToken);
   return std::make_unique<QnnEp>(factory, "QNNExecutionProvider",
                                  *fake_session_opts, fake_logger);
-}
-
-static void ResetSharedBackendManagerForTest() {
-#ifdef _WIN32
-  QnnUnit_ResetSharedBackendManagerForTesting();
-#else
-  SharedContext::GetInstance().ResetSharedQnnBackendManager();
-#endif
-}
-
-static bool SetSharedBackendManagerAllocatorForTest(qnn::QnnAllocatorType allocator_type) {
-#ifdef _WIN32
-  return QnnUnit_SetSharedBackendManagerAllocatorForTesting(static_cast<uint32_t>(allocator_type));
-#else
-  auto manager = SharedContext::GetInstance().GetSharedQnnBackendManager();
-  if (manager == nullptr) {
-    return false;
-  }
-
-  manager->SetQnnAllocatorType(allocator_type);
-  return true;
-#endif
 }
 
 // Asserts that ctx.log_records contains at least one entry at the given

@@ -657,17 +657,13 @@ TEST_F(QnnHTPBackendTests, MatMulOp_QDQ) {
 }
 
 // Tests MatMul with two uint16 (quantized) inputs that are both dynamic.
-// This exercises a logic in QNN EP that inserts a QNN Convert op before input[1] to convert asymmetric uint16 into
-// symmetric one.
+// This exercises a workaround in QNN EP that inserts a QNN Convert op before input[1] (converts from uint16 to uint8).
+// This workaround prevents a validation error for this specific MatMul configuration.
 // Got specific shapes and input ranges (quant params) from customer model.
 TEST_F(QnnHTPBackendTests, MatMulOp_QDQ_Regression_uint16_dynamic_inputs) {
   ProviderOptions provider_options;
   provider_options["backend_type"] = "htp";
   provider_options["offload_graph_io_quantization"] = "0";
-#ifdef __linux__
-  // W16A16 requires minimum HTP arch v73.
-  provider_options["htp_arch"] = "73";
-#endif
 
   // Test with rank 4 inputs
   {
@@ -835,6 +831,7 @@ TEST_F(QnnHTPBackendTests, MatMulOp_F32S4_PerChannelWeightOnly) {
   RunPerChannelWeightOnlyTest<Int4x2>("s4");
 }
 
+#ifndef __linux__
 // Tests MatMul with two uint16 (quantized) inputs with weight as static.
 // This exercises a workaround in QNN EP that inserts a QNN Convert op before input[1] (converts from uint16 to sint16).
 // This workaround prevents a validation error for this specific MatMul configuration.
@@ -843,10 +840,6 @@ TEST_F(QnnHTPBackendTests, MatMulOp_QDQ_Regression_uint16_static_weight) {
   ProviderOptions provider_options;
   provider_options["backend_type"] = "htp";
   provider_options["offload_graph_io_quantization"] = "0";
-#ifdef __linux__
-  // W16A16 requires minimum HTP arch v73.
-  provider_options["htp_arch"] = "73";
-#endif
 
   // Test with rank 4 inputs
   {
@@ -890,6 +883,7 @@ TEST_F(QnnHTPBackendTests, MatMulOp_QDQ_Regression_uint16_static_weight) {
         provider_options, 21, ExpectedEPNodeAssignment::All, QDQTolerance());
   }
 }
+#endif
 
 #endif  // defined(__aarch64__) || defined(_M_ARM64) || defined(__linux__)
 

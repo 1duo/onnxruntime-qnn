@@ -295,26 +295,26 @@ static GetTestQDQModelFn<QuantType> BuildQDQGroupNormInputFanoutTestCase(
     const TestInputDef<float>& bias_def,
     const std::vector<ONNX_NAMESPACE::AttributeProto>& gn_attrs) {
   return [input_def, scale_def, bias_def, gn_attrs](ModelTestBuilder& builder,
-                                                     std::vector<QuantParams<QuantType>>& output_qparams) {
+                                                    std::vector<QuantParams<QuantType>>& output_qparams) {
     MakeTestInput(builder, "X", input_def);
     QuantParams<QuantType> input_qparams = GetTestInputQuantParams<QuantType>(input_def);
     std::string x_qdq = AddQDQNodePair<QuantType>(builder, "x_qdq", "X", input_qparams.scale,
-                                                   input_qparams.zero_point);
+                                                  input_qparams.zero_point);
 
     MakeTestInput(builder, "scale", scale_def);
     QuantParams<QuantType> scale_qparams = GetTestInputQuantParams<QuantType>(scale_def);
     std::string scale_qdq = AddQDQNodePair<QuantType>(builder, "scale_qdq", "scale", scale_qparams.scale,
-                                                       scale_qparams.zero_point);
+                                                      scale_qparams.zero_point);
 
     MakeTestInput(builder, "bias", bias_def);
     QuantParams<QuantType> bias_qparams = GetTestInputQuantParams<QuantType>(bias_def);
     std::string bias_qdq = AddQDQNodePair<QuantType>(builder, "bias_qdq", "bias", bias_qparams.scale,
-                                                      bias_qparams.zero_point);
+                                                     bias_qparams.zero_point);
 
     builder.AddNode("group_norm", "GroupNormalization", {x_qdq, scale_qdq, bias_qdq}, {"gn_out"}, "", gn_attrs);
     AddFloatValueInfo(builder, "gn_out", {1, 2, 3, 4});
     AddQDQNodePairWithOutputAsGraphOutput<QuantType>(builder, "gn_out_qdq", "gn_out", output_qparams[0].scale,
-                                                      output_qparams[0].zero_point);
+                                                     output_qparams[0].zero_point);
 
     // Second consumer of the quantized X: MaxPool is layout-sensitive, so ORT's layout transformer
     // wraps it in NCHW<->NHWC Transposes. Before the fix, this triggered GroupNormalization duplication.
@@ -323,7 +323,7 @@ static GetTestQDQModelFn<QuantType> BuildQDQGroupNormInputFanoutTestCase(
     builder.AddNode("max_pool", "MaxPool", {x_qdq}, {"pool_out"}, "", pool_attrs);
     AddFloatValueInfo(builder, "pool_out", {1, 2, 3, 4});
     AddQDQNodePairWithOutputAsGraphOutput<QuantType>(builder, "pool_out_qdq", "pool_out", output_qparams[1].scale,
-                                                      output_qparams[1].zero_point);
+                                                     output_qparams[1].zero_point);
   };
 }
 

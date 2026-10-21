@@ -614,8 +614,8 @@ static nlohmann::json GetStaticTensorHashJson(std::vector<uint8_t> data,
                              {in_fix.tensor}, {out_fix.tensor}, {param});
   qnn::utils::QnnJSONGraph json_graph;
   json_graph.AddOp(op, true);
-  return json_graph.Finalize()["graph"]["nodes"]["hash_op"]["tensor_params"]["weights"]["weights"]
-                              ["static_data_hash"];
+  EXPECT_FALSE(json_graph.Finalize().dump().contains("static_data_hash"));
+  return json_graph.GetStaticTensorHashes()["node_tensor_params"]["hash_op"]["weights"]["weights"];
 }
 
 TEST(QnnUnit_UtilsTest, QnnJSONGraph_StaticTensorHashIsContentSensitive) {
@@ -666,6 +666,25 @@ TEST(QnnUnit_UtilsTest, QnnJSONGraph_StaticTensorHashReportsUnavailableWithoutCl
   EXPECT_EQ(hash["byte_count"], 4);
   EXPECT_EQ(hash["status"], "unavailable");
   EXPECT_FALSE(hash.contains("digest"));
+}
+
+TEST(QnnUnit_UtilsTest, QnnJSONGraph_StaticTensorHashesAreNotCollectedByDefault) {
+  TensorFixture weights, input, output;
+  weights.Init<uint8_t>("weights", QNN_DATATYPE_UINT_8, {0, 1, 2, 3});
+  input.InitIO("input", QNN_DATATYPE_UINT_8, {4});
+  output.InitIO("output", QNN_DATATYPE_UINT_8, {4});
+
+  Qnn_Param_t param{};
+  param.paramType = QNN_PARAMTYPE_TENSOR;
+  param.name = "weights";
+  param.tensorParam = weights.tensor;
+
+  qnn::QnnOpConfigWrapper op("hash_op", "qti.aisw", "Relu", {input.tensor}, {output.tensor}, {param});
+  qnn::utils::QnnJSONGraph json_graph;
+  json_graph.AddOp(op);
+
+  EXPECT_TRUE(json_graph.GetStaticTensorHashes().empty());
+  EXPECT_FALSE(json_graph.Finalize().dump().contains("static_data_hash"));
 }
 
 TEST(QnnUnit_UtilsTest, QnnJSONGraph_AddOp_SFixedPoint8) {

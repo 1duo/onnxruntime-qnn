@@ -34,72 +34,6 @@ namespace {
 
 constexpr int kQnnGraphGoldenMetadataSchemaVersion = 1;
 
-void ExtractStaticDataHash(nlohmann::json& tensor, nlohmann::json& hashes, const std::string& tensor_name) {
-  auto hash_it = tensor.find("static_data_hash");
-  if (hash_it != tensor.end()) {
-    hashes[tensor_name] = std::move(*hash_it);
-    tensor.erase(hash_it);
-  }
-}
-
-nlohmann::json ExtractStaticDataHashes(nlohmann::json& qnn_graph) {
-  nlohmann::json hashes = nlohmann::json::object();
-
-  auto graph_it = qnn_graph.find("graph");
-  if (graph_it == qnn_graph.end() || !graph_it->is_object()) {
-    return hashes;
-  }
-
-  auto tensors_it = graph_it->find("tensors");
-  if (tensors_it != graph_it->end() && tensors_it->is_object()) {
-    nlohmann::json graph_tensor_hashes = nlohmann::json::object();
-    for (auto& [tensor_name, tensor] : tensors_it->items()) {
-      if (tensor.is_object()) {
-        ExtractStaticDataHash(tensor, graph_tensor_hashes, tensor_name);
-      }
-    }
-    if (!graph_tensor_hashes.empty()) {
-      hashes["graph_tensors"] = std::move(graph_tensor_hashes);
-    }
-  }
-
-  auto nodes_it = graph_it->find("nodes");
-  if (nodes_it != graph_it->end() && nodes_it->is_object()) {
-    nlohmann::json node_tensor_param_hashes = nlohmann::json::object();
-    for (auto& [node_name, node] : nodes_it->items()) {
-      auto tensor_params_it = node.find("tensor_params");
-      if (tensor_params_it == node.end() || !tensor_params_it->is_object()) {
-        continue;
-      }
-
-      nlohmann::json node_hashes = nlohmann::json::object();
-      for (auto& [param_name, param_tensors] : tensor_params_it->items()) {
-        if (!param_tensors.is_object()) {
-          continue;
-        }
-
-        nlohmann::json param_hashes = nlohmann::json::object();
-        for (auto& [tensor_name, tensor] : param_tensors.items()) {
-          if (tensor.is_object()) {
-            ExtractStaticDataHash(tensor, param_hashes, tensor_name);
-          }
-        }
-        if (!param_hashes.empty()) {
-          node_hashes[param_name] = std::move(param_hashes);
-        }
-      }
-      if (!node_hashes.empty()) {
-        node_tensor_param_hashes[node_name] = std::move(node_hashes);
-      }
-    }
-    if (!node_tensor_param_hashes.empty()) {
-      hashes["node_tensor_params"] = std::move(node_tensor_param_hashes);
-    }
-  }
-
-  return hashes;
-}
-
 // Resolves the correct I/O order for a QNN fused subgraph, preferring ONNX declaration order.
 // For each ONNX-declared name, tries `tensor_name_overrides_reversed` first (handles renames),
 // then a direct match. Fallback to fused_order if any name is unresolvable. Appends partition-
@@ -432,8 +366,7 @@ Ort::Status QnnModel::ComposeGraph(const QnnModelContext& context) {
 
   if (build_json_graph) {
     namespace fs = std::filesystem;
-    nlohmann::json json_graph = qnn_model_wrapper.GetQnnJSONGraph();
-    nlohmann::json static_tensor_hashes = ExtractStaticDataHashes(json_graph);
+    const nlohmann::json& json_graph = qnn_model_wrapper.GetQnnJSONGraph();
     std::ofstream ofs(context.json_qnn_graph_path);
 
     if (ofs.is_open()) {
@@ -468,7 +401,7 @@ Ort::Status QnnModel::ComposeGraph(const QnnModelContext& context) {
                  {"enable_htp_matmul_lut", configs.enable_htp_matmul_lut},
                  {"htp_num_cores", configs.htp_num_cores},
              }},
-            {"static_tensor_hashes", std::move(static_tensor_hashes)},
+            {"static_tensor_hashes", qnn_model_wrapper.GetStaticTensorHashes()},
         };
         metadata_ofs << metadata.dump();
         metadata_ofs.close();

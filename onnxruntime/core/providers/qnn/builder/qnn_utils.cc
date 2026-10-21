@@ -859,8 +859,7 @@ static std::string Sha256Hex(const void* data, size_t size) {
 //     "src_axis_format" : "NOT_YET_DEFINED",
 // }
 static nlohmann::json GetQnnTensorJSON(const Qnn_Tensor_t& tensor,
-                                       bool include_static_data = false,
-                                       bool include_static_data_hash = false) {
+                                       bool include_static_data = false) {
   using json = nlohmann::json;
   json tensor_json = json::object();
   const Qnn_TensorType_t tensor_type = GetQnnTensorType(tensor);
@@ -927,22 +926,8 @@ static nlohmann::json GetQnnTensorJSON(const Qnn_Tensor_t& tensor,
 
   if (tensor_type == Qnn_TensorType_t::QNN_TENSOR_TYPE_STATIC) {
     const Qnn_ClientBuffer_t& client_buffer = GetQnnTensorClientBuf(tensor);
-    if (include_static_data_hash) {
-      nlohmann::json static_data_hash = {{"algorithm", "sha256"}};
-      static_data_hash["byte_count"] = client_buffer.dataSize;
-      if (client_buffer.data != nullptr) {
-        static_data_hash["digest"] = Sha256Hex(client_buffer.data, client_buffer.dataSize);
-      } else {
-        // A graph golden must not treat an opaque/static memory handle as a
-        // verified match. The future gate will fall back to real execution.
-        static_data_hash["status"] = "unavailable";
-      }
-      tensor_json["static_data_hash"] = std::move(static_data_hash);
-    }
-
     // A static tensor may be backed by opaque memory. Keep the graph dump valid
-    // without dereferencing a missing client buffer; its golden hash records
-    // the unavailable state above.
+    // without dereferencing a missing client buffer.
     if (include_static_data && client_buffer.data != nullptr) {
       tensor_json["data"] = GetQnnClientBufJSON(client_buffer, GetQnnTensorDataType(tensor), dims);
     } else {
@@ -953,6 +938,20 @@ static nlohmann::json GetQnnTensorJSON(const Qnn_Tensor_t& tensor,
   }
 
   return tensor_json;
+}
+
+static nlohmann::json GetStaticTensorHashJSON(const Qnn_Tensor_t& tensor) {
+  const Qnn_ClientBuffer_t& client_buffer = GetQnnTensorClientBuf(tensor);
+  nlohmann::json static_data_hash = {{"algorithm", "sha256"}};
+  static_data_hash["byte_count"] = client_buffer.dataSize;
+  if (client_buffer.data != nullptr) {
+    static_data_hash["digest"] = Sha256Hex(client_buffer.data, client_buffer.dataSize);
+  } else {
+    // A graph golden must not treat an opaque/static memory handle as a
+    // verified match. The future gate will fall back to real execution.
+    static_data_hash["status"] = "unavailable";
+  }
+  return static_data_hash;
 }
 
 // Returns a JSON object representation of a QNN scalar parameter. Example: { "306": 1 }
@@ -1015,7 +1014,7 @@ static nlohmann::json GetQnnTensorNamesJSON(gsl::span<const Qnn_Tensor_t> tensor
 //     "tensor_params": { "stride": {...} },
 //     "macs_per_inference": ""
 // }
-static nlohmann::json GetQnnOpJSON(const QnnOpConfigWrapper& op_config, bool include_static_data_hash) {
+static nlohmann::json GetQnnOpJSON(const QnnOpConfigWrapper& op_config, nlohmann::json* static_tensor_hashes) {
   using json = nlohmann::json;
   json op_json = json::object();
   op_json["package"] = op_config.GetPackageName();
@@ -1029,8 +1028,12 @@ static nlohmann::json GetQnnOpJSON(const QnnOpConfigWrapper& op_config, bool inc
     if (param.paramType == QNN_PARAMTYPE_SCALAR) {
       scalar_params_json[param.name] = GetQnnScalarParamJSON(param.scalarParam);
     } else if (param.paramType == QNN_PARAMTYPE_TENSOR) {
-      tensor_params_json[param.name][GetQnnTensorName(param.tensorParam)] =
-          GetQnnTensorJSON(param.tensorParam, true, include_static_data_hash);
+      const std::string tensor_name = GetQnnTensorName(param.tensorParam);
+      tensor_params_json[param.name][tensor_name] = GetQnnTensorJSON(param.tensorParam, true);
+      if (static_tensor_hashes != nullptr &&
+          GetQnnTensorType(param.tensorParam) == Qnn_TensorType_t::QNN_TENSOR_TYPE_STATIC) {
+        (*static_tensor_hashes)[param.name][tensor_name] = GetStaticTensorHashJSON(param.tensorParam);
+      }
     }
   }
 
@@ -1059,12 +1062,13 @@ QnnJSONGraph::QnnJSONGraph() {
       {"Total parameters", ""},
       {"Total MACs per inference", ""},
       {"graph", {{"tensors", json::object()}, {"nodes", json::object()}}}};
+  static_tensor_hashes_ = json::object();
 }
 
-void QnnJSONGraph::AddOp(const QnnOpConfigWrapper& op_conf_wrapper, bool include_static_data_hash) {
+void QnnJSONGraph::AddOp(const QnnOpConfigWrapper& op_conf_wrapper, bool collect_static_tensor_hashes) {
   // Serialize inputs and outputs.
-  AddOpTensors({op_conf_wrapper.GetInputTensors(), op_conf_wrapper.GetInputsNum()}, include_static_data_hash);
-  AddOpTensors({op_conf_wrapper.GetOutputTensors(), op_conf_wrapper.GetOutputsNum()}, include_static_data_hash);
+  AddOpTensors({op_conf_wrapper.GetInputTensors(), op_conf_wrapper.GetInputsNum()}, collect_static_tensor_hashes);
+  AddOpTensors({op_conf_wrapper.GetOutputTensors(), op_conf_wrapper.GetOutputsNum()}, collect_static_tensor_hashes);
 
   // Track unique op types (serialized in Finalize()).
   const std::string& op_type = op_conf_wrapper.GetTypeName();
@@ -1072,15 +1076,23 @@ void QnnJSONGraph::AddOp(const QnnOpConfigWrapper& op_conf_wrapper, bool include
     seen_op_types_.insert(op_type);
   }
 
-  // Serialize op
-  json_["graph"]["nodes"][op_conf_wrapper.GetOpName()] = GetQnnOpJSON(op_conf_wrapper, include_static_data_hash);
+  // Serialize op and collect hashes separately from the QNN JSON schema.
+  nlohmann::json node_tensor_hashes = nlohmann::json::object();
+  json_["graph"]["nodes"][op_conf_wrapper.GetOpName()] =
+      GetQnnOpJSON(op_conf_wrapper, collect_static_tensor_hashes ? &node_tensor_hashes : nullptr);
+  if (!node_tensor_hashes.empty()) {
+    static_tensor_hashes_["node_tensor_params"][op_conf_wrapper.GetOpName()] = std::move(node_tensor_hashes);
+  }
 }
 
-void QnnJSONGraph::AddOpTensors(gsl::span<const Qnn_Tensor_t> tensors, bool include_static_data_hash) {
+void QnnJSONGraph::AddOpTensors(gsl::span<const Qnn_Tensor_t> tensors, bool collect_static_tensor_hashes) {
   for (const auto& tensor : tensors) {
     std::string name = GetQnnTensorName(tensor);  // Copies name into std::string, which is moved into seen_tensors_.
     if (seen_tensors_.count(name) == 0) {
-      json_["graph"]["tensors"][name] = GetQnnTensorJSON(tensor, false, include_static_data_hash);
+      json_["graph"]["tensors"][name] = GetQnnTensorJSON(tensor);
+      if (collect_static_tensor_hashes && GetQnnTensorType(tensor) == Qnn_TensorType_t::QNN_TENSOR_TYPE_STATIC) {
+        static_tensor_hashes_["graph_tensors"][name] = GetStaticTensorHashJSON(tensor);
+      }
       seen_tensors_.insert(std::move(name));
     }
   }

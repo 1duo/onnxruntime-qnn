@@ -1340,6 +1340,19 @@ QnnEp::QnnEp(const QnnEpFactory& factory,
                                                     FormatEPConfigKey(kDumpQnnGraphGoldenMetadata),
                                                     false,
                                                     logger_);
+  if (dump_qnn_graph_golden_metadata_ && !dump_json_qnn_graph_) {
+    ORT_CXX_LOG(logger_,
+                ORT_LOGGING_LEVEL_WARNING,
+                "dump_qnn_graph_golden_metadata requires dump_json_qnn_graph=1. Skipping golden metadata export.");
+    dump_qnn_graph_golden_metadata_ = false;
+  }
+  if (dump_qnn_graph_golden_metadata_ && enable_multi_soc_ep_context_) {
+    ORT_CXX_LOG(logger_,
+                ORT_LOGGING_LEVEL_WARNING,
+                "dump_qnn_graph_golden_metadata does not support multi-SoC EP contexts. "
+                "Skipping golden metadata export.");
+    dump_qnn_graph_golden_metadata_ = false;
+  }
 
   static const std::string QNN_GRAPH_DUMP_DIR = "json_qnn_graph_dir";
   std::string json_graph_dir_str;

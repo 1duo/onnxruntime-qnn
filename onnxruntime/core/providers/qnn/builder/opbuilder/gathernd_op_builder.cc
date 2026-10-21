@@ -78,7 +78,7 @@ Ort::Status ProcessGatherNDIndices(QnnModelWrapper& qnn_model_wrapper,
                                                      indices_tensor_name, std::move(qnn_indices_bytes),
                                                      logger, input_names, do_op_validation));
 
-  // QNN GatherNd on HTP cannot finalize with indices whose rank is greater than 4. With no batch
+  // QNN GatherNd validation on HTP rejects indices whose rank is greater than 4. With no batch
   // dimensions, flattening indices[:-1] preserves the index tuples; the output is reshaped back to
   // the ONNX shape in ProcessAttributesAndOutputs.
   const auto& indices_tensor = qnn_model_wrapper.GetQnnTensorWrapper(input_names[1]);

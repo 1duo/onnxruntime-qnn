@@ -2171,11 +2171,11 @@ Ort::Status ResolveExternalDataPath(const std::filesystem::path& model_directory
   std::error_code error_code;
   const std::filesystem::path canonical_model_directory =
       std::filesystem::weakly_canonical(effective_model_directory, error_code);
-  RETURN_IF(error_code, "Failed to resolve the model directory: ", error_code.message());
+  RETURN_IF(error_code, ("Failed to resolve the model directory: " + error_code.message()).c_str());
 
   const std::filesystem::path candidate_path =
       std::filesystem::weakly_canonical(canonical_model_directory / normalized_relative_path, error_code);
-  RETURN_IF(error_code, "Failed to resolve the external initializer path: ", error_code.message());
+  RETURN_IF(error_code, ("Failed to resolve the external initializer path: " + error_code.message()).c_str());
 
   const std::filesystem::path path_relative_to_model = candidate_path.lexically_relative(canonical_model_directory);
   RETURN_IF(path_relative_to_model.empty() || path_relative_to_model.has_root_path(),

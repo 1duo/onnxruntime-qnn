@@ -1,6 +1,7 @@
 // Copyright (c) Microsoft Corporation. All rights reserved.
 // Licensed under the MIT License.
 
+#include <algorithm>
 #include <functional>
 #include <limits>
 #include <numeric>
@@ -19,6 +20,63 @@ namespace onnxruntime {
 namespace qnn {
 
 namespace {
+const OrtNode* FindProducer(const OrtGraph& graph, const OrtApi& ort_api, const OrtValueInfo* value) {
+  if (value == nullptr) {
+    return nullptr;
+  }
+
+  size_t node_count = 0;
+  RETURN_DEFAULT_IF_API_FAIL(ort_api.Graph_GetNumNodes(&graph, &node_count), ort_api, nullptr);
+
+  std::vector<const OrtNode*> nodes(node_count);
+  RETURN_DEFAULT_IF_API_FAIL(ort_api.Graph_GetNodes(&graph, nodes.data(), nodes.size()), ort_api, nullptr);
+
+  for (const OrtNode* node : nodes) {
+    size_t output_count = 0;
+    RETURN_DEFAULT_IF_API_FAIL(ort_api.Node_GetNumOutputs(node, &output_count), ort_api, nullptr);
+
+    std::vector<const OrtValueInfo*> outputs(output_count);
+    RETURN_DEFAULT_IF_API_FAIL(ort_api.Node_GetOutputs(node, outputs.data(), outputs.size()), ort_api, nullptr);
+    if (std::find(outputs.begin(), outputs.end(), value) != outputs.end()) {
+      return node;
+    }
+  }
+
+  return nullptr;
+}
+
+const OrtValueInfo* GetNodeInput(const OrtApi& ort_api, const OrtNode& node, size_t index) {
+  size_t input_count = 0;
+  RETURN_DEFAULT_IF_API_FAIL(ort_api.Node_GetNumInputs(&node, &input_count), ort_api, nullptr);
+  if (index >= input_count) {
+    return nullptr;
+  }
+
+  std::vector<const OrtValueInfo*> inputs(input_count);
+  RETURN_DEFAULT_IF_API_FAIL(ort_api.Node_GetInputs(&node, inputs.data(), inputs.size()), ort_api, nullptr);
+  return inputs[index];
+}
+
+bool IsSoftmaxValueMatMul(const QnnModelWrapper& qnn_model_wrapper, const OrtNodeUnit& node_unit) {
+  const OrtApi& ort_api = qnn_model_wrapper.GetOrtApi();
+  const OrtGraph& graph = qnn_model_wrapper.GetOrtGraph();
+
+  // MatMul input[0] is the QDQ output. Follow DQ <- Q <- Softmax.
+  const OrtValueInfo* matmul_input0 = GetNodeInput(ort_api, node_unit.GetNode(), 0);
+  const OrtNode* dq_node = FindProducer(graph, ort_api, matmul_input0);
+  if (dq_node == nullptr || Ort::ConstNode(dq_node).GetOperatorType() != "DequantizeLinear") {
+    return false;
+  }
+
+  const OrtNode* q_node = FindProducer(graph, ort_api, GetNodeInput(ort_api, *dq_node, 0));
+  if (q_node == nullptr || Ort::ConstNode(q_node).GetOperatorType() != "QuantizeLinear") {
+    return false;
+  }
+
+  const OrtNode* softmax_node = FindProducer(graph, ort_api, GetNodeInput(ort_api, *q_node, 0));
+  return softmax_node != nullptr && Ort::ConstNode(softmax_node).GetOperatorType() == "Softmax";
+}
+
 bool ShouldUseSymmetricU16ForMatMul(float input1_scale) {
   constexpr float kMaximumValueQuantError = 0.1f;
 
@@ -369,7 +427,8 @@ Ort::Status MatMulOpBuilder::ProcessInputsForQnnMatMul(QnnModelWrapper& qnn_mode
   //                         |
   //     input_1_uint16 -----+
   //
-  // Dynamic asymmetric U16 input[1] uses the value-domain U16-to-U8 error gate:
+  // Dynamic asymmetric U16 input[1] from a Softmax x Value MatMul uses the value-domain U16-to-U8 error gate.
+  // Softmax weights are nonnegative and sum to one, so the U8 half-step also bounds the output error.
   //     input_0_uint16 ----------------------------------> MatMul ---> output_uint16
   //                                                        ^
   //                                                        |
@@ -401,6 +460,7 @@ Ort::Status MatMulOpBuilder::ProcessInputsForQnnMatMul(QnnModelWrapper& qnn_mode
       constexpr int32_t kSymmetricU16Offset = -32768;
       if (quant_param.scaleOffsetEncoding.offset != kSymmetricU16Offset) {
         const bool use_symmetric_u16 =
+            IsSoftmaxValueMatMul(qnn_model_wrapper, node_unit) &&
             ShouldUseSymmetricU16ForMatMul(quant_param.scaleOffsetEncoding.scale);
         RETURN_IF_ERROR(utils::InsertConvertOp(qnn_model_wrapper,
                                                convert_input_name,

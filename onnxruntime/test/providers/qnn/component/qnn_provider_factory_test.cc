@@ -986,6 +986,7 @@ TEST_F(QnnUnit_ProviderFactoryTest, IncompatibilityDetails_SupportedNpu_NoDefaul
   FactoryStubContext ctx;
   UseFactoryStubs use(ctx);
   QnnEpFactory factory("ep", ctx.MakeApiPtrs());
+
   OrtHardwareDevice* npu = MakeFakeHwDevice(21);
   ctx.device_type_map[npu] = OrtHardwareDeviceType_NPU;
   ctx.device_vendor_map[npu] = kQualcommVendorId;  // supported → past SetDetails.
@@ -1021,6 +1022,7 @@ TEST_F(QnnUnit_ProviderFactoryTest, ValidateCompatibility_NpuDevice_NoDefaultLog
   FactoryStubContext ctx;
   UseFactoryStubs use(ctx);
   QnnEpFactory factory("ep", ctx.MakeApiPtrs());
+
   OrtHardwareDevice* npu = MakeFakeHwDevice(23);
   ctx.device_type_map[npu] = OrtHardwareDeviceType_NPU;
 
@@ -1063,6 +1065,7 @@ TEST_F(QnnUnit_ProviderFactoryTest, CreateEp_NullLogger_NoDefaultLogger_ReturnsE
   FactoryStubContext ctx;
   UseFactoryStubs use(ctx);
   QnnEpFactory factory("ep", ctx.MakeApiPtrs());
+
   OrtEp* ep = reinterpret_cast<OrtEp*>(0xDEAD);
   OrtStatus* status = factory.CreateEp(&factory, /*devices*/ nullptr, /*ep_metadata*/ nullptr,
                                        /*num_devices*/ 0,

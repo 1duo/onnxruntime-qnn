@@ -156,6 +156,12 @@ jobs:
       - uses: actions/checkout@v6
         # Submodules omitted here; initialized below only when a heavy build is needed, so
         # has_code_changes=false jobs skip the expensive recursive fetch while still reporting green.
+      - name: Validate internal-symbol artifact settings
+        if: ${{ inputs.qnn_internal_ut_symbols && (inputs.upload_test_archive || inputs.upload_wheel || inputs.upload_nuget || inputs.upload_archive || inputs.build_pdb_archive || inputs.upload_pdb_archive || inputs.upload_aar) }}
+        run: |
+          echo "::error::Internal-symbol builds must not publish test or production artifacts."
+          exit 1
+
       - name: Initialize submodules
         if: ${{ inputs.has_code_changes }}
         run: git submodule update --init --recursive

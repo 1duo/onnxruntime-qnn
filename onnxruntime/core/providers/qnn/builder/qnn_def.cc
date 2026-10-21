@@ -7,8 +7,10 @@
 #include <functional>
 #include <memory>
 #include <ostream>
+#ifdef USE_QAIRT_API
 
 #include "core/providers/qnn/builder/graph_emitter_interface.h"
+#endif
 
 #include "core/providers/qnn/builder/qnn_utils.h"
 
@@ -628,9 +630,10 @@ bool QnnOpConfigWrapper::CreateQnnGraphOp(const QNN_INTERFACE_VER_TYPE& qnn_inte
   return true;
 }
 
+#ifdef USE_QAIRT_API
 // IGraphEmitter overload: routes tensor creation through the abstract emitter.
 bool CreateTensorInQnnGraph(IGraphEmitter& emitter,
-                            const Qnn_GraphHandle_t& graph,
+                            const Qnn_GraphHandle_t& /*graph*/,
                             const std::string& node_name,
                             const std::string& tensor_name,
                             Qnn_Tensor_t& qnn_tensor,
@@ -674,7 +677,7 @@ bool CreateTensorInQnnGraph(IGraphEmitter& emitter,
     }
   }
 
-  Ort::Status s = emitter.CreateTensor(graph, qnn_tensor);
+  Ort::Status s = emitter.CreateTensor(qnn_tensor);
   if (!s.IsOK()) {
     ss << "Failed to create tensor for node: " << node_name
        << " tensor_name: " << tensor_name
@@ -689,9 +692,9 @@ bool CreateTensorInQnnGraph(IGraphEmitter& emitter,
 
 // IGraphEmitter overload: routes op validation through the abstract emitter.
 bool QnnOpConfigWrapper::QnnGraphOpValidation(IGraphEmitter& emitter,
-                                              const Qnn_BackendHandle_t& backend_handle,
+                                              const Qnn_BackendHandle_t& /*backend_handle*/,
                                               std::string& error_msg) {
-  Ort::Status s = emitter.ValidateOp(backend_handle, op_config_);
+  Ort::Status s = emitter.ValidateOp(op_config_);
   if (!s.IsOK()) {
     std::ostringstream oss;
     oss << "QNN.backendValidateOpConfig() failed for node `" << name_ << "` of type `"
@@ -704,9 +707,9 @@ bool QnnOpConfigWrapper::QnnGraphOpValidation(IGraphEmitter& emitter,
 
 // IGraphEmitter overload: routes graphAddNode through the abstract emitter.
 bool QnnOpConfigWrapper::CreateQnnGraphOp(IGraphEmitter& emitter,
-                                          const Qnn_GraphHandle_t& graph,
+                                          const Qnn_GraphHandle_t& /*graph*/,
                                           std::string& error_msg) {
-  Ort::Status s = emitter.AddNode(graph, op_config_);
+  Ort::Status s = emitter.AddNode(op_config_);
   if (!s.IsOK()) {
     std::ostringstream oss;
     oss << "QNN.graphAddNode() failed for node `" << name_ << "` of type `" << type_name_
@@ -745,6 +748,7 @@ bool QnnParamWrapper::CreateQnnGraphParam(IGraphEmitter& emitter,
   return true;
 }
 
+#endif
 bool IsIrBackend(QnnBackendType backend_type) {
   return backend_type == QnnBackendType::SERIALIZER;
 }

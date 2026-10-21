@@ -13,9 +13,8 @@
 #ifdef USE_QAIRT_API
 #include "core/providers/qnn/builder/qairt_graph_emitter.h"
 #include "core/providers/qnn/builder/qairt_backend_manager.h"
+#include "core/providers/qnn/builder/qairt_profiling_manager.h"
 #endif
-#include "core/providers/qnn/builder/graph_emitter_interface.h"
-#include "core/providers/qnn/builder/qnn_graph_emitter.h"
 #include "core/providers/qnn/builder/op_tracing/qnn_op_tracing_types.h"
 #include "core/providers/qnn/ort_api.h"
 #include "core/providers/qnn/rpcmem_library.h"
@@ -59,17 +58,16 @@ class QnnModel {
       : qnn_backend_manager_(qnn_backend_manager),
         api_ptrs_(api_ptrs) {
     qnn_backend_type_ = qnn_backend_manager_->GetQnnBackendType();
-    graph_emitter_ = std::make_unique<QnnGraphEmitter>(qnn_backend_manager_->GetQnnInterface());
   }
 
-  QnnModel(QnnBackendManager* qnn_backend_manager,
-           const ApiPtrs& api_ptrs,
-           std::unique_ptr<IGraphEmitter> emitter)
-      : qnn_backend_manager_(qnn_backend_manager),
-        graph_emitter_(std::move(emitter)),
-        api_ptrs_(ApiPtrs{api_ptrs.ort_api, api_ptrs.ep_api, api_ptrs.model_editor_api}) {
-    qnn_backend_type_ = qnn_backend_manager_->GetQnnBackendType();
-  }
+#ifdef USE_QAIRT_API
+  Ort::Status LoadQairtGraph(QairtBackendManager::CachedGraph&& graph);
+  QnnModel(std::shared_ptr<QairtBackendManager> backend, std::shared_ptr<QairtProfilingManager> profiler,
+           const ApiPtrs& api_ptrs)
+      : qnn_backend_type_(backend->GetBackendType()), qairt_backend_manager_(std::move(backend)),
+        qairt_profiler_(std::move(profiler)),
+        qairt_graph_(std::make_unique<QairtGraphEmitter>(qairt_backend_manager_)), api_ptrs_(api_ptrs) {}
+#endif
 
   ~QnnModel() = default;
   ORT_DISALLOW_COPY_ASSIGNMENT_AND_MOVE(QnnModel);
@@ -234,8 +232,15 @@ class QnnModel {
   std::vector<QnnTensorInfo> qnn_output_infos_;
   QnnBackendType qnn_backend_type_ = QnnBackendType::CPU;
 
-  std::unique_ptr<IGraphEmitter> graph_emitter_;
+#ifdef USE_QAIRT_API
+  Ort::Status ComposeQairtGraph(const QnnModelContext& context);
+  Ort::Status FinalizeQairtGraph(const Ort::Logger& logger);
+  Ort::Status ExecuteQairtGraph(OrtKernelContext* context, const Ort::Logger& logger, QnnEpProfiler* profiler);
+  std::shared_ptr<QairtBackendManager> qairt_backend_manager_;
+  std::shared_ptr<QairtProfilingManager> qairt_profiler_;
+  std::unique_ptr<QairtGraphEmitter> qairt_graph_;
 
+#endif
   // Mutex acquired during graph execution to support multi-threaded inference of a single session.
   std::mutex graph_exec_mutex_;
   const ApiPtrs api_ptrs_;

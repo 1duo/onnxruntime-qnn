@@ -34,7 +34,7 @@ namespace qairt_convert {
 
 // Maps Qnn_DataType_t to qairt::DataType. The two enums share numeric values
 // (both derive from the same backend ABI), but cast through explicitly so a
-// future divergence surfaces here rather than as silent data corruption.
+// future ABI divergence can be handled at this conversion boundary.
 inline qairt::DataType ToQairtDataType(Qnn_DataType_t dt) {
   return static_cast<qairt::DataType>(dt);
 }
@@ -63,12 +63,6 @@ Ort::Status FromQnnTensor(const Qnn_Tensor_t& qnn_tensor,
 Ort::Status FromQnnOpConfig(const Qnn_OpConfig_t& qnn_op,
                             const qairt::Api& api,
                             qairt::OpConfig& out);
-
-// ID-only tensor ref for fallback cases where a tensor wasn't pre-registered.
-// Sets ID, name, dataType, dims — no TensorProperties.
-Ort::Status FromQnnTensorRef(const Qnn_Tensor_t& qnn_tensor,
-                             const qairt::Api& api,
-                             qairt::Tensor& out);
 
 // Converts a QNN C Qnn_Scalar_t to a qairt::Scalar.
 Ort::Status ConvertScalarPublic(const Qnn_Scalar_t& qnn_scalar,

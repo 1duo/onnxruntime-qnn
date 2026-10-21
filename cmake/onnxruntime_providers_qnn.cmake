@@ -9,6 +9,11 @@
        "${ONNXRUNTIME_ROOT}/core/providers/qnn/*.cc"
   )
 
+  option(onnxruntime_USE_QAIRT_API "Enable QAIRT C++ API path (experimental)" OFF)
+  if(NOT onnxruntime_USE_QAIRT_API)
+    list(FILTER onnxruntime_providers_qnn_ep_srcs EXCLUDE REGEX "/qairt_[^/]*\\.(cc|h)$")
+  endif()
+
   function(extract_qnn_sdk_version_from_yaml QNN_SDK_YAML_FILE QNN_VERSION_OUTPUT)
     file(READ "${QNN_SDK_YAML_FILE}" QNN_SDK_YAML_CONTENT)
     # Match a line of text like "version: 1.33.2"
@@ -133,7 +138,6 @@
   # QAIRT C++ API integration.
   # When ON, builds QairtBackendManager + QairtGraphEmitter as an alternative to the QNN C path.
   # QAIRT C++ API is header-only; the Api class loads the backend .dll at runtime via dlopen.
-  option(onnxruntime_USE_QAIRT_API "Enable QAIRT C++ API path (experimental)" OFF)
   if(onnxruntime_USE_QAIRT_API)
     target_compile_definitions(onnxruntime_providers_qnn PRIVATE USE_QAIRT_API=1)
     target_include_directories(onnxruntime_providers_qnn SYSTEM PRIVATE

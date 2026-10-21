@@ -135,8 +135,8 @@ class BuildEpWindowsTask(RunPowershellScriptsTask):
         build_as_x: bool = False,
         build_nuget: bool = False,
         build_archive: bool = False,
-        use_qairt_api: bool = False,
         qnn_internal_ut_symbols: bool = False,
+        use_qairt_api: bool = False,
     ) -> None:
         cmd = [
             str(REPO_ROOT / "qcom" / "scripts" / "windows" / "build.ps1"),

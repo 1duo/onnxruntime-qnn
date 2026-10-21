@@ -6,6 +6,7 @@
 #include "core/providers/qnn/builder/qairt_graph_emitter.h"
 #include "core/providers/qnn/builder/qairt_type_convert.h"
 #include "core/providers/qnn/builder/qnn_def.h"
+#include "core/providers/qnn/builder/qairt_backend_manager.h"
 
 #include "QairtCpp/QairtApi.hpp"
 
@@ -20,63 +21,35 @@
 namespace onnxruntime {
 namespace qnn {
 
-QairtGraphEmitter::QairtGraphEmitter(qairt::Api& api, qairt::Context& context)
-    : api_(api), context_(context) {}
+QairtGraphEmitter::QairtGraphEmitter(std::shared_ptr<QairtBackendManager> manager)
+    : manager_(std::move(manager)) {}
 
-Ort::Status QairtGraphEmitter::CreateGraph(Qnn_ContextHandle_t /*ctx*/,
-                                           const char* name,
-                                           const QnnGraph_Config_t** /*configs*/,
-                                           Qnn_GraphHandle_t& out) {
+Ort::Status QairtGraphEmitter::RetrieveGraph(std::shared_ptr<qairt::Context> context, const std::string& name) {
   try {
-    auto graph_config = api_.make<qairt::GraphConfiguration>();
-    auto graph = context_.createGraph(name, graph_config);
-    current_graph_ = std::make_shared<qairt::Graph>(std::move(graph));
-    // Return a non-null sentinel so callers' null-checks pass.
-    // The handle is never dereferenced on the QAIRT path.
-    out = reinterpret_cast<Qnn_GraphHandle_t>(current_graph_.get());
-  } catch (const qairt::Exception& e) {
-    return MAKE_EP_FAIL(("QairtGraphEmitter::CreateGraph failed for `" +
-                         std::string(name) + "`: " + e.what())
-                            .c_str());
+    current_graph_ = context->retrieveGraph(name.c_str());
+    context_ = std::move(context);
+    return Ort::Status();
   } catch (const std::exception& e) {
-    return MAKE_EP_FAIL(("QairtGraphEmitter::CreateGraph std::exception for `" +
-                         std::string(name) + "`: " + e.what())
-                            .c_str());
-  } catch (...) {
-    return MAKE_EP_FAIL(("QairtGraphEmitter::CreateGraph unknown exception for `" +
-                         std::string(name) + "`")
-                            .c_str());
+    return MAKE_EP_FAIL(e.what());
   }
-  return Ort::Status();
 }
 
-Ort::Status QairtGraphEmitter::RetrieveGraph(Qnn_ContextHandle_t /*ctx*/,
-                                             const char* name,
-                                             Qnn_GraphHandle_t& out) {
+Ort::Status QairtGraphEmitter::CreateGraph(const char* name) {
   try {
-    current_graph_ = context_.retrieveGraph(name);
-    out = reinterpret_cast<Qnn_GraphHandle_t>(current_graph_.get());
-  } catch (const qairt::Exception& e) {
-    return MAKE_EP_FAIL(("QairtGraphEmitter::RetrieveGraph failed for `" +
-                         std::string(name) + "`: " + e.what())
-                            .c_str());
+    RETURN_IF(current_graph_, "A QAIRT emitter already owns a graph.");
+    context_ = manager_->GetContext();
+    auto config = manager_->GetApi().make<qairt::GraphConfiguration>();
+    current_graph_ = std::make_shared<qairt::Graph>(context_->createGraph(name, config));
+    return Ort::Status();
   } catch (const std::exception& e) {
-    return MAKE_EP_FAIL(("QairtGraphEmitter::RetrieveGraph std::exception for `" +
-                         std::string(name) + "`: " + e.what())
-                            .c_str());
-  } catch (...) {
-    return MAKE_EP_FAIL(("QairtGraphEmitter::RetrieveGraph unknown exception for `" +
-                         std::string(name) + "`")
-                            .c_str());
+    return MAKE_EP_FAIL(e.what());
   }
-  return Ort::Status();
 }
 
-Ort::Status QairtGraphEmitter::CreateTensor(Qnn_GraphHandle_t /*graph*/,
-                                            Qnn_Tensor_t& tensor) {
+Ort::Status QairtGraphEmitter::CreateTensor(Qnn_Tensor_t& tensor) {
   try {
     qairt::Tensor qairt_tensor;
-    QAIRT_RETURN_IF_ERROR(qairt_convert::FromQnnTensor(tensor, api_, qairt_tensor));
+    QAIRT_RETURN_IF_ERROR(qairt_convert::FromQnnTensor(tensor, manager_->GetApi(), qairt_tensor));
     current_graph_->createGraphTensor(qairt_tensor);
     // Write back the assigned tensor ID so the caller can reference it later.
     uint32_t id = static_cast<uint32_t>(qairt_tensor.getId());
@@ -97,10 +70,9 @@ Ort::Status QairtGraphEmitter::CreateTensor(Qnn_GraphHandle_t /*graph*/,
   return Ort::Status();
 }
 
-Ort::Status QairtGraphEmitter::AddNode(Qnn_GraphHandle_t /*graph*/,
-                                       const Qnn_OpConfig_t& op) {
+Ort::Status QairtGraphEmitter::AddNode(const Qnn_OpConfig_t& op) {
   try {
-    qairt::OpConfig qairt_op = api_.make<qairt::OpConfig>();
+    qairt::OpConfig qairt_op = manager_->GetApi().make<qairt::OpConfig>();
     const auto& v1 = op.v1;
 
     if (v1.name) qairt_op.setName(v1.name);
@@ -112,12 +84,12 @@ Ort::Status QairtGraphEmitter::AddNode(Qnn_GraphHandle_t /*graph*/,
     params.reserve(v1.numOfParams);
     for (uint32_t i = 0; i < v1.numOfParams; ++i) {
       const auto& qp = v1.params[i];
-      auto param = api_.make<qairt::Param>();
+      auto param = manager_->GetApi().make<qairt::Param>();
       if (qp.name) param.setName(qp.name);
 
       if (qp.paramType == QNN_PARAMTYPE_SCALAR) {
         qairt::Scalar scalar;
-        QAIRT_RETURN_IF_ERROR(qairt_convert::ConvertScalarPublic(qp.scalarParam, api_, scalar));
+        QAIRT_RETURN_IF_ERROR(qairt_convert::ConvertScalarPublic(qp.scalarParam, manager_->GetApi(), scalar));
         param.setScalar(scalar);
       } else if (qp.paramType == QNN_PARAMTYPE_TENSOR) {
         uint32_t id = GetQnnTensorID(qp.tensorParam);
@@ -133,7 +105,7 @@ Ort::Status QairtGraphEmitter::AddNode(Qnn_GraphHandle_t /*graph*/,
     }
     qairt_op.setParams(params);
 
-    // ponytail: OpConfig tensors MUST be shallowCopy of registered tensors.
+    // OpConfig tensors retain the properties of their registered tensors.
     // shallowCopy creates a new handle with properties (isNative) already set from
     // createGraphTensor time. Fresh tensors default to APP_WRITE=0 at C level —
     // QairtHtp.dll rejects that in addNode validation.
@@ -180,75 +152,48 @@ Ort::Status QairtGraphEmitter::AddNode(Qnn_GraphHandle_t /*graph*/,
   return Ort::Status();
 }
 
-Ort::Status QairtGraphEmitter::ValidateOp(Qnn_BackendHandle_t /*backend*/,
-                                          const Qnn_OpConfig_t& /*op*/) {
-  // ponytail: QAIRT C++ API has no standalone backendValidateOpConfig equivalent.
-  // Validation happens implicitly at addNode(). Return OK — if the op is invalid,
-  // addNode will throw. Add explicit validation when QAIRT exposes it.
-  return Ort::Status();
+Ort::Status QairtGraphEmitter::ValidateOp(const Qnn_OpConfig_t& op) {
+  return manager_->ValidateOp(op);
 }
 
-Ort::Status QairtGraphEmitter::FinalizeGraph(Qnn_GraphHandle_t /*graph*/,
-                                             Qnn_ProfileHandle_t /*profile*/) {
+Ort::Status QairtGraphEmitter::Finalize(qairt::Profile* profile) {
   try {
-    // ponytail: profile handle ignored — QAIRT profile is set via GraphConfiguration
-    // or passed to execute(). Add profile forwarding when perf infra wires up.
-    current_graph_->finalize();
-  } catch (const qairt::Exception& e) {
-    return MAKE_EP_FAIL(("QairtGraphEmitter::FinalizeGraph failed: " +
-                         std::string(e.what()))
-                            .c_str());
+    if (profile)
+      current_graph_->finalize(*profile);
+    else
+      current_graph_->finalize();
+    return Ort::Status();
   } catch (const std::exception& e) {
-    return MAKE_EP_FAIL(("QairtGraphEmitter::FinalizeGraph std::exception: " +
-                         std::string(e.what()))
-                            .c_str());
-  } catch (...) {
-    return MAKE_EP_FAIL("QairtGraphEmitter::FinalizeGraph unknown exception");
+    return MAKE_EP_FAIL(e.what());
   }
-  return Ort::Status();
 }
 
-Qnn_ErrorHandle_t QairtGraphEmitter::ExecuteGraph(Qnn_GraphHandle_t /*graph*/,
-                                                  Qnn_Tensor_t* inputs,
-                                                  uint32_t n_inputs,
-                                                  Qnn_Tensor_t* outputs,
-                                                  uint32_t n_outputs,
-                                                  Qnn_ProfileHandle_t /*profile*/,
-                                                  Qnn_SignalHandle_t /*signal*/) {
+Ort::Status QairtGraphEmitter::Execute(Qnn_Tensor_t* inputs, uint32_t n_inputs,
+                                       Qnn_Tensor_t* outputs, uint32_t n_outputs,
+                                       std::shared_ptr<qairt::Profile> profile) {
   try {
-    std::vector<qairt::Tensor> qairt_inputs;
-    qairt_inputs.reserve(n_inputs);
+    std::vector<qairt::Tensor> in(n_inputs), out(n_outputs);
     for (uint32_t i = 0; i < n_inputs; ++i) {
-      qairt::Tensor t;
-      auto s = qairt_convert::FromQnnTensor(inputs[i], api_, t);
-      if (!s.IsOK()) return QNN_GRAPH_ERROR_GENERAL;
-      qairt_inputs.push_back(std::move(t));
+      RETURN_IF_ERROR(qairt_convert::FromQnnTensor(inputs[i], manager_->GetApi(), in[i]));
     }
-
-    std::vector<qairt::Tensor> qairt_outputs;
-    qairt_outputs.reserve(n_outputs);
     for (uint32_t i = 0; i < n_outputs; ++i) {
-      qairt::Tensor t;
-      auto s = qairt_convert::FromQnnTensor(outputs[i], api_, t);
-      if (!s.IsOK()) return QNN_GRAPH_ERROR_GENERAL;
-      qairt_outputs.push_back(std::move(t));
+      RETURN_IF_ERROR(qairt_convert::FromQnnTensor(outputs[i], manager_->GetApi(), out[i]));
     }
-
-    current_graph_->execute(qairt_inputs, qairt_outputs);
-
+    current_graph_->execute(in, out, profile);
     for (uint32_t i = 0; i < n_outputs; ++i) {
-      auto& cb = qairt_outputs[i].getClientBuffer();
-      SetQnnTensorClientBufSize(outputs[i], cb.getDataSize());
+      SetQnnTensorClientBufSize(outputs[i], out[i].getClientBuffer().getDataSize());
     }
-  } catch (const qairt::Exception&) {
-    return QNN_GRAPH_ERROR_GENERAL;
-  } catch (...) {
-    return QNN_GRAPH_ERROR_GENERAL;
+    return Ort::Status();
+  } catch (const qairt::Exception& e) {
+    if (e == qairt::CommonError::SystemCommunication || e == qairt::CommonError::SystemCommunicationFatal) {
+      return Ort::Status("QAIRT device communication failed; QAIRT context recovery is not implemented.",
+                         QNN_SSR_UNRECOVERABLE_ERROR_CODE);
+    }
+    return MAKE_EP_FAIL(e.what());
+  } catch (const std::exception& e) {
+    return MAKE_EP_FAIL(e.what());
   }
-  return QNN_GRAPH_NO_ERROR;
 }
-
 }  // namespace qnn
 }  // namespace onnxruntime
-
-#endif  // USE_QAIRT_API
+#endif

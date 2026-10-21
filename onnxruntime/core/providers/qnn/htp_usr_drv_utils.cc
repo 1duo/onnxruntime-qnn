@@ -400,6 +400,7 @@ Ort::Status IsHtpUsrDrvEnabled(const std::string& backend_lib_dir, const uint32_
 
   const std::filesystem::path backend_lib_dir_path(backend_lib_dir);
 
+#ifdef USE_QAIRT_API
   // The prepare library is required for compilation, not cached-context execution.
   auto has_htp_libs = [&](const std::string& prefix) {
 #ifdef _WIN32
@@ -416,6 +417,23 @@ Ort::Status IsHtpUsrDrvEnabled(const std::string& backend_lib_dir, const uint32_
   if (!has_htp_libs("Qnn") && !has_htp_libs("Qairt")) {
     enabled = true;
   }
+#else
+  // Prepare lib is only mandatory in compile time but not in runtime (i.e., reload from EP Context model).
+  // Furthermore, current QNN-EP creates QNN device first before QNN backend tries to load prepare lib and thus its
+  // existence does not affect HNRD adoption. As a result, prepare lib is safe not checked here.
+#ifdef _WIN32
+  const std::string stub_lib_path = "QnnHtp" + htp_arch_string + "Stub.dll";
+  const std::string skel_lib_path = "libQnnHtp" + htp_arch_string + "Skel.so";
+#else
+  const std::string stub_lib_path = "libQnnHtp" + htp_arch_string + "Stub.so";
+  const std::string skel_lib_path = "libQnnHtp" + htp_arch_string + "Skel.so";
+#endif
+
+  if (!std::filesystem::exists(backend_lib_dir_path / stub_lib_path) ||
+      !std::filesystem::exists(backend_lib_dir_path / skel_lib_path)) {
+    enabled = true;
+  }
+#endif
 
   return Ort::Status();
 }

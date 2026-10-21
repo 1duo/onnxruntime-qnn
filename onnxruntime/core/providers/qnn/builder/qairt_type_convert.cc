@@ -22,9 +22,8 @@ namespace qairt_convert {
 namespace {
 
 // Maps Qnn_TensorType_t to qairt::TensorProperties flags.
-// ponytail: QAIRT Graph::addNode requires native inputs to be outputs of a prior node
-// (QairtGraph.hpp line 501). Graph I/O tensors MUST be flagged isInput/isOutput so
-// the backend knows they're externally provided, not intermediate.
+// Graph I/O tensors must be flagged as inputs or outputs so the backend can
+// distinguish externally provided tensors from intermediate tensors.
 //
 // IMPORTANT: caller must set an explicit TensorProperties on `out` via
 // setTensorProperties(api.make<TensorProperties>()) BEFORE calling this function.
@@ -106,27 +105,6 @@ Ort::Status ConvertScalar(const Qnn_Scalar_t& qnn_scalar, const qairt::Api& api,
 }
 
 }  // namespace
-
-// ponytail: ID-only tensor ref for addNode OpConfig. Backend matches by ID to
-// the tensor registered at createGraphTensor time.
-// Do NOT set any TensorProperties — the default-constructed tensor has no type flags,
-// which is what the backend expects for OpConfig refs (it uses the registered tensor's type).
-Ort::Status FromQnnTensorRef(const Qnn_Tensor_t& qnn_tensor,
-                             const qairt::Api& api,
-                             qairt::Tensor& out) {
-  out = api.make<qairt::Tensor>();
-  out.setId(GetQnnTensorID(qnn_tensor));
-  const char* name = GetQnnTensorName(qnn_tensor);
-  if (name) out.setName(name);
-  out.setDataType(ToQairtDataType(GetQnnTensorDataType(qnn_tensor)));
-
-  uint32_t rank = GetQnnTensorRank(qnn_tensor);
-  uint32_t* dims = GetQnnTensorDims(qnn_tensor);
-  if (rank > 0 && dims) {
-    out.setDimensions(std::vector<uint32_t>(dims, dims + rank));
-  }
-  return Ort::Status();
-}
 
 Ort::Status ConvertScalarPublic(const Qnn_Scalar_t& qnn_scalar,
                                 const qairt::Api& api,
@@ -366,7 +344,7 @@ Ort::Status FromQnnOpConfig(const Qnn_OpConfig_t& qnn_op,
       param.setScalar(scalar);
     } else if (qp.paramType == QNN_PARAMTYPE_TENSOR) {
       qairt::Tensor tensor;
-      QAIRT_RETURN_IF_ERROR(FromQnnTensorRef(qp.tensorParam, api, tensor));
+      QAIRT_RETURN_IF_ERROR(FromQnnTensor(qp.tensorParam, api, tensor));
       param.setTensor(tensor);
     }
     params.push_back(std::move(param));
@@ -378,7 +356,7 @@ Ort::Status FromQnnOpConfig(const Qnn_OpConfig_t& qnn_op,
   inputs.reserve(v1.numOfInputs);
   for (uint32_t i = 0; i < v1.numOfInputs; ++i) {
     qairt::Tensor t;
-    QAIRT_RETURN_IF_ERROR(FromQnnTensorRef(v1.inputTensors[i], api, t));
+    QAIRT_RETURN_IF_ERROR(FromQnnTensor(v1.inputTensors[i], api, t));
     inputs.push_back(std::move(t));
   }
   out.setInputs(inputs);
@@ -388,7 +366,7 @@ Ort::Status FromQnnOpConfig(const Qnn_OpConfig_t& qnn_op,
   outputs.reserve(v1.numOfOutputs);
   for (uint32_t i = 0; i < v1.numOfOutputs; ++i) {
     qairt::Tensor t;
-    QAIRT_RETURN_IF_ERROR(FromQnnTensorRef(v1.outputTensors[i], api, t));
+    QAIRT_RETURN_IF_ERROR(FromQnnTensor(v1.outputTensors[i], api, t));
     outputs.push_back(std::move(t));
   }
   out.setOutputs(outputs);

@@ -1,147 +1,60 @@
 // Copyright (c) Qualcomm Innovation Center, Inc. All rights reserved.
 // SPDX-License-Identifier: MIT
-
 #ifdef USE_QAIRT_API
-
 #include "core/providers/qnn/builder/qairt_backend_manager.h"
-
+#include "core/providers/qnn/builder/qairt_type_convert.h"
 #include "QairtCpp/QairtApi.hpp"
+#include "QairtCpp/QairtBackend.hpp"
+#include "QairtCpp/QairtContext.hpp"
+#include "QairtCpp/QairtLog.hpp"
 
-namespace onnxruntime {
-namespace qnn {
+namespace onnxruntime::qnn {
+QairtBackendManager::QairtBackendManager(Config config) : config_(std::move(config)) {}
+QairtBackendManager::~QairtBackendManager() = default;
 
-// Null sentinels for C-handle accessors. Never dereferenced on the QAIRT path.
-const QNN_INTERFACE_VER_TYPE QairtBackendManager::null_interface_{};
-const Qnn_BackendHandle_t QairtBackendManager::null_backend_handle_ = nullptr;
-const Qnn_ContextHandle_t QairtBackendManager::null_context_handle_ = nullptr;
-
-std::unique_ptr<QairtBackendManager> QairtBackendManager::Create(const Config& config,
-                                                                 Ort::Status& status) {
-  std::unique_ptr<QairtBackendManager> mgr(new QairtBackendManager());
-  status = mgr->Initialize(config);
-  if (!status.IsOK()) {
-    return nullptr;
-  }
-  return mgr;
-}
-
-Ort::Status QairtBackendManager::Initialize(const Config& config) {
-  backend_type_ = config.backend_type;
-
+Ort::Status QairtBackendManager::Setup() {
+  if (backend_) return Ort::Status();
   try {
-    api_ = std::make_unique<qairt::Api>(config.backend_lib_path.c_str());
-  } catch (const std::runtime_error& e) {
-    return MAKE_EP_FAIL(("QairtBackendManager: failed to load backend library `" +
-                         config.backend_lib_path + "`: " + e.what())
-                            .c_str());
-  }
-
-  try {
-    log_ = api_->makeShared<qairt::Log>(static_cast<QairtLog_CallbackFn_t>(nullptr),
-                                        QAIRT_LOG_LEVEL_WARN);
-  } catch (const qairt::Exception& e) {
-    return MAKE_EP_FAIL(("QairtBackendManager: makeShared<Log> failed: " +
-                         std::string(e.what()))
-                            .c_str());
-  }
-
-  try {
-    backend_ = api_->makeShared<qairt::Backend>(*log_);
-  } catch (const qairt::Exception& e) {
-    return MAKE_EP_FAIL(("QairtBackendManager: makeShared<Backend> failed: " +
-                         std::string(e.what()))
-                            .c_str());
-  }
-
-  try {
-    auto context_config = api_->make<qairt::ContextConfiguration>();
-    auto context = backend_->createContext(context_config);
-    contexts_.push_back(std::make_unique<qairt::Context>(std::move(context)));
-  } catch (const qairt::Exception& e) {
-    return MAKE_EP_FAIL(("QairtBackendManager: createContext failed: " +
-                         std::string(e.what()))
-                            .c_str());
-  }
-
-  try {
-    if (config.enable_profiling) {
-      profile_ = std::make_unique<qairt::Profile>(backend_->createProfile(QAIRT_PROFILE_LEVEL_BASIC));
-    }
-  } catch (const qairt::Exception& e) {
-    return MAKE_EP_FAIL(("QairtBackendManager: createProfile failed: " +
-                         std::string(e.what()))
-                            .c_str());
-  }
-
-  return Ort::Status();
-}
-
-const QNN_INTERFACE_VER_TYPE& QairtBackendManager::GetQnnInterface() const {
-  return null_interface_;
-}
-
-const QNN_INTERFACE_VER_TYPE& QairtBackendManager::GetQnnValidatorInterface() const {
-  return null_interface_;
-}
-
-const Qnn_BackendHandle_t& QairtBackendManager::GetQnnBackendHandle() const {
-  return null_backend_handle_;
-}
-
-const Qnn_BackendHandle_t& QairtBackendManager::GetQnnValidatorBackendHandle() const {
-  return null_backend_handle_;
-}
-
-const Qnn_ContextHandle_t& QairtBackendManager::GetQnnContext(int /*index*/) {
-  return null_context_handle_;
-}
-
-QnnBackendType QairtBackendManager::GetQnnBackendType() const {
-  return backend_type_;
-}
-
-Ort::Status QairtBackendManager::GetContextBinaryBuffer(bool is_multi_soc_buffer,
-                                                        unsigned char** context_buffer,
-                                                        uint64_t& buffer_size) {
-  buffer_size = 0;
-  *context_buffer = nullptr;
-  if (is_multi_soc_buffer) {
-    return MAKE_EP_FAIL("Multi-SoC export is not implemented in QairtBackendManager.");
-  }
-  if (contexts_.empty()) {
+    auto api = std::make_unique<qairt::Api>(config_.backend_lib_path.c_str());
+    auto log = api->makeShared<qairt::Log>(static_cast<QairtLog_CallbackFn_t>(nullptr), QAIRT_LOG_LEVEL_WARN);
+    auto backend = api->makeShared<qairt::Backend>(*log);
+    api_ = std::move(api);
+    log_ = std::move(log);
+    backend_ = std::move(backend);
     return Ort::Status();
+  } catch (const std::exception& e) {
+    return MAKE_EP_FAIL(("QAIRT backend setup failed for " + config_.backend_lib_path + ": " + e.what()).c_str());
   }
+}
+qairt::Api& QairtBackendManager::GetApi() { return *api_; }
+qairt::Backend& QairtBackendManager::GetBackend() { return *backend_; }
+std::shared_ptr<qairt::Context> QairtBackendManager::GetContext() {
+  if (!context_) {
+    auto config = api_->make<qairt::ContextConfiguration>();
+    context_ = std::make_shared<qairt::Context>(backend_->createContext(config));
+  }
+  return context_;
+}
+Ort::Status QairtBackendManager::ValidateOp(const Qnn_OpConfig_t& op) {
   try {
-    uint64_t binary_size = contexts_[0]->getBinarySize();
-    if (binary_size == 0) {
-      return Ort::Status();
-    }
-    auto buffer = std::make_unique<unsigned char[]>(binary_size);
-    buffer_size = contexts_[0]->getBinary(buffer.get(), binary_size);
-    *context_buffer = buffer.release();
+    qairt::OpConfig converted;
+    RETURN_IF_ERROR(qairt_convert::FromQnnOpConfig(op, *api_, converted));
+    backend_->validateOpConfig(converted);
     return Ort::Status();
-  } catch (const qairt::Exception& e) {
-    buffer_size = 0;
-    *context_buffer = nullptr;
-    return MAKE_EP_FAIL(("QairtBackendManager::GetContextBinaryBuffer failed: " +
-                         std::string(e.what()))
-                            .c_str());
+  } catch (const std::exception& e) {
+    return MAKE_EP_FAIL(e.what());
   }
 }
-
-Ort::Status QairtBackendManager::LoadCachedQnnContextFromBuffer(
-    char* /*buffer*/,
-    uint64_t /*buffer_length*/,
-    const std::string& /*context_bin_filepath*/,
-    std::string /*node_name*/,
-    std::unordered_map<std::string, std::unique_ptr<qnn::QnnModel>>& /*qnn_models*/,
-    int64_t /*max_spill_fill_size*/,
-    const qnn::EpContextIoDispatch& /*io_dispatch*/,
-    bool /*is_multi_soc_buffer*/) {
-  return MAKE_EP_FAIL("QairtBackendManager::LoadCachedQnnContextFromBuffer not yet implemented");
+Ort::Status QairtBackendManager::ExportContext(std::vector<unsigned char>& buffer) {
+  try {
+    RETURN_IF(!context_, "QAIRT context has not been created.");
+    buffer.resize(context_->getBinarySize());
+    if (!buffer.empty()) buffer.resize(context_->getBinary(buffer.data(), buffer.size()));
+    return Ort::Status();
+  } catch (const std::exception& e) {
+    buffer.clear();
+    return MAKE_EP_FAIL(e.what());
+  }
 }
-
-}  // namespace qnn
-}  // namespace onnxruntime
-
-#endif  // USE_QAIRT_API
+}  // namespace onnxruntime::qnn
+#endif

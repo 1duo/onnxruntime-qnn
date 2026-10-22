@@ -78,9 +78,13 @@ Ort::Status ProcessGatherNDIndices(QnnModelWrapper& qnn_model_wrapper,
                                                     indices_tensor_name, std::move(qnn_indices_bytes),
                                                     logger, input_names, do_op_validation));
 
-  // QNN GatherNd validation on HTP rejects indices whose rank is greater than 4. With no batch
-  // dimensions, flattening indices[:-1] preserves the index tuples; the output is reshaped back to
-  // the ONNX shape in ProcessAttributesAndOutputs.
+  // TODO: QAIRT 2.51 does not reliably compile HTP GatherNd with rank-5 indices.
+  // FP32 is rejected during validation, while UFXP8 passes validation but graph finalization fails
+  // with QNN_COMMON_ERROR_MEM_ALLOC. The UFXP8 failure reproduces with an isolated single-GatherND
+  // ONNX model, so it is not caused by the surrounding graph. With no batch dimensions, flattening
+  // indices[:-1] preserves the index tuples; the output is reshaped back to the ONNX shape in
+  // ProcessAttributesAndOutputs. Re-test after a QAIRT upgrade and remove this workaround once
+  // rank-5 GatherNd validates and finalizes successfully on HTP.
   const auto& indices_tensor = qnn_model_wrapper.GetQnnTensorWrapper(input_names[1]);
   const auto& indices_shape = indices_tensor.GetTensorDims();
   if (qnn_model_wrapper.GetQnnBackendType() == QnnBackendType::HTP &&

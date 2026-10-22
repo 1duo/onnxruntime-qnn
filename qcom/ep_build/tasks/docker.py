@@ -10,7 +10,7 @@ from typing import Any
 
 from ..task import RunExecutablesTask
 from ..typing import TargetPyVersionT
-from ..util import DEFAULT_PYTHON_LINUX
+from ..util import DEFAULT_PYTHON_LINUX, REPO_ROOT
 
 DOCKER_BUILD_USER = "ortqnnep"
 DOCKER_REPO_ROOT = Path("/ort")
@@ -121,8 +121,13 @@ class DockerBuildAndTestTask(DockerRunTask):
             "ORT_BUILD_TOOLS_PATH": "/ort_caches/tools",
             "ORT_BUILD_PRUNE_PACKAGES": "0",
             "ORT_BUILD_UV_CACHE_PATH": "/ort_caches/uv",
+            # Keep scratch space on the bind-mounted repo tree rather than the container's
+            # writable layer, which lives on the (small) docker data-root volume.
+            "TMPDIR": str(DOCKER_REPO_ROOT / "build" / "docker-tmp"),
             "UV_LINK_MODE": "copy",
         }
+        # TMPDIR must exist or tempfile silently falls back to /tmp.
+        (REPO_ROOT / "build" / "docker-tmp").mkdir(parents=True, exist_ok=True)
 
         if qairt_sdk_root is not None:
             volumes_with_caches[qairt_sdk_root] = Path("/ort_caches/qairt")

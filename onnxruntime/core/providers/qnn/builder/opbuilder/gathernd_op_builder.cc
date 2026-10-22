@@ -75,8 +75,8 @@ Ort::Status ProcessGatherNDIndices(QnnModelWrapper& qnn_model_wrapper,
   }
 
   RETURN_IF_ERROR(utils::AddNormalizedIndicesTensor(qnn_model_wrapper, std::move(indices_info),
-                                                     indices_tensor_name, std::move(qnn_indices_bytes),
-                                                     logger, input_names, do_op_validation));
+                                                    indices_tensor_name, std::move(qnn_indices_bytes),
+                                                    logger, input_names, do_op_validation));
 
   // QNN GatherNd validation on HTP rejects indices whose rank is greater than 4. With no batch
   // dimensions, flattening indices[:-1] preserves the index tuples; the output is reshaped back to
@@ -130,7 +130,7 @@ Ort::Status GatherNDOpBuilder::ProcessInputs(QnnModelWrapper& qnn_model_wrapper,
   TensorInfo data_info = {};
   RETURN_IF_ERROR(qnn_model_wrapper.GetTensorInfo(inputs[0], data_info));
 
-  // GatherND on HTP does not support BOOL data. Cast to UINT8 before GatherND and cast the output
+  // GatherND on HTP does not support BOOL data. Cast to UFXP8 before GatherND and cast the output
   // back to BOOL in ProcessAttributesAndOutputs.
   const bool needs_bool_cast = (qnn_model_wrapper.GetQnnBackendType() == QnnBackendType::HTP &&
                                 inputs[0].type == ONNX_TENSOR_ELEMENT_DATA_TYPE_BOOL);
@@ -225,42 +225,46 @@ Ort::Status GatherNDOpBuilder::ProcessAttributesAndOutputs(QnnModelWrapper& qnn_
   bool reshape_required = (qnn_output_shape.size() != target_output_shape.size());
   bool is_graph_output = qnn_model_wrapper.IsGraphOutput(output_name);
 
-  // Check if we need to add a cast node for int64
-  bool needs_int64_cast = false;
-  if (is_graph_output) {
-    for (const auto& input_name : input_names) {
-      if (input_name.find("_cast_int32") != std::string::npos) {
-        needs_int64_cast = true;
-        break;
-      }
-    }
-  }
-  struct CastNodeInfo {
-    std::string node_name;
-    std::string input_name;
-    std::string output_name;
-  };
-  std::vector<CastNodeInfo> cast_node_info_vec;
-
   // Get the output info for the gather output tensor
   TensorInfo output_info = {};
   RETURN_IF_ERROR(qnn_model_wrapper.GetTensorInfo(output, output_info));
 
-  // If a cast to int64 is needed, add the cast node
-  if (needs_int64_cast) {
-    std::string cast_node_name = utils::UniqueNameGenerator().New(node_unit, "_cast_int64");
-    std::string cast_input_name = utils::UniqueNameGenerator().New(output_name, "_cast_int64");
-    std::string cast_output_name = output_name;
+  struct OutputCastPlan {
+    bool needs_bool_cast = false;
+    bool needs_int64_cast = false;
+    std::string bool_cast_input_name;
+    std::string int64_cast_node_name;
+    std::string int64_cast_input_name;
+  };
+
+  OutputCastPlan cast_plan;
+  cast_plan.needs_bool_cast = needs_bool_cast;
+
+  if (is_graph_output && !cast_plan.needs_bool_cast) {
+    for (const auto& input_name : input_names) {
+      if (input_name.find("_cast_int32") != std::string::npos) {
+        cast_plan.needs_int64_cast = true;
+        break;
+      }
+    }
+  }
+
+  if (cast_plan.needs_bool_cast) {
+    cast_plan.bool_cast_input_name = utils::UniqueNameGenerator().New(output_name, "_u8_to_bool_in");
+  }
+
+  if (cast_plan.needs_int64_cast) {
+    cast_plan.int64_cast_node_name = utils::UniqueNameGenerator().New(node_unit, "_cast_int64");
+    cast_plan.int64_cast_input_name = utils::UniqueNameGenerator().New(output_name, "_cast_int64");
 
     // Create the cast input tensor wrapper - use qnn_output_shape for the intermediate tensor
-    QnnTensorWrapper cast_input_tensorwrapper(cast_input_name,
+    QnnTensorWrapper cast_input_tensorwrapper(cast_plan.int64_cast_input_name,
                                               QNN_TENSOR_TYPE_NATIVE,
                                               output_info.qnn_data_type,
                                               output_info.quant_param.Copy(),
                                               std::vector<uint32_t>(qnn_output_shape));
 
     RETURN_IF_NOT(qnn_model_wrapper.AddTensorWrapper(std::move(cast_input_tensorwrapper)), "Failed to add tensor.");
-    cast_node_info_vec.push_back({cast_node_name, cast_input_name, cast_output_name});
     Qnn_TensorType_t cast_tensor_type = is_graph_output ? QNN_TENSOR_TYPE_APP_READ : QNN_TENSOR_TYPE_NATIVE;
     QnnTensorWrapper cast_output(output_name, cast_tensor_type, qnn_data_type, quant_params.Copy(),
                                  std::vector<uint32_t>(target_output_shape));
@@ -268,25 +272,23 @@ Ort::Status GatherNDOpBuilder::ProcessAttributesAndOutputs(QnnModelWrapper& qnn_
   }
 
   std::string gather_output_name = output_name;
-  const std::string bool_cast_input_name = needs_bool_cast
-                                               ? utils::UniqueNameGenerator().New(output_name, "_u8_to_bool_in")
-                                               : std::string{};
   if (reshape_required) {
     gather_output_name = utils::UniqueNameGenerator().New(output_name, "_reshape");
-  } else if (needs_bool_cast) {
-    gather_output_name = bool_cast_input_name;
-  } else if (needs_int64_cast) {
-    gather_output_name = utils::UniqueNameGenerator().New(output_name, "_cast_int64");
+  } else if (cast_plan.needs_bool_cast) {
+    gather_output_name = cast_plan.bool_cast_input_name;
+  } else if (cast_plan.needs_int64_cast) {
+    gather_output_name = cast_plan.int64_cast_input_name;
   }
 
   Qnn_DataType_t gather_qnn_data_type = qnn_data_type;
   QnnQuantParamsWrapper gather_quant_params = quant_params.Copy();
-  if (needs_bool_cast) {
+  if (cast_plan.needs_bool_cast) {
     gather_qnn_data_type = QNN_DATATYPE_UFIXED_POINT_8;
     gather_quant_params = QnnQuantParamsWrapper::PerTensor(1.0f, 0);
   }
 
-  Qnn_TensorType_t tensor_type = (!reshape_required && is_graph_output && !needs_bool_cast)
+  Qnn_TensorType_t tensor_type = (!reshape_required && is_graph_output &&
+                                  !cast_plan.needs_bool_cast && !cast_plan.needs_int64_cast)
                                      ? QNN_TENSOR_TYPE_APP_READ
                                      : QNN_TENSOR_TYPE_NATIVE;
 
@@ -305,12 +307,15 @@ Ort::Status GatherNDOpBuilder::ProcessAttributesAndOutputs(QnnModelWrapper& qnn_
                 "Failed to create GatherND node.");
 
   if (reshape_required) {
-    const bool reshape_is_graph_output = is_graph_output && !needs_bool_cast;
+    const bool reshape_is_graph_output = is_graph_output &&
+                                         !cast_plan.needs_bool_cast && !cast_plan.needs_int64_cast;
     Qnn_TensorType_t reshape_tensor_type = reshape_is_graph_output ? QNN_TENSOR_TYPE_APP_READ
                                                                    : QNN_TENSOR_TYPE_NATIVE;
-    std::string reshape_output_name = needs_bool_cast ? bool_cast_input_name : output_name;
-    if (needs_int64_cast) {
-      reshape_output_name = utils::UniqueNameGenerator().New(output_name, "_cast_int64");
+    std::string reshape_output_name = output_name;
+    if (cast_plan.needs_bool_cast) {
+      reshape_output_name = cast_plan.bool_cast_input_name;
+    } else if (cast_plan.needs_int64_cast) {
+      reshape_output_name = cast_plan.int64_cast_input_name;
     }
     QnnTensorWrapper reshape_output(reshape_output_name, reshape_tensor_type, gather_qnn_data_type,
                                     gather_quant_params.Copy(), std::vector<uint32_t>(target_output_shape));
@@ -326,9 +331,9 @@ Ort::Status GatherNDOpBuilder::ProcessAttributesAndOutputs(QnnModelWrapper& qnn_
                   "Failed to add Reshape node.");
   }
 
-  if (needs_bool_cast) {
+  if (cast_plan.needs_bool_cast) {
     Qnn_TensorType_t output_tensor_type = is_graph_output ? QNN_TENSOR_TYPE_APP_READ : QNN_TENSOR_TYPE_NATIVE;
-    const std::string& cast_input_name = reshape_required ? bool_cast_input_name : gather_output_name;
+    const std::string& cast_input_name = reshape_required ? cast_plan.bool_cast_input_name : gather_output_name;
     RETURN_IF_ERROR(qnn_model_wrapper.AddCastNode(utils::UniqueNameGenerator().New(output_name, "_u8_to_bool"),
                                                   cast_input_name,
                                                   output_name,
@@ -339,17 +344,14 @@ Ort::Status GatherNDOpBuilder::ProcessAttributesAndOutputs(QnnModelWrapper& qnn_
                                                   do_op_validation));
   }
 
-  if (needs_int64_cast) {
-    for (const auto& cast_node_info : cast_node_info_vec) {
-      // Insert cast node.
-      RETURN_IF_NOT(qnn_model_wrapper.CreateQnnNode(cast_node_info.node_name,
-                                                    QNN_OP_PACKAGE_NAME_QTI_AISW,
-                                                    QNN_OP_CAST,
-                                                    {cast_node_info.input_name},
-                                                    {cast_node_info.output_name},
-                                                    {}),
-                    "Failed to add Cast node");
-    }
+  if (cast_plan.needs_int64_cast) {
+    RETURN_IF_NOT(qnn_model_wrapper.CreateQnnNode(cast_plan.int64_cast_node_name,
+                                                  QNN_OP_PACKAGE_NAME_QTI_AISW,
+                                                  QNN_OP_CAST,
+                                                  {cast_plan.int64_cast_input_name},
+                                                  {output_name},
+                                                  {}),
+                  "Failed to add Cast node");
   }
 
   return Ort::Status();

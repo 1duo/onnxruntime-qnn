@@ -44,11 +44,9 @@ download the Qualcomm AI Runtime SDK (QAIRT SDK) from [https://qpm.qualcomm.com/
 ONNX Runtime QNN EP has been built and tested with the following SDK version combinations on Windows:
 | QNN EP Version | QAIRT SDK Version | ONNX Runtime Version |
 |----------------|-------------------|----------------------|
-| v2.7.40        | v2.51.40          | v1.29.0              |
+| v2.8.0         | v2.51.0           | v1.30.0              |
 
-> **Note**: ONNX Runtime QNN EP 2.7.40 was built for WinML with QAIRT 2.51.40 and is available only through WinML channels. 
-> **Note**: For mainline release of ORT QNN EP please use 2.7.0 which was built with QAIRT 2.51.0.
-> **Note**: ONNX Runtime QNN EP 2.7.0 and 2.7.40 were built and tested with ORT 1.29.0 but are compatible with ORT >= 1.24.1
+> **Note**: ONNX Runtime QNN EP 2.8.0 was built and tested with ORT 1.30.0 but it is compatible with ORT >= 1.24.1
 
 ## Build (Windows)
 For build instructions, please see the [BUILD page](./build.md).
@@ -73,9 +71,9 @@ For build instructions, please see the [BUILD page](./build.md).
   - This release is validated against the following dependency versions:
     | Dependency | Maven Coordinate | Version |
     |---|---|---|
-    | ONNX Runtime Android | `com.microsoft.onnxruntime:onnxruntime-android` | `1.29.0` |
+    | ONNX Runtime Android | `com.microsoft.onnxruntime:onnxruntime-android` | `1.30.0` |
     | QNN Runtime | `com.qualcomm.qti:qnn-runtime` | `2.51.0` |
-  - **Version note:** QNN EP v2.7.0 was built and tested with QAIRT SDK 2.51.0; the public Android Maven runtime artifact is versioned `2.51.0`.
+  - **Version note:** QNN EP v2.8.0 was built and tested with QAIRT SDK 2.51.0; the public Android Maven runtime artifact is versioned `2.51.0`.
 
 ## Qualcomm AI Hub
 Qualcomm AI Hub can be used to optimize and run models on Qualcomm hosted devices.
@@ -800,6 +798,7 @@ QNN EP recognizes the following multi-op patterns and fuses them into a single Q
 | `ReduceMean → Sub → Pow(2) → ReduceMean → Add(ε) → Sqrt → Div → Mul(γ) → Add(β)` | `QNN_OP_LAYER_NORM` | Matches the manual LayerNorm decomposition. Gamma and beta must be constants. |
 | `Mul(scalar constant) → Softmax` | `QNN_OP_SOFTMAX` | The scalar multiplier is folded into the beta parameter of QNN's Softmax. |
 | `ReduceL2 → Add(ε) → Div(x, .)` | `QNN_OP_L2_NORM` | Avoids fp16 overflow in the ReduceL2→Sqrt decomposition by using HTP's native L2Norm kernel. Epsilon must be a constant scalar. |
+| `SequenceConstruct(t₀..tₙ₋₁) → SequenceAt(seq, pos)` | `QNN_OP_RESHAPE × N + QNN_OP_CONCAT + QNN_OP_GATHER` | Requires homogeneous element shapes. String/complex element types fall back to CPU EP. Negative `position` values are normalized at compile time (static) or via `QNN_OP_ELEMENT_WISE_ADD + QNN_OP_ELEMENT_WISE_SELECT` (dynamic). |
 | `SequenceConstruct(t₀..tₙ₋₁) → SequenceLength(seq)` | `QNN_OP_RESHAPE` (constant N) | N is known at compile time from `SequenceConstruct`'s input count. Emits a single static `int64` constant through a trivial Reshape. Element tensors are not registered in QNN — their values are unused. |
 | `Reshape(ND→2D) → Gemm` | `QNN_OP_FULLY_CONNECTED` | Input Reshape must not be shared; Gemm: transA=0, transB=0, alpha=1, beta=1; weight must be a constant; input rank ≤ 4. CPU and HTP backends only. |
 | `Reshape(ND→2D) → Gemm → Reshape(2D→MD)` | `QNN_OP_FULLY_CONNECTED` + `QNN_OP_RESHAPE` | 3-node variant; quantized weights supported. |

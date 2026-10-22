@@ -229,6 +229,7 @@ Ort::Status GatherNDOpBuilder::ProcessAttributesAndOutputs(QnnModelWrapper& qnn_
   TensorInfo output_info = {};
   RETURN_IF_ERROR(qnn_model_wrapper.GetTensorInfo(output, output_info));
 
+  // Plan optional output casts. BOOL and INT64 data paths are mutually exclusive.
   struct OutputCastPlan {
     bool needs_bool_cast = false;
     bool needs_int64_cast = false;
@@ -240,6 +241,7 @@ Ort::Status GatherNDOpBuilder::ProcessAttributesAndOutputs(QnnModelWrapper& qnn_
   OutputCastPlan cast_plan;
   cast_plan.needs_bool_cast = needs_bool_cast;
 
+  // INT64 data is cast to INT32 before GatherND and restored only at graph outputs.
   if (is_graph_output && !cast_plan.needs_bool_cast) {
     for (const auto& input_name : input_names) {
       if (input_name.find("_cast_int32") != std::string::npos) {
@@ -249,6 +251,7 @@ Ort::Status GatherNDOpBuilder::ProcessAttributesAndOutputs(QnnModelWrapper& qnn_
     }
   }
 
+  // BOOL data runs through GatherND as UFXP8 and is cast back after any output reshape.
   if (cast_plan.needs_bool_cast) {
     cast_plan.bool_cast_input_name = utils::UniqueNameGenerator().New(output_name, "_u8_to_bool_in");
   }
@@ -271,6 +274,7 @@ Ort::Status GatherNDOpBuilder::ProcessAttributesAndOutputs(QnnModelWrapper& qnn_
     RETURN_IF_NOT(qnn_model_wrapper.AddTensorWrapper(std::move(cast_output)), "Failed to add tensor.");
   }
 
+  // Route GatherND through reshape/cast intermediates when it cannot write the ONNX output directly.
   std::string gather_output_name = output_name;
   if (reshape_required) {
     gather_output_name = utils::UniqueNameGenerator().New(output_name, "_reshape");

@@ -3,6 +3,7 @@
 
 #include "core/providers/qnn/soc_utility/soc_utils.h"
 
+#include <charconv>
 #include <climits>
 #include <stdint.h>
 #include <string>
@@ -255,16 +256,14 @@ std::optional<uint32_t> ParseHtpArchitecture(std::string_view architecture) {
   return std::nullopt;
 }
 
-std::optional<uint32_t> ParseHtpTarget(std::string_view target) {
-  constexpr std::string_view prefix = "htp-v";
-  if (target.substr(0, prefix.size()) != prefix) return std::nullopt;
-  const auto architecture = ParseHtpArchitecture(target.substr(prefix.size()));
-  return architecture && *architecture != 0 ? architecture : std::nullopt;
-}
-
-std::string MakeHtpTarget(uint32_t architecture) {
-  const auto text = std::to_string(architecture);
-  return architecture != 0 && ParseHtpArchitecture(text) ? "htp-v" + text : std::string{};
+std::optional<uint32_t> ParseSocModelTarget(std::string_view target) {
+  if (target.empty()) return std::nullopt;
+  uint32_t model = 0;
+  const auto result = std::from_chars(target.data(), target.data() + target.size(), model);
+  if (result.ec != std::errc{} || result.ptr != target.data() + target.size() || model == 0) {
+    return std::nullopt;
+  }
+  return model;
 }
 
 }  // namespace soc

@@ -129,9 +129,6 @@ class FactoryStubContext {
   // Ordered log of (key, value) pairs passed to AddKeyValuePair (e.g., hw device metadata).
   std::vector<std::pair<std::string, std::string>> added_kv_pairs;
 
-  // Ordered log of (key, value) pairs passed to AddKeyValuePair (e.g., hw device metadata).
-  std::vector<std::pair<std::string, std::string>> added_kv_pairs;
-
   // Ordered log of every OrtHardwareDevice* passed to CreateEpDevice.
   std::vector<const OrtHardwareDevice*> created_ep_devices;
 
@@ -907,11 +904,34 @@ TEST_F(QnnUnit_ProviderFactoryTest, GetSupportedDevices_AddAllocatorInfoFails_Do
 #if defined(_WIN32) && QNN_ARCH_ARM64 && \
     (QNN_API_VERSION_MAJOR > 2 || (QNN_API_VERSION_MAJOR == 2 && QNN_API_VERSION_MINOR >= 40))
 
+TEST_F(QnnUnit_ProviderFactoryTest, CreateEp_VirtualNpuRejectsConflictingSocWithSameHtpArchitecture) {
+  FactoryStubContext ctx;
+  UseFactoryStubs use(ctx);
+  QnnEpFactory factory("QNNExecutionProvider", ctx.MakeApiPtrs());
+  const auto npu = MakeFakeHwDevice(125);
+  ctx.device_type_map[npu] = OrtHardwareDeviceType_NPU;
+  ctx.virtual_devices.insert(npu);
+  ctx.env_config["target_architecture"] = "60";
+  // Both SoCs use HTP V73, but the selected SoC must still be preserved.
+  ctx.session_config["ep.qnnexecutionprovider.soc_model"] = "43";
+  const OrtHardwareDevice* devices[] = {npu};
+  const OrtKeyValuePairs* metadata[] = {reinterpret_cast<const OrtKeyValuePairs*>(kFakeToken)};
+  OrtEp* ep = nullptr;
+  OrtStatus* status = factory.CreateEp(
+      &factory, devices, metadata, 1, reinterpret_cast<const OrtSessionOptions*>(kFakeToken),
+      reinterpret_cast<const OrtLogger*>(kFakeToken), &ep);
+  ASSERT_NE(status, nullptr);
+  EXPECT_EQ(StubStatusCode(ctx, status), ORT_INVALID_ARGUMENT);
+  EXPECT_NE(StubStatusMsg(ctx, status).find("soc_model"), std::string::npos);
+  EXPECT_EQ(ep, nullptr);
+  ctx.stub_ort_api.ReleaseStatus(status);
+}
+
 TEST_F(QnnUnit_ProviderFactoryTest, GetSupportedDevices_TargetRequiresIdentity) {
   FactoryStubContext ctx;
   UseFactoryStubs use(ctx);
   QnnEpFactory factory("ep", ctx.MakeApiPtrs());
-  ctx.env_config["ep_factory.ep.qnn_target_architecture"] = "htp-v73";
+  ctx.env_config["ep_factory.ep.qnn_target_architecture"] = "60";
   OrtEpDevice* ep_devices[4] = {};
   size_t num = 0;
   OrtStatus* status = factory.GetSupportedDevices(&factory, nullptr, 0, ep_devices, 4, &num);
@@ -948,7 +968,7 @@ TEST_F(QnnUnit_ProviderFactoryTest, GetSupportedDevices_PartialFailureReleasesOu
     (QNN_API_VERSION_MAJOR > 2 || (QNN_API_VERSION_MAJOR == 2 && QNN_API_VERSION_MINOR >= 40))
 
 TEST_F(QnnUnit_ProviderFactoryTest, GetSupportedDevices_InvalidTargetRejectsBeforeAdvertising) {
-  for (const char* target : {"", "73", "htp-v", "htp-v073", "htp-v+73", "htp-v73junk", "htp-v4294967296", "htp-v999"}) {
+  for (const char* target : {"", "0", "-60", "+60", "60junk", "4294967296", "htp-v73", " 60"}) {
     SCOPED_TRACE(target);
     FactoryStubContext ctx;
     UseFactoryStubs use(ctx);
@@ -967,19 +987,18 @@ TEST_F(QnnUnit_ProviderFactoryTest, GetSupportedDevices_InvalidTargetRejectsBefo
 
 #endif  // defined(_WIN32) && QNN_ARCH_ARM64 && QNN API >= 2.40
 
-TEST(QnnHtpTargetTest, SupportedArchitecturesRoundTrip) {
-  for (uint32_t arch : {68u, 69u, 73u, 75u, 79u, 81u}) {
-    EXPECT_EQ(qnn::soc::ParseHtpTarget(qnn::soc::MakeHtpTarget(arch)), arch);
-  }
-  EXPECT_TRUE(qnn::soc::MakeHtpTarget(0).empty());
-  EXPECT_TRUE(qnn::soc::MakeHtpTarget(999).empty());
+TEST(QnnHtpTargetTest, SocModelTargetIsDistinctFromHtpArchitecture) {
+  EXPECT_EQ(qnn::soc::ParseSocModelTarget("60"), 60u);
+  EXPECT_EQ(qnn::soc::MapHtpArchFromSocModel(60), 73u);
+  EXPECT_EQ(qnn::soc::MapHtpArchFromSocModel(88), 81u);
+  EXPECT_FALSE(qnn::soc::ParseSocModelTarget("htp-v73"));
+  EXPECT_FALSE(qnn::soc::ParseSocModelTarget("0"));
+  EXPECT_FALSE(qnn::soc::ParseSocModelTarget("4294967296"));
 }
 
 TEST(QnnHtpTargetTest, SessionDefaultsAreNotConcreteTargets) {
   EXPECT_EQ(qnn::soc::ParseHtpArchitecture(""), 0u);
   EXPECT_EQ(qnn::soc::ParseHtpArchitecture("0"), 0u);
-  EXPECT_FALSE(qnn::soc::ParseHtpTarget("htp-v"));
-  EXPECT_FALSE(qnn::soc::ParseHtpTarget("htp-v0"));
   for (const char* value : {"073", "+73", "73junk", " 73", "999"}) {
     EXPECT_FALSE(qnn::soc::ParseHtpArchitecture(value));
   }
@@ -995,7 +1014,7 @@ TEST_F(QnnUnit_ProviderFactoryTest,
   QnnEpFactory factory("QNNExecutionProvider", ctx.MakeApiPtrs());
   ctx.env_config["allow_virtual_devices"] = "1";
   ctx.env_config["ep_factory.QNNExecutionProvider.qnn_hardware_device_id"] = "41304430";
-  ctx.env_config["ep_factory.QNNExecutionProvider.qnn_target_architecture"] = "htp-v73";
+  ctx.env_config["ep_factory.QNNExecutionProvider.qnn_target_architecture"] = "60";
 
   OrtEpDevice* ep_devices[4] = {};
   size_t num = 0;
@@ -1007,12 +1026,12 @@ TEST_F(QnnUnit_ProviderFactoryTest,
                         std::pair<std::string, std::string>{kOrtHardwareDevice_MetadataKey_IsVirtual, "1"}) !=
               ctx.added_kv_pairs.end());
   EXPECT_TRUE(std::find(ctx.added_kv_pairs.begin(), ctx.added_kv_pairs.end(),
-                        std::pair<std::string, std::string>{"target_architecture", "htp-v73"}) !=
+                        std::pair<std::string, std::string>{"target_architecture", "60"}) !=
               ctx.added_kv_pairs.end());
 }
 
 TEST_F(QnnUnit_ProviderFactoryTest,
-       GetSupportedDevices_Arm64CompilerOptInRequiresTargetIdentityWhenNpuIsUnavailable) {
+       GetSupportedDevices_Arm64OptInWithoutIdentityPreservesHostDiscovery) {
   FactoryStubContext ctx;
   UseFactoryStubs use(ctx);
   QnnEpFactory factory("QNNExecutionProvider", ctx.MakeApiPtrs());
@@ -1021,10 +1040,9 @@ TEST_F(QnnUnit_ProviderFactoryTest,
   OrtEpDevice* ep_devices[4] = {};
   size_t num = 0;
   OrtStatus* status = factory.GetSupportedDevices(&factory, nullptr, 0, ep_devices, 4, &num);
-  ASSERT_NE(status, nullptr);
-  EXPECT_EQ(StubStatusCode(ctx, status), ORT_FAIL);
-  EXPECT_EQ(num, 0u);
-  ctx.stub_ort_api.ReleaseStatus(status);
+  ASSERT_EQ(status, nullptr);
+  EXPECT_EQ(num, 1u);  // Preserve the generic discovery path from #896.
+
 }
 
 #endif  // defined(_WIN32) && QNN_ARCH_ARM64 && QNN API >= 2.40
@@ -1041,6 +1059,7 @@ TEST_F(QnnUnit_ProviderFactoryTest,
 TEST_F(QnnUnit_ProviderFactoryTest, GetSupportedDevices_RepeatedSynthesisRetainsHardware) {
   FactoryStubContext ctx;
   UseFactoryStubs use(ctx);
+  ctx.env_config["allow_virtual_devices"] = "1";
   {
     QnnEpFactory factory("ep", ctx.MakeApiPtrs());
     for (int i = 0; i < 2; ++i) {
@@ -1148,125 +1167,6 @@ TEST_F(QnnUnit_ProviderFactoryTest, GetSupportedDevices_CrossCompileHost_Explici
 }
 
 #endif  // !QNN_ARCH_ARM64
-
-TEST_F(QnnUnit_ProviderFactoryTest, GetSupportedDevices_RealNpuPresent_NoSynthesis) {
-  FactoryStubContext ctx;
-  UseFactoryStubs use(ctx);
-  QnnEpFactory factory("ep", ctx.MakeApiPtrs());
-
-  // Pass a real Qualcomm NPU — synthesis should NOT fire.
-  OrtHardwareDevice* npu = MakeFakeHwDevice(31);
-  ctx.device_type_map[npu] = OrtHardwareDeviceType_NPU;
-  ctx.device_vendor_map[npu] = kQualcommVendorId;
-
-  const OrtHardwareDevice* devices[] = {npu};
-  OrtEpDevice* ep_devices[4] = {nullptr};
-  size_t num = 0;
-  EXPECT_EQ(factory.GetSupportedDevices(&factory, devices, 1, ep_devices, 4, &num), nullptr);
-
-  // Only the real NPU, no synthesis.
-  EXPECT_EQ(num, 1u);
-  ASSERT_EQ(ctx.created_ep_devices.size(), 1u);
-  EXPECT_EQ(ctx.created_ep_devices[0], npu);
-
-  // No IsVirtual metadata should have been added.
-  bool found_is_virtual = false;
-  for (const auto& kv : ctx.added_kv_pairs) {
-    if (kv.first == kOrtHardwareDevice_MetadataKey_IsVirtual) {
-      found_is_virtual = true;
-      break;
-    }
-  }
-  EXPECT_FALSE(found_is_virtual) << "Real NPU present — no synthesis, no IsVirtual metadata.";
-}
-
-// ===========================================================================
-// Group 3b: GetSupportedDevicesImpl — x86/x64 cross-compile NPU synthesis.
-//
-// On x86/x64 hosts (no real Qualcomm NPU), GetSupportedDevicesImpl should
-// synthesize a virtual NPU OrtHardwareDevice for AOT cross-compilation.
-// ===========================================================================
-
-#if !defined(__aarch64__) && !defined(_M_ARM64)
-
-TEST_F(QnnUnit_ProviderFactoryTest, GetSupportedDevices_CrossCompileHost_AdvertisesVirtualNpu) {
-  FactoryStubContext ctx;
-  UseFactoryStubs use(ctx);
-  QnnEpFactory factory("ep", ctx.MakeApiPtrs());
-
-  // Pass no devices at all — no NPU in the input array.
-  OrtEpDevice* ep_devices[4] = {nullptr};
-  size_t num = 0;
-  EXPECT_EQ(factory.GetSupportedDevices(&factory, nullptr, 0, ep_devices, 4, &num), nullptr);
-
-  // On x86, the cross-compile NPU synthesis should fire.
-  EXPECT_GE(num, 1u);
-  ASSERT_FALSE(ctx.created_ep_devices.empty());
-
-  // The synthesized device must have IsVirtual="1" metadata.
-  bool found_is_virtual = false;
-  for (const auto& kv : ctx.added_kv_pairs) {
-    if (kv.first == kOrtHardwareDevice_MetadataKey_IsVirtual && kv.second == "1") {
-      found_is_virtual = true;
-      break;
-    }
-  }
-  EXPECT_TRUE(found_is_virtual) << "Synthesized NPU on x86 must have IsVirtual=1 metadata.";
-}
-
-TEST_F(QnnUnit_ProviderFactoryTest, GetSupportedDevices_CrossCompileHost_CpuDeviceUnaffected) {
-  FactoryStubContext ctx;
-  UseFactoryStubs use(ctx);
-  QnnEpFactory factory("ep", ctx.MakeApiPtrs());
-
-  // Pass only a CPU device — no NPU in the input array.
-  OrtHardwareDevice* cpu = MakeFakeHwDevice(30);
-  ctx.device_type_map[cpu] = OrtHardwareDeviceType_CPU;
-  ctx.device_vendor_map[cpu] = 0;
-
-  const OrtHardwareDevice* devices[] = {cpu};
-  OrtEpDevice* ep_devices[4] = {nullptr};
-  size_t num = 0;
-  EXPECT_EQ(factory.GetSupportedDevices(&factory, devices, 1, ep_devices, 4, &num), nullptr);
-
-  // Both CPU (from input) and synthesized virtual NPU (from cross-compile path).
-  EXPECT_EQ(num, 2u);
-  ASSERT_EQ(ctx.created_ep_devices.size(), 2u);
-  EXPECT_EQ(ctx.created_ep_devices[0], cpu);
-}
-
-TEST_F(QnnUnit_ProviderFactoryTest, GetSupportedDevices_CrossCompileHost_ExplicitNpuNoDoubleSynthesis) {
-  FactoryStubContext ctx;
-  UseFactoryStubs use(ctx);
-  QnnEpFactory factory("ep", ctx.MakeApiPtrs());
-
-  // Pass an explicit Qualcomm NPU device on x86 — synthesis should NOT fire.
-  OrtHardwareDevice* npu = MakeFakeHwDevice(32);
-  ctx.device_type_map[npu] = OrtHardwareDeviceType_NPU;
-  ctx.device_vendor_map[npu] = kQualcommVendorId;
-
-  const OrtHardwareDevice* devices[] = {npu};
-  OrtEpDevice* ep_devices[4] = {nullptr};
-  size_t num = 0;
-  EXPECT_EQ(factory.GetSupportedDevices(&factory, devices, 1, ep_devices, 4, &num), nullptr);
-
-  // Only the explicitly provided NPU — no virtual synthesis despite being on x86.
-  EXPECT_EQ(num, 1u);
-  ASSERT_EQ(ctx.created_ep_devices.size(), 1u);
-  EXPECT_EQ(ctx.created_ep_devices[0], npu);
-
-  // No IsVirtual metadata should have been added for the real NPU.
-  bool found_is_virtual = false;
-  for (const auto& kv : ctx.added_kv_pairs) {
-    if (kv.first == kOrtHardwareDevice_MetadataKey_IsVirtual) {
-      found_is_virtual = true;
-      break;
-    }
-  }
-  EXPECT_FALSE(found_is_virtual) << "Explicit NPU on x86 — no synthesis, no IsVirtual metadata.";
-}
-
-#endif  // !__aarch64__ && !_M_ARM64
 
 TEST_F(QnnUnit_ProviderFactoryTest, GetSupportedDevices_RealNpuPresent_NoSynthesis) {
   FactoryStubContext ctx;
@@ -1654,14 +1554,14 @@ TEST_F(QnnUnit_ProviderFactoryHtpTest,
 TEST_F(QnnUnit_ProviderFactoryHtpTest,
        CreateEp_VirtualNpu_InjectsLockdownAotDefaultsAndTarget) {
   FactoryStubContext ctx;
-  UseGlobalFactoryStubs use(ctx);
+  UseFactoryStubs use(ctx);
   QnnEpFactory factory("QNNExecutionProvider", ctx.MakeApiPtrs());
 
   OrtHardwareDevice* virtual_npu = MakeFakeHwDevice(25);
   ctx.device_type_map[virtual_npu] = OrtHardwareDeviceType_NPU;
   ctx.device_vendor_map[virtual_npu] = kQualcommVendorId;
   ctx.virtual_devices.insert(virtual_npu);
-  ctx.env_config["target_architecture"] = "htp-v73";
+  ctx.env_config["target_architecture"] = "60";
 
   auto* fake_session_opts = reinterpret_cast<OrtSessionOptions*>(kFakeToken);
   auto* fake_logger = reinterpret_cast<OrtLogger*>(kFakeToken);
@@ -1682,6 +1582,7 @@ TEST_F(QnnUnit_ProviderFactoryHtpTest,
                        });
   };
   EXPECT_TRUE(has_entry("htp_arch", "73"));
+  EXPECT_TRUE(has_entry("soc_model", "60"));
   EXPECT_TRUE(has_entry("ep.context_enable", "1"));
   EXPECT_TRUE(has_entry("enable_htp_prepare_only", "1"));
   EXPECT_TRUE(has_entry("enable_htp_cross_device_prepare", "1"));

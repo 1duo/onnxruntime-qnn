@@ -1506,7 +1506,7 @@ class TaskLibrary:
         def test_ort_windows_x86_64_internal_symbols(self, plan: Plan) -> str:
             return plan.add_step(
                 BuildEpWindowsTask(
-                    "Testing ONNX Runtime for Windows on x86_64 with QNN EP internal unit-test symbols",
+                    "Testing ONNX Runtime for Windows on x86_64 with QNN EP internal test symbols",
                     self.__venv_path,
                     "x86_64",
                     self.__config,
@@ -1514,7 +1514,7 @@ class TaskLibrary:
                     self.__ort_prebuilt_root,
                     self.__qairt_sdk_root,
                     "test",
-                    qnn_internal_ut_symbols=True,
+                    qnn_internal_test_symbols=True,
                 )
             )
 

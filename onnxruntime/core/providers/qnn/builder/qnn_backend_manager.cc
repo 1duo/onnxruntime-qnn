@@ -1886,10 +1886,6 @@ Ort::Status QnnBackendManager::ReleaseContext() {
     contexts_.clear();
     context_map_.clear();
   }
-  {
-    std::lock_guard<std::mutex> lock(ep_context_handle_map_mutex_);
-    ep_context_handle_map_.clear();
-  }
 
   context_created_ = false;
   return Ort::Status();

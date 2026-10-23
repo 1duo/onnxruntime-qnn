@@ -15,6 +15,8 @@ namespace onnxruntime {
 
 class SharedContext {
  public:
+  using QnnModelOwnerToken = std::shared_ptr<const void>;
+
   static SharedContext& GetInstance() {
     static SharedContext instance_;
     return instance_;
@@ -54,6 +56,7 @@ class SharedContext {
 
   bool SetSharedQnnModel(std::vector<std::unique_ptr<qnn::QnnModel>>&& shared_qnn_models,
                          const std::shared_ptr<qnn::QnnBackendManager>& producer,
+                         const QnnModelOwnerToken& owner_token,
                          std::string& duplicate_graph_names) {
     const std::lock_guard<std::mutex> lock(mtx_);
     bool graph_exist = false;
@@ -64,7 +67,7 @@ class SharedContext {
                                return entry.producer == producer && entry.qnn_model->Name() == model_name;
                              });
       if (it == shared_qnn_models_.end()) {
-        shared_qnn_models_.push_back(SharedQnnModel{std::move(shared_qnn_model), producer});
+        shared_qnn_models_.push_back(SharedQnnModel{std::move(shared_qnn_model), producer, owner_token});
       } else {
         duplicate_graph_names.append(model_name + " ");
         graph_exist = true;
@@ -74,11 +77,11 @@ class SharedContext {
     return graph_exist;
   }
 
-  void RemoveSharedQnnModels(const std::shared_ptr<qnn::QnnBackendManager>& producer) {
+  void RemoveSharedQnnModels(const QnnModelOwnerToken& owner_token) {
     const std::lock_guard<std::mutex> lock(mtx_);
     shared_qnn_models_.erase(
         std::remove_if(shared_qnn_models_.begin(), shared_qnn_models_.end(),
-                       [&producer](const SharedQnnModel& entry) { return entry.producer == producer; }),
+                       [&owner_token](const SharedQnnModel& entry) { return entry.owner_token == owner_token; }),
         shared_qnn_models_.end());
   }
 
@@ -124,6 +127,7 @@ class SharedContext {
   struct SharedQnnModel {
     std::unique_ptr<qnn::QnnModel> qnn_model;
     std::shared_ptr<qnn::QnnBackendManager> producer;
+    QnnModelOwnerToken owner_token;
   };
 
   SharedContext() = default;

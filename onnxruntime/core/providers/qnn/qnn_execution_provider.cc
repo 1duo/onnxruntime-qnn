@@ -1734,7 +1734,7 @@ QnnEp::QnnEp(const QnnEpFactory& factory,
 }
 
 QnnEp::~QnnEp() {
-  SharedContext::GetInstance().RemoveSharedQnnModels(qnn_backend_manager_);
+  SharedContext::GetInstance().RemoveSharedQnnModels(shared_qnn_model_owner_);
 
   if (qnn_backend_manager_) {
     auto thread_id = std::this_thread::get_id();
@@ -2983,6 +2983,7 @@ OrtStatus* QnnEp::CompileContextModel(const OrtGraph** graphs,
     std::string duplicate_graph_names;
     bool has_duplicate_graph = SharedContext::GetInstance().SetSharedQnnModel(std::move(shared_qnn_models),
                                                                               qnn_backend_manager_,
+                                                                              shared_qnn_model_owner_,
                                                                               duplicate_graph_names);
     if (has_duplicate_graph) {
       return ort_api.CreateStatus(ORT_EP_FAIL,

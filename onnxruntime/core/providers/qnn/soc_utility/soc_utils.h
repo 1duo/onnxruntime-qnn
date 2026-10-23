@@ -30,10 +30,9 @@ uint32_t MapHtpArchFromSocModel(uint32_t soc_model);
 // unsupported or non-canonical values return nullopt.
 std::optional<uint32_t> ParseHtpArchitecture(std::string_view architecture);
 
-// EP metadata uses a concrete target (e.g. "htp-v73"), so automatic architecture
-// is not accepted. These wrappers reuse the session-option architecture parser.
-std::optional<uint32_t> ParseHtpTarget(std::string_view target);
-std::string MakeHtpTarget(uint32_t architecture);
+// Chromium target_architecture metadata carries a nonzero decimal QNN SoC model,
+// shared by GPU and NPU. It is not a hardware device ID or HTP architecture.
+std::optional<uint32_t> ParseSocModelTarget(std::string_view target);
 
 }  // namespace soc
 }  // namespace qnn

@@ -6,6 +6,7 @@
 #include "core/providers/qnn/qnn_external_resource_importer.h"
 #include "core/providers/qnn/builder/qnn_utils.h"
 
+#include <exception>
 #include <new>
 #include <sstream>
 #include <string>
@@ -207,7 +208,12 @@ OrtStatus* ORT_API_CALL QnnExternalResourceImporterImpl::CreateTensorFromMemoryI
   const auto* qnn_handle = static_cast<const QnnExternalMemoryHandle*>(mem_handle);
 
   size_t tensor_size_bytes = 0;
-  tensor_size_bytes = qnn::utils::GetOnnxTensorDataSizeInBytes(gsl::span{tensor_desc->shape, tensor_desc->rank}, tensor_desc->element_type);
+  try {
+    tensor_size_bytes = qnn::utils::GetOnnxTensorDataSizeInBytes(
+        gsl::span{tensor_desc->shape, tensor_desc->rank}, tensor_desc->element_type);
+  } catch (const std::exception& ex) {
+    return impl.ort_api_.CreateStatus(ORT_INVALID_ARGUMENT, ex.what());
+  }
 
   size_t available_size = qnn_handle->descriptor.size_bytes - qnn_handle->descriptor.offset_bytes - tensor_desc->offset_bytes;
 

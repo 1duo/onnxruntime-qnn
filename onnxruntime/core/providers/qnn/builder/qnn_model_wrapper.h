@@ -87,7 +87,7 @@ class QnnModelWrapper {
   // Add to internal param wrapper table
   bool AddParamWrapper(QnnParamWrapper&& param_wrapper);
 
-  const QnnTensorWrapper& GetQnnTensorWrapper(const std::string& tensor_name);
+  const QnnTensorWrapper& GetQnnTensorWrapper(const std::string& tensor_name) const;
 
   // Utility function to validate a QNN node. Does not modify this object's state.
   Ort::Status ValidateQnnNode(const std::string& node_name,
@@ -352,6 +352,15 @@ class QnnModelWrapper {
     return AddTransposeNode(node_index, input_name, output_name, input_shape, transpose_perm, output_shape,
                             tensor_data_type, quantize_param, do_op_validation, is_for_input, is_for_output);
   }
+
+  // Registers a static bias initializer tensor with the given shape and quant params.
+  // Used when bias data is already correctly quantized and only needs to be registered.
+  Ort::Status AddStaticBiasTensor(const std::string& bias_name,
+                                  const std::vector<uint32_t>& bias_shape,
+                                  Qnn_DataType_t data_type,
+                                  QnnQuantParamsWrapper quant_params,
+                                  std::vector<uint8_t> bias_data,
+                                  std::vector<std::string>& input_names);
 
   Ort::Status UnpackInitializerData(const OrtValueInfo* initializer,
                                     std::vector<uint8_t>& unpacked_tensor,

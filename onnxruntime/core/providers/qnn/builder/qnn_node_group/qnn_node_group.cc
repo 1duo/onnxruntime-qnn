@@ -118,7 +118,9 @@ static std::unordered_map<std::string, std::vector<FusionFunc>> fusions = {
     {"Concat", {SliceConcatSpaceToDepthFusion::TryFusion}},
     {"SequenceConstruct", {SequenceAtFusion::TryFusion, SequenceLengthFusion::TryFusion}},
     {"Transpose", {ChannelShuffleFusion::TryFusion, TransposeReshapeTransposeFusion::TryFusion}}};
+
 void registerUDO(const std::string& node_type, const std::string& op_package) {
+  std::function<std::unique_ptr<IQnnNodeGroup>(QnnModelWrapper & qnn_model_wrapper,
                                                const OrtNodeUnit& udo_node_unit,
                                                const std::unordered_map<const OrtNode*, const OrtNodeUnit*>& node_to_node_unit,
                                                const std::unordered_map<const OrtNodeUnit*, const IQnnNodeGroup*>& node_unit_to_qnn_node_group,

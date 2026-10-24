@@ -5,9 +5,8 @@
 
 #include <array>
 #include <memory>
-#include <string>
+#include <string_view>
 #include <unordered_map>
-#include <vector>
 
 #include "core/providers/qnn/builder/qnn_node_group/qnn_node_group.h"
 #include "core/providers/qnn/ort_api.h"
@@ -21,13 +20,15 @@ class QnnModelWrapper;
 /// Fuses the two-node pattern
 ///   SequenceConstruct(t0..tN-1) -> seq -> SequenceLength(seq) -> int64 scalar N
 /// into a single QNN_OP_RESHAPE that moves a compile-time int64 constant to the
-/// graph output.
+/// graph output (shape {1}, not {} — QNN HTP rejects rank-0 output tensors).
 ///
 /// Rationale: The QNN EP type system is tensor-only; a standalone SequenceLength
 /// op builder cannot be registered because the sequence-typed input edge cannot
 /// be expressed as a QnnTensor. When the upstream is SequenceConstruct, N is
 /// fully determined at compile time from the input count, so the fusion emits
 /// only a static constant and a trivial Reshape — no element-tensor processing.
+/// ORT's constant-fold pass does not traverse sequence-typed edges, so this
+/// pattern reaches the EP unfolded.
 ///
 /// Constraints (TryFusion returns nullptr if any is violated):
 ///   - The sequence output of SequenceConstruct must have exactly one

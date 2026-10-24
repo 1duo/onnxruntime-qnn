@@ -632,12 +632,12 @@ class TaskLibrary:
                 )
             )
 
-        @public_task("Build ONNX Runtime for x86_64 with QNN EP internal unit-test symbols")
+        @public_task("Build ONNX Runtime for x86_64 with QNN EP internal test symbols")
         @depends(["create_venv"])
         def build_ort_linux_x86_64_internal_symbols(self, plan: Plan) -> str:
             return plan.add_step(
                 BuildEpLinuxTask(
-                    "Building ONNX Runtime for Linux on x86_64 with QNN EP internal unit-test symbols",
+                    "Building ONNX Runtime for Linux on x86_64 with QNN EP internal test symbols",
                     self.__venv_path,
                     "linux",
                     "x86_64",
@@ -646,7 +646,7 @@ class TaskLibrary:
                     self.__ort_prebuilt_root,
                     self.__qairt_sdk_root,
                     "build",
-                    qnn_internal_ut_symbols=True,
+                    qnn_internal_test_symbols=True,
                     build_dir_suffix="internal-symbols",
                 )
             )
@@ -689,7 +689,7 @@ class TaskLibrary:
                     self.__qairt_sdk_root,
                     "build",
                     extra_args=["--enable-coverage"],
-                    qnn_internal_ut_symbols=True,
+                    qnn_internal_test_symbols=True,
                 )
             )
 
@@ -712,7 +712,7 @@ class TaskLibrary:
                             self.__qairt_sdk_root,
                             "build",
                             extra_args=["--enable-coverage"],
-                            qnn_internal_ut_symbols=True,
+                            qnn_internal_test_symbols=True,
                         ),
                         GenerateCoverageTask(
                             "Generating HTML coverage report",
@@ -845,12 +845,12 @@ class TaskLibrary:
                 )
             )
 
-        @public_task("Build ONNX Runtime for x86_64 with QNN EP internal unit-test symbols")
+        @public_task("Build ONNX Runtime for x86_64 with QNN EP internal test symbols")
         @depends(["create_venv"])
         def build_ort_windows_x86_64_internal_symbols(self, plan: Plan) -> str:
             return plan.add_step(
                 BuildEpWindowsTask(
-                    "Building ONNX Runtime for Windows on x86_64 with QNN EP internal unit-test symbols",
+                    "Building ONNX Runtime for Windows on x86_64 with QNN EP internal test symbols",
                     self.__venv_path,
                     "x86_64",
                     self.__config,
@@ -860,7 +860,7 @@ class TaskLibrary:
                     "build",
                     build_nuget=False,
                     build_archive=False,
-                    qnn_internal_ut_symbols=True,
+                    qnn_internal_test_symbols=True,
                 )
             )
 
@@ -1498,6 +1498,23 @@ class TaskLibrary:
                     self.__ort_prebuilt_root,
                     self.__qairt_sdk_root,
                     "test",
+                )
+            )
+
+        @task
+        @depends(["build_ort_windows_x86_64_internal_symbols"])
+        def test_ort_windows_x86_64_internal_symbols(self, plan: Plan) -> str:
+            return plan.add_step(
+                BuildEpWindowsTask(
+                    "Testing ONNX Runtime for Windows on x86_64 with QNN EP internal test symbols",
+                    self.__venv_path,
+                    "x86_64",
+                    self.__config,
+                    self.__target_py_version,
+                    self.__ort_prebuilt_root,
+                    self.__qairt_sdk_root,
+                    "test",
+                    qnn_internal_test_symbols=True,
                 )
             )
 

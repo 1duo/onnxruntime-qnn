@@ -374,7 +374,7 @@ Ort::Status IsHtpUsrDrvEnabled(const std::string& backend_lib_dir, const uint32_
     if (!std::filesystem::exists(GetHtpUsrDrvPath())) {
       return Ort::Status();
     }
-  } catch (std::filesystem::filesystem_error) {
+  } catch (const std::filesystem::filesystem_error&) {
     return Ort::Status();
   }
 
@@ -420,7 +420,7 @@ Ort::Status IsHtpUsrDrvEnabled(const std::string& backend_lib_dir, const uint32_
         !std::filesystem::exists(backend_lib_dir_path / skel_lib_path)) {
       enabled = true;
     }
-  } catch (std::filesystem::filesystem_error) {
+  } catch (const std::filesystem::filesystem_error&) {
     return Ort::Status();
   }
 

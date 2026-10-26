@@ -1,32 +1,16 @@
 // Copyright (c) Qualcomm Technologies, Inc. and/or its subsidiaries.
 // SPDX-License-Identifier: MIT
 //
-// Component-level unit tests for QnnEpFactory (qnn_provider_factory.cc).
-//
-// All tests here run without loading any real QNN backend shared library, and
-// without constructing a real QnnEp instance. They exercise:
-//   - Basic getters (name/vendor/version/vendor-id/is-stream-aware) and the
-//     ctor's CreateMemoryInfo_V2 wiring.
-//   - Trivial factory methods that never dispatch through the OrtApi tables
-//     (CreateDataTransferImpl, ReleaseEpImpl(nullptr)).
-//   - CreateEpFactories / ReleaseEpFactory extern-"C" entry points, focused
-//     on argument-validation and version-check error paths that do NOT
-//     reach the QnnEpFactory ctor's Ort::InitApi() (which would clobber the
-//     global api table that gtest itself uses).
-//   - GetSupportedDevicesImpl device filtering + NPU-synthesis fallback.
-//   - GetHardwareDeviceIncompatibilityDetailsImpl / ValidateCompiledModel-
-//     CompatibilityInfoImpl error paths that stop before std::make_unique<QnnEp>.
-//
-// Real-QnnEp paths (autoep CreateEpImpl clone + AddSessionConfigEntry, and
-// Validate / Incompatibility temp-EP construction) are covered by the
-// QnnUnit_ProviderFactoryHtpTest fixture at the end of this file; those
-// tests GTEST_SKIP() when the platform HTP backend is unavailable. This mirrors
-// QnnUnit_BackendManagerHtpTest — component-level tests with a real backend
-// load but no ORT session.
+// Component tests for factory enumeration, backend selection, compatibility
+// probes, and resource ownership. QnnEp construction is lazy, so default
+// selection tests do not need a QNN backend library or an ORT session.
 
 #if !defined(ORT_MINIMAL_BUILD) && QNN_EP_INTERNAL_SYMBOL_ACCESS
 
+#include <algorithm>
 #include <cstdint>
+#include <filesystem>
+#include <memory>
 #include <cstring>
 #include <string>
 #include <unordered_map>
@@ -41,6 +25,8 @@
 #include "test/providers/qnn/infra/qnn_test_windows_compat.h"
 
 #include "core/providers/qnn/qnn_provider_factory.h"
+#include "core/providers/qnn/genie/genie_backend_manager.h"
+#include "core/providers/qnn/soc_utility/soc_utils.h"
 #include "onnxruntime_config.h"
 #include "onnxruntime_ep_device_ep_metadata_keys.h"
 
@@ -79,6 +65,14 @@ static OrtHardwareDevice* MakeFakeHwDevice(uintptr_t tag) {
 // The stubs treat these as opaque tokens and never dereference them.
 static constexpr uintptr_t kFakeToken = 0x1;
 
+// Convenience: Qualcomm vendor ID computed the same way as in the factory
+// ('Q' | 'C'<<8 | 'O'<<16 | 'M'<<24).
+static constexpr uint32_t kQualcommVendorId =
+    static_cast<uint32_t>('Q') |
+    (static_cast<uint32_t>('C') << 8) |
+    (static_cast<uint32_t>('O') << 16) |
+    (static_cast<uint32_t>('M') << 24);
+
 // ---------------------------------------------------------------------------
 // FactoryStubContext
 //
@@ -116,7 +110,33 @@ class FactoryStubContext {
   // per test before calling into factory code.
   std::unordered_map<const OrtHardwareDevice*, OrtHardwareDeviceType> device_type_map;
   std::unordered_map<const OrtHardwareDevice*, uint32_t> device_vendor_map;
-  std::unordered_map<std::string, std::string> env_config;
+  using KeyValues = std::unordered_map<std::string, std::string>;
+  KeyValues env_config;
+  std::unordered_map<const OrtHardwareDevice*, KeyValues> hardware_metadata;
+  std::unordered_map<const OrtHardwareDevice*, uint32_t> device_ids;
+  std::unordered_map<const OrtHardwareDevice*, KeyValues> ep_metadata;
+  std::unordered_map<const OrtHardwareDevice*, KeyValues> ep_options;
+  std::vector<std::unique_ptr<KeyValues>> key_values;
+  std::vector<const OrtHardwareDevice*> synthesized_devices;
+  std::vector<const OrtHardwareDevice*> released_hardware;
+  std::vector<std::string> log_messages;
+  bool fail_get_env_config = false;
+  bool fail_create_hardware = false;
+  int fail_create_ep_device_call = 0;
+  int create_ep_device_calls = 0;
+  int create_session_options_calls = 0;
+  int release_session_options_calls = 0;
+  OrtLoggingLevel log_severity = ORT_LOGGING_LEVEL_FATAL;
+
+  OrtHardwareDevice* AddDevice(OrtHardwareDeviceType type, bool is_virtual = false,
+                               uint32_t vendor = kQualcommVendorId, uint32_t id = 0) {
+    auto* device = MakeFakeHwDevice(next_device_tag_++);
+    device_type_map[device] = type;
+    device_vendor_map[device] = vendor;
+    device_ids[device] = id;
+    if (is_virtual) hardware_metadata[device][kOrtHardwareDevice_MetadataKey_IsVirtual] = "1";
+    return device;
+  }
 
   // Ordered log of (key, value) pairs passed to AddKeyValuePair (e.g., hw device metadata).
   std::vector<std::pair<std::string, std::string>> added_kv_pairs;
@@ -145,23 +165,18 @@ class FactoryStubContext {
   // If true, MakeFakeApiBase()'s GetApi returns nullptr (fallback-api failure).
   bool fail_get_api = false;
 
-  // Count of DeviceEpIncompatibilityDetails_SetDetails invocations.
+  // Capture the compatibility result, including failures reported by the EP.
   int set_details_calls = 0;
+  uint32_t last_incompatibility_reason = OrtDeviceEpIncompatibility_NONE;
+  int32_t last_incompatibility_error_code = 0;
+  std::string last_incompatibility_message;
 
-  // Session-config plumbing (used by Group 6 HTP tests):
-  //   session_config          — populated per test to pre-set entries that
-  //                             HasSessionConfigEntry / GetSessionConfigEntry
-  //                             report to the factory (e.g., pre-loading a
-  //                             backend_path to skip the autoep branch).
-  //   added_config_entries    — records the (key, value) pairs written by
-  //                             the factory via AddSessionConfigEntry (used to
-  //                             verify the autoep + Validate/Incompatibility
-  //                             temp-EP paths wired the expected keys).
-  //   clone_session_options_calls — counts CloneSessionOptions calls (verifies
-  //                             the autoep branch cloned before mutating).
-  //
-  // Groups 1–5 never populate these (empty maps mean autoep is unreachable
-  // without an NPU/GPU device), so behaviour is backwards-compatible.
+  // Session-config plumbing for construction and compatibility probes:
+  //   session_config — entries pre-populated by each test and read by QnnEp.
+  //   added_config_entries — entries written by the factory (only CPU probes
+  //                          should inject backend_type).
+  //   clone_session_options_calls — verifies default selection leaves the
+  //                                 caller's session options unchanged.
   std::unordered_map<std::string, std::string> session_config;
   std::vector<std::pair<std::string, std::string>> added_config_entries;
   int clone_session_options_calls = 0;
@@ -188,6 +203,8 @@ class FactoryStubContext {
   static thread_local FactoryStubContext* current_;
 
  private:
+  uintptr_t next_device_tag_ = 0x100;
+
   void InstallOrtApiStubs() {
     stub_ort_api.GetEpApi = []() noexcept -> const OrtEpApi* {
       auto* self = current_;
@@ -232,19 +249,26 @@ class FactoryStubContext {
     };
 
     stub_ort_api.CreateKeyValuePairs = [](OrtKeyValuePairs** out) noexcept {
-      *out = reinterpret_cast<OrtKeyValuePairs*>(kFakeToken);
+      auto& pairs = current_->key_values.emplace_back(std::make_unique<KeyValues>());
+      *out = reinterpret_cast<OrtKeyValuePairs*>(pairs.get());
     };
-    stub_ort_api.AddKeyValuePair = [](OrtKeyValuePairs*, const char* key, const char* value) noexcept {
-      if (auto* self = current_) {
-        self->added_kv_pairs.emplace_back(key ? key : "", value ? value : "");
-      }
+    stub_ort_api.AddKeyValuePair = [](OrtKeyValuePairs* pairs, const char* key, const char* value) noexcept {
+      (*reinterpret_cast<KeyValues*>(pairs))[key] = value;
+      current_->added_kv_pairs.emplace_back(key, value);
     };
+    // Key/value storage belongs to the stub context; device creation copies it.
     stub_ort_api.ReleaseKeyValuePairs = [](OrtKeyValuePairs*) noexcept {};
-    stub_ort_api.GetKeyValue = [](const OrtKeyValuePairs*, const char* key) noexcept -> const char* {
-      auto* self = current_;
-      if (self == nullptr || key == nullptr) return nullptr;
-      const auto it = self->env_config.find(key);
-      return it == self->env_config.end() ? nullptr : it->second.c_str();
+    stub_ort_api.GetKeyValue = [](const OrtKeyValuePairs* pairs, const char* key) noexcept -> const char* {
+      if (pairs == nullptr || key == nullptr) return nullptr;
+      const auto& values = *reinterpret_cast<const KeyValues*>(pairs);
+      const auto it = values.find(key);
+      return it == values.end() ? nullptr : it->second.c_str();
+    };
+    stub_ort_api.HardwareDevice_Metadata = [](const OrtHardwareDevice* device) noexcept -> const OrtKeyValuePairs* {
+      return reinterpret_cast<const OrtKeyValuePairs*>(&current_->hardware_metadata[device]);
+    };
+    stub_ort_api.HardwareDevice_DeviceId = [](const OrtHardwareDevice* device) noexcept {
+      return current_->device_ids[device];
     };
 
     stub_ort_api.HardwareDevice_Type =
@@ -310,6 +334,7 @@ class FactoryStubContext {
       return nullptr;
     };
     stub_ort_api.CreateSessionOptions = [](OrtSessionOptions** out) noexcept -> OrtStatus* {
+      ++current_->create_session_options_calls;
       *out = reinterpret_cast<OrtSessionOptions*>(kFakeToken);
       return nullptr;
     };
@@ -319,7 +344,9 @@ class FactoryStubContext {
       *out = reinterpret_cast<OrtSessionOptions*>(kFakeToken);
       return nullptr;
     };
-    stub_ort_api.ReleaseSessionOptions = [](OrtSessionOptions*) noexcept {};
+    stub_ort_api.ReleaseSessionOptions = [](OrtSessionOptions*) noexcept {
+      ++current_->release_session_options_calls;
+    };
     stub_ort_api.AddSessionConfigEntry =
         [](OrtSessionOptions*, const char* key, const char* value) noexcept -> OrtStatus* {
       if (auto* self = current_) {
@@ -328,50 +355,67 @@ class FactoryStubContext {
       return nullptr;
     };
     stub_ort_api.Logger_LogMessage =
-        [](const OrtLogger*, OrtLoggingLevel, const char*, const ORTCHAR_T*, int,
-           const char*) noexcept -> OrtStatus* { return nullptr; };
-    // Returns FATAL so Ort::Logger(OrtLogger*)'s C++ ctor short-circuits on
-    // the cached-severity check — required for QnnEp construction under
-    // OrtGlobalApiOverride (Group 6 tests) so that logger dispatch never
-    // dereferences the fake OrtLogger* token.
+        [](const OrtLogger*, OrtLoggingLevel, const char* message, const ORTCHAR_T*, int,
+           const char*) noexcept -> OrtStatus* {
+      current_->log_messages.emplace_back(message);
+      return nullptr;
+    };
+    // Default to FATAL; tests can enable logging to inspect backend selection.
+    // Both logger callbacks are stubbed so the fake token is never dereferenced.
     stub_ort_api.Logger_GetLoggingSeverityLevel =
         [](const OrtLogger*, OrtLoggingLevel* out) noexcept -> OrtStatus* {
-      *out = ORT_LOGGING_LEVEL_FATAL;
+      *out = current_->log_severity;
       return nullptr;
     };
   }
 
   void InstallOrtEpApiStubs() {
     stub_ep_api.GetEnvConfigEntries = [](OrtKeyValuePairs** out) noexcept -> OrtStatus* {
-      *out = reinterpret_cast<OrtKeyValuePairs*>(kFakeToken);
+      if (current_->fail_get_env_config) {
+        return current_->stub_ort_api.CreateStatus(ORT_FAIL, "stub environment failure");
+      }
+      *out = reinterpret_cast<OrtKeyValuePairs*>(&current_->env_config);
       return nullptr;
     };
     stub_ep_api.CreateEpDevice =
         [](OrtEpFactory*, const OrtHardwareDevice* device,
-           const OrtKeyValuePairs*, const OrtKeyValuePairs*,
+           const OrtKeyValuePairs* metadata, const OrtKeyValuePairs* options,
            OrtEpDevice** ep_device) noexcept -> OrtStatus* {
       auto* self = current_;
+      if (++self->create_ep_device_calls == self->fail_create_ep_device_call) {
+        *ep_device = nullptr;
+        return self->stub_ort_api.CreateStatus(ORT_FAIL, "stub CreateEpDevice failure");
+      }
       if (self && self->fail_next_create_ep_device > 0) {
         --self->fail_next_create_ep_device;
         *ep_device = nullptr;
         return reinterpret_cast<OrtStatus*>(new StatusRecord{ORT_FAIL, "stub CreateEpDevice failure"});
       }
-      if (self) self->created_ep_devices.push_back(device);
-      *ep_device = reinterpret_cast<OrtEpDevice*>(kFakeToken);
+      self->created_ep_devices.push_back(device);
+      self->ep_metadata[device] = *reinterpret_cast<const KeyValues*>(metadata);
+      self->ep_options[device] = *reinterpret_cast<const KeyValues*>(options);
+      *ep_device = reinterpret_cast<OrtEpDevice*>(0x1000 + self->created_ep_devices.size());
       return nullptr;
     };
     stub_ep_api.ReleaseEpDevice = [](OrtEpDevice*) noexcept {
       if (auto* self = current_) ++self->release_ep_device_calls;
     };
     stub_ep_api.CreateHardwareDevice =
-        [](OrtHardwareDeviceType, uint32_t, uint32_t, const char*,
-           const OrtKeyValuePairs*, OrtHardwareDevice** out) noexcept -> OrtStatus* {
-      // 3 was chosen as a fresh tag distinct from kFakeToken so tests can
-      // identify the synthesized NPU device by pointer.
-      *out = reinterpret_cast<OrtHardwareDevice*>(3);
+        [](OrtHardwareDeviceType type, uint32_t vendor, uint32_t id, const char*,
+           const OrtKeyValuePairs* metadata, OrtHardwareDevice** out) noexcept -> OrtStatus* {
+      auto* self = current_;
+      if (self->fail_create_hardware) {
+        *out = nullptr;
+        return self->stub_ort_api.CreateStatus(ORT_FAIL, "stub CreateHardwareDevice failure");
+      }
+      *out = self->AddDevice(type, false, vendor, id);
+      self->hardware_metadata[*out] = *reinterpret_cast<const KeyValues*>(metadata);
+      self->synthesized_devices.push_back(*out);
       return nullptr;
     };
-    stub_ep_api.ReleaseHardwareDevice = [](OrtHardwareDevice*) noexcept {};
+    stub_ep_api.ReleaseHardwareDevice = [](OrtHardwareDevice* device) noexcept {
+      current_->released_hardware.push_back(device);
+    };
     stub_ep_api.EpDevice_AddAllocatorInfo =
         [](OrtEpDevice*, const OrtMemoryInfo*) noexcept -> OrtStatus* {
       if (auto* self = current_) {
@@ -384,8 +428,14 @@ class FactoryStubContext {
       return nullptr;
     };
     stub_ep_api.DeviceEpIncompatibilityDetails_SetDetails =
-        [](OrtDeviceEpIncompatibilityDetails*, uint32_t, int32_t, const char*) noexcept -> OrtStatus* {
-      if (auto* self = current_) ++self->set_details_calls;
+        [](OrtDeviceEpIncompatibilityDetails*, uint32_t reasons, int32_t error_code,
+           const char* message) noexcept -> OrtStatus* {
+      if (auto* self = current_) {
+        ++self->set_details_calls;
+        self->last_incompatibility_reason = reasons;
+        self->last_incompatibility_error_code = error_code;
+        self->last_incompatibility_message = message ? message : "";
+      }
       return nullptr;
     };
   }
@@ -442,14 +492,6 @@ class QnnUnit_ProviderFactoryTest : public ::testing::Test {
  protected:
   ScopedDefaultLoggerOverride default_logger_scope_{nullptr};
 };
-
-// Convenience: Qualcomm vendor ID computed the same way as in the factory
-// ('Q' | 'C'<<8 | 'O'<<16 | 'M'<<24).
-static constexpr uint32_t kQualcommVendorId =
-    static_cast<uint32_t>('Q') |
-    (static_cast<uint32_t>('C') << 8) |
-    (static_cast<uint32_t>('O') << 16) |
-    (static_cast<uint32_t>('M') << 24);
 
 // ===========================================================================
 // Group 1: Basic getters + ctor + trivial factory methods.
@@ -833,30 +875,29 @@ TEST_F(QnnUnit_ProviderFactoryTest, GetSupportedDevices_AddAllocatorInfoFails_Do
 
 #if !QNN_ARCH_ARM64
 
-TEST_F(QnnUnit_ProviderFactoryTest, GetSupportedDevices_CrossCompileHost_AdvertisesVirtualNpu) {
+TEST_F(QnnUnit_ProviderFactoryTest, GetSupportedDevices_CrossCompileHost_AdvertisesVirtualNpuAndGpu) {
   FactoryStubContext ctx;
   UseFactoryStubs use(ctx);
   QnnEpFactory factory("ep", ctx.MakeApiPtrs());
   ctx.env_config["allow_virtual_devices"] = "1";
-
-  // Pass no devices at all — no NPU in the input array.
-  OrtEpDevice* ep_devices[4] = {nullptr};
-  size_t num = 0;
-  EXPECT_EQ(factory.GetSupportedDevices(&factory, nullptr, 0, ep_devices, 4, &num), nullptr);
-
-  // On x86, the cross-compile NPU synthesis should fire.
-  EXPECT_GE(num, 1u);
-  ASSERT_FALSE(ctx.created_ep_devices.empty());
-
-  // The synthesized device must have IsVirtual="1" metadata.
-  bool found_is_virtual = false;
-  for (const auto& kv : ctx.added_kv_pairs) {
-    if (kv.first == kOrtHardwareDevice_MetadataKey_IsVirtual && kv.second == "1") {
-      found_is_virtual = true;
-      break;
-    }
+  ctx.env_config["ep_factory.QNNExecutionProvider.qnn_target_architecture"] = "88";
+  ctx.env_config["ep_factory.QNNExecutionProvider.qnn_hardware_device_id"] = "0x36334630";
+  OrtEpDevice* output[2] = {};
+  size_t count = 0;
+  Ort::Status status(factory.GetSupportedDevices(&factory, nullptr, 0, output, 2, &count));
+  ASSERT_TRUE(status.IsOK()) << status.GetErrorMessage();
+  ASSERT_EQ(count, 2u);
+  ASSERT_EQ(ctx.synthesized_devices.size(), 2u);
+  EXPECT_NE(ctx.synthesized_devices[0], ctx.synthesized_devices[1]);
+  EXPECT_EQ(ctx.device_type_map.at(ctx.synthesized_devices[0]), OrtHardwareDeviceType_NPU);
+  EXPECT_EQ(ctx.device_type_map.at(ctx.synthesized_devices[1]), OrtHardwareDeviceType_GPU);
+  for (const auto* device : ctx.synthesized_devices) {
+    EXPECT_EQ(ctx.hardware_metadata.at(device).at(kOrtHardwareDevice_MetadataKey_IsVirtual), "1");
+    EXPECT_EQ(ctx.device_vendor_map.at(device), kQualcommVendorId);
+    EXPECT_EQ(ctx.device_ids.at(device), 0x36334630u);
+    EXPECT_EQ(ctx.ep_metadata.at(device).at("target_architecture"), "88");
+    EXPECT_EQ(ctx.ep_options.at(device).at("soc_model"), "88");
   }
-  EXPECT_TRUE(found_is_virtual) << "Synthesized NPU on x86 must have IsVirtual=1 metadata.";
 }
 
 TEST_F(QnnUnit_ProviderFactoryTest, GetSupportedDevices_CrossCompileHost_CpuDeviceUnaffected) {
@@ -875,9 +916,9 @@ TEST_F(QnnUnit_ProviderFactoryTest, GetSupportedDevices_CrossCompileHost_CpuDevi
   size_t num = 0;
   EXPECT_EQ(factory.GetSupportedDevices(&factory, devices, 1, ep_devices, 4, &num), nullptr);
 
-  // Both CPU (from input) and synthesized virtual NPU (from cross-compile path).
-  EXPECT_EQ(num, 2u);
-  ASSERT_EQ(ctx.created_ep_devices.size(), 2u);
+  // CPU input plus the synthesized virtual NPU and GPU.
+  EXPECT_EQ(num, 3u);
+  ASSERT_EQ(ctx.created_ep_devices.size(), 3u);
   EXPECT_EQ(ctx.created_ep_devices[0], cpu);
 }
 
@@ -1164,29 +1205,6 @@ TEST_F(QnnUnit_ProviderFactoryTest, ValidateCompatibility_CreateSessionOptionsFa
   ctx.stub_ort_api.ReleaseStatus(status);
 }
 
-TEST_F(QnnUnit_ProviderFactoryTest, ValidateCompatibility_AddSessionConfigEntryFails_ReturnsError) {
-  FactoryStubContext ctx;
-  UseFactoryStubs use(ctx);
-  // CreateSessionOptions OK (default), AddSessionConfigEntry fails.
-  ctx.stub_ort_api.AddSessionConfigEntry =
-      [](OrtSessionOptions*, const char*, const char*) noexcept -> OrtStatus* {
-    return reinterpret_cast<OrtStatus*>(new StatusRecord{ORT_FAIL, "stub AddSessionConfigEntry failure"});
-  };
-  QnnEpFactory factory("ep", ctx.MakeApiPtrs());
-
-  OrtHardwareDevice* npu = MakeFakeHwDevice(34);
-  ctx.device_type_map[npu] = OrtHardwareDeviceType_NPU;
-
-  const OrtHardwareDevice* devices[] = {npu};
-  OrtCompiledModelCompatibility compat = OrtCompiledModelCompatibility_EP_SUPPORTED_OPTIMAL;
-  OrtStatus* status =
-      factory.ValidateCompiledModelCompatibilityInfo(&factory, devices, 1, "info", &compat);
-  ASSERT_NE(status, nullptr);
-  EXPECT_EQ(StubStatusCode(ctx, status), ORT_FAIL);
-  EXPECT_EQ(compat, OrtCompiledModelCompatibility_EP_NOT_APPLICABLE);
-  ctx.stub_ort_api.ReleaseStatus(status);
-}
-
 TEST_F(QnnUnit_ProviderFactoryTest, CreateEpFactories_VersionTooLow_FallbackApiNull_ReturnsNull) {
   FactoryStubContext ctx;
   ctx.version_string = "1.5.0";  // parses to 5 (< 24)
@@ -1226,201 +1244,440 @@ TEST_F(QnnUnit_ProviderFactoryTest, ReleaseEpFactory_NullPointer_ReturnsNull) {
 }
 
 // ===========================================================================
-// Group 6: Real-HTP-backend paths (QnnUnit_ProviderFactoryHtpTest)
+// Group 6: Temporary EP compatibility probes.
 //
-// These tests exercise factory code paths that need a real QnnEp instance:
-//   - CreateEpImpl autoep branch (clone session options, add backend_path).
-//   - ValidateCompiledModelCompatibilityInfoImpl temp-EP construction path.
-//   - GetHardwareDeviceIncompatibilityDetailsImpl temp-EP construction path.
-//
-// QnnEp construction loads the platform HTP backend via QnnBackendManager; the fixture
-// GTEST_SKIP()s when the backend is unavailable, mirroring
-// QnnUnit_BackendManagerHtpTest / QnnUnit_ExecutionProviderHtpTest.
-//
-// Strategy: stubbed OrtApi (Groups 1–5 infra, extended with session-config
-// read-back and Logger_GetLoggingSeverityLevel=FATAL) + OrtGlobalApiOverride
-// (so Ort::Logger's C++ ctor short-circuits) + real dlopen inside
-// QnnBackendManager. The tests verify factory *behaviour* — the recorded
-// added_config_entries / clone_session_options_calls — which is what actually
-// changes coverage: the target lines are hit before make_unique<QnnEp>
-// completes, so status inspection is best-effort (both OK and QnnEp
-// construction failures are tolerated with a diagnostic).
+// Install a default logger so both factory APIs construct a real temporary
+// QnnEp and delegate to it. Empty model info verifies the EP's validation
+// response without loading QNN; a nonexistent backend exercises SetupBackend
+// and verifies the EP's missing-dependency classification. Constructor failures
+// are test failures. Neither test requires an installed QNN backend.
 // ===========================================================================
 
-class QnnUnit_ProviderFactoryHtpTest : public ::testing::Test {
- protected:
-  void SetUp() override {
-    QnnRealHtpBackendContext htp_check;
-    if (!htp_check.IsValid()) {
-      GTEST_SKIP() << QnnHtpBackendLibraryName() << " not available";
+TEST_F(QnnUnit_ProviderFactoryTest, ValidateCompatibility_TemporaryEpUsesDefaultHtpBackend) {
+  FactoryStubContext ctx;
+  UseFactoryStubs use(ctx);
+  ctx.log_severity = ORT_LOGGING_LEVEL_VERBOSE;
+  ScopedDefaultLoggerOverride logger_scope(reinterpret_cast<const OrtLogger*>(kFakeToken));
+  QnnEpFactory factory("ep", ctx.MakeApiPtrs());
+  const OrtHardwareDevice* devices[] = {ctx.AddDevice(OrtHardwareDeviceType_NPU)};
+  OrtCompiledModelCompatibility compat = OrtCompiledModelCompatibility_EP_SUPPORTED_OPTIMAL;
+
+  Ort::Status status(factory.ValidateCompiledModelCompatibilityInfo(&factory, devices, 1, "", &compat));
+
+  ASSERT_TRUE(status.IsOK()) << status.GetErrorMessage();
+  EXPECT_EQ(compat, OrtCompiledModelCompatibility_EP_NOT_APPLICABLE);
+  EXPECT_TRUE(std::any_of(ctx.log_messages.begin(), ctx.log_messages.end(), [](const auto& message) {
+    return message.find("Using default backend path:") != std::string::npos &&
+           message.find(QnnHtpBackendLibraryName()) != std::string::npos;
+  }));
+  EXPECT_NE(std::find(ctx.log_messages.begin(), ctx.log_messages.end(),
+                      "No compatibility info to be validated."),
+            ctx.log_messages.end());
+  EXPECT_TRUE(ctx.added_config_entries.empty());
+  EXPECT_EQ(ctx.clone_session_options_calls, 0);
+  EXPECT_EQ(ctx.create_session_options_calls, 1);
+  EXPECT_EQ(ctx.release_session_options_calls, 1);
+}
+
+TEST_F(QnnUnit_ProviderFactoryTest, IncompatibilityDetails_TemporaryEpReportsMissingBackend) {
+  for (auto type : {OrtHardwareDeviceType_NPU, OrtHardwareDeviceType_GPU}) {
+    SCOPED_TRACE(type);
+    FactoryStubContext ctx;
+    UseFactoryStubs use(ctx);
+    ScopedDefaultLoggerOverride logger_scope(reinterpret_cast<const OrtLogger*>(kFakeToken));
+    // Inject a path through the session-options stub to make backend setup fail
+    // deterministically, even on hosts with QNN installed. No factory option
+    // injection is needed for NPU/GPU probes.
+    const auto backend_path = std::filesystem::absolute("qnn_factory_missing_backend/libQnnFake.so");
+    ASSERT_FALSE(std::filesystem::exists(backend_path));
+    ctx.session_config["ep.ep.backend_path"] = backend_path.string();
+    QnnEpFactory factory("ep", ctx.MakeApiPtrs());
+    const auto* device = ctx.AddDevice(type, false, kQualcommVendorId,
+                                       type == OrtHardwareDeviceType_GPU ? 0x36334630 : 0);
+
+    Ort::Status status(factory.GetHardwareDeviceIncompatibilityDetails(
+        &factory, device, reinterpret_cast<OrtDeviceEpIncompatibilityDetails*>(kFakeToken)));
+
+    ASSERT_TRUE(status.IsOK()) << status.GetErrorMessage();
+    ASSERT_EQ(ctx.set_details_calls, 1);
+    EXPECT_EQ(ctx.last_incompatibility_reason, OrtDeviceEpIncompatibility_MISSING_DEPENDENCY);
+    EXPECT_EQ(ctx.last_incompatibility_error_code, QNN_COMMON_ERROR_PLATFORM_NOT_SUPPORTED);
+    EXPECT_NE(ctx.last_incompatibility_message.find("Unable to load backend"), std::string::npos);
+    EXPECT_TRUE(ctx.added_config_entries.empty());
+    EXPECT_EQ(ctx.clone_session_options_calls, 0);
+    EXPECT_EQ(ctx.create_session_options_calls, 1);
+    EXPECT_EQ(ctx.release_session_options_calls, 1);
+  }
+}
+
+// ===========================================================================
+// Group 7: Virtual-device discovery and backend selection.
+// QnnEp construction selects the backend lazily without loading its library.
+// These tests verify device ordering and unchanged caller session options.
+// ===========================================================================
+
+TEST_F(QnnUnit_ProviderFactoryTest, GetSupportedDevices_VirtualGpuOptInAndCapacity) {
+  for (const char* allow : {"", "0", "1", "true"}) {
+    for (size_t capacity : {0u, 1u, 2u}) {
+      SCOPED_TRACE(allow);
+      SCOPED_TRACE(capacity);
+      FactoryStubContext ctx;
+      UseFactoryStubs use(ctx);
+      QnnEpFactory factory("ep", ctx.MakeApiPtrs());
+      // Supplying an NPU makes this independent of host NPU discovery.
+      const OrtHardwareDevice* devices[] = {ctx.AddDevice(OrtHardwareDeviceType_NPU)};
+      if (*allow) ctx.env_config["allow_virtual_devices"] = allow;
+      OrtEpDevice* output[3] = {};
+      size_t count = 99;
+      Ort::Status status(factory.GetSupportedDevices(&factory, devices, 1, output, capacity, &count));
+      ASSERT_TRUE(status.IsOK()) << status.GetErrorMessage();
+      const size_t expected = capacity == 0 ? 0 : (std::strcmp(allow, "1") == 0 && capacity == 2 ? 2 : 1);
+      EXPECT_EQ(count, expected);
+      EXPECT_EQ(output[capacity], nullptr);
+      ASSERT_EQ(ctx.synthesized_devices.size(), expected == 2 ? 1u : 0u);
+      if (expected == 2) {
+        const auto* gpu = ctx.synthesized_devices.front();
+        EXPECT_EQ(ctx.device_type_map.at(gpu), OrtHardwareDeviceType_GPU);
+        EXPECT_EQ(ctx.device_vendor_map.at(gpu), kQualcommVendorId);
+        EXPECT_EQ(ctx.hardware_metadata.at(gpu).at(kOrtHardwareDevice_MetadataKey_IsVirtual), "1");
+        EXPECT_EQ(ctx.add_allocator_info_calls, 1);  // NPU only.
+      }
     }
   }
+}
 
-  ScopedDefaultLoggerOverride default_logger_scope_{nullptr};
+TEST_F(QnnUnit_ProviderFactoryTest, GetSupportedDevices_PhysicalGpuNotDuplicated) {
+  FactoryStubContext ctx;
+  UseFactoryStubs use(ctx);
+  QnnEpFactory factory("ep", ctx.MakeApiPtrs());
+  ctx.env_config["allow_virtual_devices"] = "1";
+  const OrtHardwareDevice* devices[] = {ctx.AddDevice(OrtHardwareDeviceType_GPU),
+                                        ctx.AddDevice(OrtHardwareDeviceType_NPU)};
+  OrtEpDevice* output[4] = {};
+  size_t count = 0;
+  Ort::Status status(factory.GetSupportedDevices(&factory, devices, 2, output, 4, &count));
+  ASSERT_TRUE(status.IsOK()) << status.GetErrorMessage();
+  EXPECT_EQ(count, 2u);
+  EXPECT_TRUE(ctx.synthesized_devices.empty());
+}
+
+TEST_F(QnnUnit_ProviderFactoryTest, GetSupportedDevices_TargetOverrideOnlyAppliesToVirtualDevices) {
+  FactoryStubContext ctx;
+  UseFactoryStubs use(ctx);
+  QnnEpFactory factory("ep", ctx.MakeApiPtrs());
+  const auto host_soc = std::to_string(qnn::soc::MapSocModelFromSocId(qnn::soc::GetSocId()));
+  const std::string target = host_soc == "88" ? "69" : "88";
+  ctx.env_config["ep_factory.QNNExecutionProvider.qnn_target_architecture"] = target;
+  const OrtHardwareDevice* devices[] = {ctx.AddDevice(OrtHardwareDeviceType_NPU),
+                                        ctx.AddDevice(OrtHardwareDeviceType_GPU),
+                                        ctx.AddDevice(OrtHardwareDeviceType_NPU, true),
+                                        ctx.AddDevice(OrtHardwareDeviceType_GPU, true)};
+  OrtEpDevice* output[4] = {};
+  size_t count = 0;
+  Ort::Status status(factory.GetSupportedDevices(&factory, devices, 4, output, 4, &count));
+  ASSERT_TRUE(status.IsOK()) << status.GetErrorMessage();
+  ASSERT_EQ(count, 4u);
+  for (size_t i = 0; i < 4; ++i) {
+    SCOPED_TRACE(i);
+    EXPECT_EQ(ctx.ep_metadata.at(devices[i]).at("target_architecture"), i < 2 ? host_soc : target);
+    if (i < 2) {
+      EXPECT_TRUE(ctx.ep_options.at(devices[i]).empty());
+    } else {
+      EXPECT_EQ(ctx.ep_options.at(devices[i]).at("soc_model"), target);
+    }
+  }
+}
+
+TEST_F(QnnUnit_ProviderFactoryTest, GetSupportedDevices_HardwareIdParsesHexAndFallsBackOnInvalidInput) {
+  struct Case {
+    const char* text;
+    uint32_t expected;
+    bool valid;
+  };
+  for (const auto& test : {Case{"36334630", 0x36334630, true}, {"0x36334630", 0x36334630, true}, {"0X36334630", 0x36334630, true}, {"FFFFFFFF", UINT32_MAX, true}, {"0", 0, true}, {"", 0, false}, {"0x", 0, false}, {"-1", 0, false}, {"+1", 0, false}, {" 36334630", 0, false}, {"36334630junk", 0, false}, {"100000000", 0, false}}) {
+    SCOPED_TRACE(test.text);
+    FactoryStubContext ctx;
+    UseFactoryStubs use(ctx);
+    ScopedDefaultLoggerOverride logger(reinterpret_cast<const OrtLogger*>(kFakeToken));
+    QnnEpFactory factory("ep", ctx.MakeApiPtrs());
+    ctx.env_config["allow_virtual_devices"] = "1";
+    ctx.env_config["ep_factory.QNNExecutionProvider.qnn_hardware_device_id"] = test.text;
+    const OrtHardwareDevice* devices[] = {ctx.AddDevice(OrtHardwareDeviceType_NPU)};
+    OrtEpDevice* output[2] = {};
+    size_t count = 0;
+    Ort::Status status(factory.GetSupportedDevices(&factory, devices, 1, output, 2, &count));
+    ASSERT_TRUE(status.IsOK()) << status.GetErrorMessage();
+    ASSERT_EQ(ctx.synthesized_devices.size(), 1u);
+    EXPECT_EQ(ctx.device_ids.at(ctx.synthesized_devices.front()), test.expected);
+    const bool warned = std::any_of(ctx.log_messages.begin(), ctx.log_messages.end(), [](const auto& message) {
+      return message.find("Failed to parse value") != std::string::npos;
+    });
+    EXPECT_EQ(warned, !test.valid);
+  }
+}
+
+TEST_F(QnnUnit_ProviderFactoryTest, GetSupportedDevices_TargetParsingPreservesFallbackBehavior) {
+  for (const char* target : {static_cast<const char*>(nullptr), "88", "0", "4294967295", "", "-88", "+88", "88junk", "4294967296", "htp-v73", " 88"}) {
+    SCOPED_TRACE(target ? target : "unset");
+    FactoryStubContext ctx;
+    UseFactoryStubs use(ctx);
+    ScopedDefaultLoggerOverride logger(reinterpret_cast<const OrtLogger*>(kFakeToken));
+    QnnEpFactory factory("ep", ctx.MakeApiPtrs());
+    if (target) ctx.env_config["ep_factory.QNNExecutionProvider.qnn_target_architecture"] = target;
+    // No hardware ID is required by this implementation.
+    const OrtHardwareDevice* devices[] = {ctx.AddDevice(OrtHardwareDeviceType_GPU, true)};
+    OrtEpDevice* output[1] = {};
+    size_t count = 0;
+    Ort::Status status(factory.GetSupportedDevices(&factory, devices, 1, output, 1, &count));
+    ASSERT_TRUE(status.IsOK()) << status.GetErrorMessage();
+    const bool valid = target && (std::strcmp(target, "88") == 0 || std::strcmp(target, "0") == 0 ||
+                                  std::strcmp(target, "4294967295") == 0);
+    const auto expected = valid ? std::string(target) : std::to_string(qnn::soc::MapSocModelFromSocId(qnn::soc::GetSocId()));
+    EXPECT_EQ(ctx.ep_metadata.at(devices[0]).at("target_architecture"), expected);
+    EXPECT_EQ(ctx.ep_options.at(devices[0]).at("soc_model"), expected);
+    const bool warned = std::any_of(ctx.log_messages.begin(), ctx.log_messages.end(), [](const auto& message) {
+      return message.find("Unrecognized soc_model") != std::string::npos;
+    });
+    EXPECT_EQ(warned, target != nullptr && !valid);
+  }
+}
+
+TEST_F(QnnUnit_ProviderFactoryTest, GetSupportedDevices_EnvironmentErrorPropagatesBeforeAdvertising) {
+  FactoryStubContext ctx;
+  UseFactoryStubs use(ctx);
+  QnnEpFactory factory("ep", ctx.MakeApiPtrs());
+  ctx.fail_get_env_config = true;
+  OrtEpDevice* output[2] = {};
+  size_t count = 99;
+  Ort::Status status(factory.GetSupportedDevices(&factory, nullptr, 0, output, 2, &count));
+  ASSERT_FALSE(status.IsOK());
+  EXPECT_STREQ(status.GetErrorMessage(), "stub environment failure");
+  EXPECT_EQ(count, 0u);
+  EXPECT_TRUE(ctx.created_ep_devices.empty());
+}
+
+TEST_F(QnnUnit_ProviderFactoryTest, GetSupportedDevices_SyntheticGpuFailurePreservesPublishedNpu) {
+  for (bool fail_hardware : {false, true}) {
+    SCOPED_TRACE(fail_hardware);
+    FactoryStubContext ctx;
+    UseFactoryStubs use(ctx);
+    {
+      QnnEpFactory factory("ep", ctx.MakeApiPtrs());
+      ctx.env_config["allow_virtual_devices"] = "1";
+      ctx.fail_create_hardware = fail_hardware;
+      ctx.fail_create_ep_device_call = fail_hardware ? 0 : 2;
+      const OrtHardwareDevice* devices[] = {ctx.AddDevice(OrtHardwareDeviceType_NPU)};
+      OrtEpDevice* output[2] = {};
+      size_t count = 0;
+      Ort::Status status(factory.GetSupportedDevices(&factory, devices, 1, output, 2, &count));
+      ASSERT_FALSE(status.IsOK());
+      // Current API behavior retains already-published outputs on a later error.
+      EXPECT_EQ(count, 1u);
+      EXPECT_NE(output[0], nullptr);
+      EXPECT_EQ(output[1], nullptr);
+      EXPECT_EQ(ctx.release_ep_device_calls, 0);
+      EXPECT_TRUE(ctx.released_hardware.empty());
+    }
+    EXPECT_EQ(ctx.released_hardware.size(), fail_hardware ? 0u : 1u);
+  }
+}
+
+// Regression fence: earlier enumeration results must not refer to released hardware.
+// This currently exposes the factory's replacement of virtual_gpu_hw_device_.
+TEST_F(QnnUnit_ProviderFactoryTest, GetSupportedDevices_RepeatedSynthesisRetainsHardware) {
+  for (bool supply_npu : {false, true}) {
+    SCOPED_TRACE(supply_npu);
+    FactoryStubContext ctx;
+    UseFactoryStubs use(ctx);
+    ctx.env_config["allow_virtual_devices"] = "1";
+    {
+      QnnEpFactory factory("ep", ctx.MakeApiPtrs());
+      const OrtHardwareDevice* devices[] = {ctx.AddDevice(OrtHardwareDeviceType_NPU)};
+      for (int i = 0; i < 2; ++i) {
+        OrtEpDevice* output[2] = {};
+        size_t count = 0;
+        Ort::Status status(factory.GetSupportedDevices(&factory, supply_npu ? devices : nullptr,
+                                                       supply_npu ? 1 : 0, output, 2, &count));
+        ASSERT_TRUE(status.IsOK()) << status.GetErrorMessage();
+        ASSERT_EQ(count, 2u);
+        EXPECT_TRUE(ctx.released_hardware.empty());
+      }
+    }
+    EXPECT_EQ(ctx.released_hardware.size(), ctx.synthesized_devices.size());
+  }
+}
+
+TEST_F(QnnUnit_ProviderFactoryTest, CreateEp_DefaultBackendSelectionPreservesSessionOptions) {
+  const std::vector<std::vector<OrtHardwareDeviceType>> combinations = {
+      {OrtHardwareDeviceType_NPU}, {OrtHardwareDeviceType_GPU}, {OrtHardwareDeviceType_GPU, OrtHardwareDeviceType_NPU}, {OrtHardwareDeviceType_NPU, OrtHardwareDeviceType_GPU}, {OrtHardwareDeviceType_CPU, OrtHardwareDeviceType_GPU}};
+  for (const auto& types : combinations) {
+    SCOPED_TRACE(types.front());
+    FactoryStubContext ctx;
+    UseFactoryStubs use(ctx);
+    ctx.log_severity = ORT_LOGGING_LEVEL_VERBOSE;
+    QnnEpFactory factory("ep", ctx.MakeApiPtrs());
+    std::vector<const OrtHardwareDevice*> devices;
+    for (auto type : types) devices.push_back(ctx.AddDevice(type));
+    OrtEp* ep = nullptr;
+    Ort::Status status(factory.CreateEp(&factory, devices.data(), nullptr, devices.size(),
+                                        reinterpret_cast<const OrtSessionOptions*>(kFakeToken),
+                                        reinterpret_cast<const OrtLogger*>(kFakeToken), &ep));
+    ASSERT_TRUE(status.IsOK()) << status.GetErrorMessage();
+    std::unique_ptr<QnnEp> owned_ep(static_cast<QnnEp*>(ep));
+    ASSERT_NE(owned_ep, nullptr);
+    const auto expected_type = std::find(types.begin(), types.end(), OrtHardwareDeviceType_NPU) != types.end()
+                                   ? OrtHardwareDeviceType_NPU
+                                   : OrtHardwareDeviceType_GPU;
+#ifdef _WIN32
+    const char* expected_backend = expected_type == OrtHardwareDeviceType_NPU ? "QnnHtp.dll" : "QnnGpu.dll";
+#else
+    const char* expected_backend = expected_type == OrtHardwareDeviceType_NPU ? "libQnnHtp.so" : "libQnnGpu.so";
+#endif
+    EXPECT_TRUE(std::any_of(ctx.log_messages.begin(), ctx.log_messages.end(), [&](const auto& message) {
+      return message.find("Using backend path:") != std::string::npos &&
+             message.find(expected_backend) != std::string::npos;
+    }));
+    EXPECT_EQ(ctx.clone_session_options_calls, 0);
+    EXPECT_TRUE(ctx.added_config_entries.empty());
+  }
+}
+
+TEST_F(QnnUnit_ProviderFactoryTest, CreateEp_ExplicitCpuBackendBypassesMissingDefault) {
+#ifdef _WIN32
+  const char* cpu_backend_path = "QnnCpu.dll";
+#else
+  const char* cpu_backend_path = "libQnnCpu.so";
+#endif
+  for (const char* option : {"backend_type", "backend_path"}) {
+    FactoryStubContext ctx;
+    UseFactoryStubs use(ctx);
+    QnnEpFactory factory("ep", ctx.MakeApiPtrs());
+    ctx.session_config[std::string("ep.ep.") + option] = std::strcmp(option, "backend_type") == 0
+                                                             ? "cpu"
+                                                             : cpu_backend_path;
+    const OrtHardwareDevice* devices[] = {ctx.AddDevice(OrtHardwareDeviceType_CPU)};
+    OrtEp* ep = nullptr;
+    Ort::Status status(factory.CreateEp(&factory, devices, nullptr, 1,
+                                        reinterpret_cast<const OrtSessionOptions*>(kFakeToken),
+                                        reinterpret_cast<const OrtLogger*>(kFakeToken), &ep));
+    ASSERT_TRUE(status.IsOK()) << status.GetErrorMessage();
+    ASSERT_NE(ep, nullptr);
+    factory.ReleaseEp(&factory, ep);
+    EXPECT_EQ(ctx.clone_session_options_calls, 0);
+    EXPECT_TRUE(ctx.added_config_entries.empty());
+  }
+}
+
+TEST_F(QnnUnit_ProviderFactoryTest, IncompatibilityDetails_OnlyCpuProbeInjectsBackendType) {
+  for (auto type : {OrtHardwareDeviceType_CPU, OrtHardwareDeviceType_NPU, OrtHardwareDeviceType_GPU}) {
+    SCOPED_TRACE(type);
+    FactoryStubContext ctx;
+    UseFactoryStubs use(ctx);
+    QnnEpFactory factory("ep", ctx.MakeApiPtrs());
+    Ort::Status status(factory.GetHardwareDeviceIncompatibilityDetails(
+        &factory, ctx.AddDevice(type), reinterpret_cast<OrtDeviceEpIncompatibilityDetails*>(kFakeToken)));
+    ASSERT_FALSE(status.IsOK());
+    EXPECT_NE(std::string(status.GetErrorMessage()).find("Default logger"), std::string::npos);
+    EXPECT_EQ(ctx.create_session_options_calls, 1);
+    EXPECT_EQ(ctx.release_session_options_calls, 1);
+    if (type == OrtHardwareDeviceType_CPU) {
+      ASSERT_EQ(ctx.added_config_entries.size(), 1u);
+      EXPECT_EQ(ctx.added_config_entries[0], (std::pair<std::string, std::string>{"ep.ep.backend_type", "cpu"}));
+    } else {
+      EXPECT_TRUE(ctx.added_config_entries.empty());
+    }
+  }
+}
+
+TEST_F(QnnUnit_ProviderFactoryTest, IncompatibilityDetails_CpuConfigFailureReleasesTemporaryOptions) {
+  FactoryStubContext ctx;
+  UseFactoryStubs use(ctx);
+  ctx.stub_ort_api.AddSessionConfigEntry = [](OrtSessionOptions*, const char*, const char*) noexcept -> OrtStatus* {
+    return FactoryStubContext::current_->stub_ort_api.CreateStatus(ORT_FAIL, "CPU config failure");
+  };
+  QnnEpFactory factory("ep", ctx.MakeApiPtrs());
+  Ort::Status status(factory.GetHardwareDeviceIncompatibilityDetails(
+      &factory, ctx.AddDevice(OrtHardwareDeviceType_CPU), reinterpret_cast<OrtDeviceEpIncompatibilityDetails*>(kFakeToken)));
+  ASSERT_FALSE(status.IsOK());
+  EXPECT_STREQ(status.GetErrorMessage(), "CPU config failure");
+  EXPECT_EQ(ctx.create_session_options_calls, 1);
+  EXPECT_EQ(ctx.release_session_options_calls, 1);
+}
+
+namespace {
+template <typename Tag, typename Tag::type Member>
+struct FactoryLibraryMember {
+  friend typename Tag::type GetFactoryLibraryMember(Tag) { return Member; }
 };
+struct LoadBackendLibraryTag {
+  using type = void* (qnn::QnnBackendManager::*)(const char*, int, std::string&);
+  friend type GetFactoryLibraryMember(LoadBackendLibraryTag);
+};
+template struct FactoryLibraryMember<LoadBackendLibraryTag, &qnn::QnnBackendManager::LoadLib>;
+}  // namespace
 
-// Verifies that CreateEpImpl enters the autoep branch when neither
-// backend_type nor backend_path is set: it must CloneSessionOptions once and
-// AddSessionConfigEntry a "backend_path" entry whose value ends in the
-// platform HTP backend (derived from kDefaultBackends[NPU]). QnnEp construction may
-// or may not succeed depending on whether the auto-computed path is
-// resolvable at runtime; either outcome is acceptable — the autoep
-// side-effects are what this test locks in.
-TEST_F(QnnUnit_ProviderFactoryHtpTest,
-       CreateEp_AutoepNpuQualcomm_ClonesAndAddsBackendPath) {
-  FactoryStubContext ctx;  // empty session_config → autoep branch
-  UseFactoryStubs use(ctx);
-  QnnEpFactory factory("QNNExecutionProvider", ctx.MakeApiPtrs());
-
-  OrtHardwareDevice* npu = MakeFakeHwDevice(20);
-  ctx.device_type_map[npu] = OrtHardwareDeviceType_NPU;
-  ctx.device_vendor_map[npu] = kQualcommVendorId;
-
-  auto* fake_session_opts = reinterpret_cast<OrtSessionOptions*>(kFakeToken);
-  auto* fake_logger = reinterpret_cast<OrtLogger*>(kFakeToken);
-  OrtEp* ep = nullptr;
-  const OrtHardwareDevice* devices[] = {npu};
-  const OrtKeyValuePairs* metadata[] = {nullptr};
-
-  OrtStatus* status = factory.CreateEp(&factory, devices, metadata, 1,
-                                       fake_session_opts, fake_logger, &ep);
-
-  // Autoep side-effects — the coverage target — must have happened regardless
-  // of whether make_unique<QnnEp> succeeded.
-  EXPECT_EQ(ctx.clone_session_options_calls, 1)
-      << "autoep should have cloned session options exactly once";
-  bool added_backend_path = false;
-  for (const auto& kv : ctx.added_config_entries) {
-    if (kv.first.find("backend_path") != std::string::npos &&
-        kv.second.find(QnnHtpBackendLibraryName()) != std::string::npos) {
-      added_backend_path = true;
-      break;
-    }
-  }
-  EXPECT_TRUE(added_backend_path)
-      << "autoep should have added a backend_path entry ending in " << QnnHtpBackendLibraryName();
-
-  if (status == nullptr) {
-    EXPECT_NE(ep, nullptr);
-    factory.ReleaseEp(&factory, ep);
-  } else {
-    ctx.stub_ort_api.ReleaseStatus(status);
-  }
-}
-
-// Multi-device autoep: NPU + GPU present, no backend_type/backend_path — the
-// factory should pick the NPU (and log a warning). Covers the multi-device
-// std::find_if(is_npu) branch of CreateEpImpl.
-TEST_F(QnnUnit_ProviderFactoryHtpTest,
-       CreateEp_AutoepMultiDeviceNpuAndGpu_PicksNpu) {
+TEST_F(QnnUnit_ProviderFactoryTest, BackendLibraries_OutliveManagersUntilFactoryRelease) {
   FactoryStubContext ctx;
   UseFactoryStubs use(ctx);
-  QnnEpFactory factory("QNNExecutionProvider", ctx.MakeApiPtrs());
-
-  OrtHardwareDevice* npu = MakeFakeHwDevice(21);
-  OrtHardwareDevice* gpu = MakeFakeHwDevice(22);
-  ctx.device_type_map[npu] = OrtHardwareDeviceType_NPU;
-  ctx.device_type_map[gpu] = OrtHardwareDeviceType_GPU;
-  ctx.device_vendor_map[npu] = kQualcommVendorId;
-  ctx.device_vendor_map[gpu] = kQualcommVendorId;
-
-  auto* fake_session_opts = reinterpret_cast<OrtSessionOptions*>(kFakeToken);
-  auto* fake_logger = reinterpret_cast<OrtLogger*>(kFakeToken);
-  OrtEp* ep = nullptr;
-  const OrtHardwareDevice* devices[] = {gpu, npu};  // GPU listed first
-  const OrtKeyValuePairs* metadata[] = {nullptr, nullptr};
-
-  OrtStatus* status = factory.CreateEp(&factory, devices, metadata, 2,
-                                       fake_session_opts, fake_logger, &ep);
-
-  // Autoep must clone + add backend_path for HTP (NPU wins over GPU).
-  EXPECT_EQ(ctx.clone_session_options_calls, 1);
-  bool added_htp_path = false;
-  for (const auto& kv : ctx.added_config_entries) {
-    if (kv.first.find("backend_path") != std::string::npos &&
-        kv.second.find(QnnHtpBackendLibraryName()) != std::string::npos) {
-      added_htp_path = true;
-      break;
-    }
-  }
-  EXPECT_TRUE(added_htp_path);
-
-  if (status == nullptr) {
-    EXPECT_NE(ep, nullptr);
-    factory.ReleaseEp(&factory, ep);
-  } else {
-    ctx.stub_ort_api.ReleaseStatus(status);
-  }
+  QnnEpFactory factory("ep", ctx.MakeApiPtrs());
+  const Ort::Logger logger = MakeNullLogger();
+  qnn::QnnBackendManagerConfig config{};
+  auto qnn_manager = qnn::QnnBackendManager::Create(config, ctx.MakeApiPtrs(), logger);
+  // Use the already-installed runtime as an opaque shared library, so this
+  // ownership test needs no QNN SDK backend or physical accelerator.
+  const auto library_path = std::filesystem::path(
+                                GetDynamicLibraryLocationByAddress(reinterpret_cast<const void*>(&OrtGetApiBase)))
+                                .string();
+  ASSERT_FALSE(library_path.empty());
+  std::string error;
+  void* qnn_handle = ((*qnn_manager).*GetFactoryLibraryMember(LoadBackendLibraryTag{}))(
+      library_path.c_str(), static_cast<int>(qnn::DlOpenFlag::DL_NOW), error);
+  ASSERT_NE(qnn_handle, nullptr) << error;
+  auto genie_manager = qnn::GenieBackendManager::Create({library_path}, logger);
+  auto setup_status = genie_manager->SetupBackend();
+  ASSERT_TRUE(setup_status.IsOK()) << setup_status.GetErrorMessage();
+  void* genie_handle = genie_manager->GetGenieBackendHandle();
+  EXPECT_TRUE(genie_manager->SetupBackend().IsOK());
+  EXPECT_EQ(genie_manager->GetGenieBackendHandle(), genie_handle);
+  const std::weak_ptr<void> qnn_lifetime = qnn_manager->GetBackendLibraryLifetime();
+  const std::weak_ptr<void> genie_lifetime = genie_manager->GetBackendLibraryLifetime();
+  factory.RegisterQnnBackendManager(qnn_manager);
+  factory.RegisterQnnBackendManager(qnn_manager);
+  factory.RegisterGenieBackendManager(genie_manager);
+  factory.RegisterGenieBackendManager(genie_manager);
+  qnn_manager->ReleaseResources();
+  qnn_manager.reset();
+  genie_manager.reset();
+  ASSERT_FALSE(qnn_lifetime.expired());
+  ASSERT_FALSE(genie_lifetime.expired());
+  void* symbol = nullptr;
+  EXPECT_TRUE(OrtGetSymbolFromLibrary(qnn_handle, "OrtGetApiBase", &symbol).IsOK());
+  EXPECT_NE(symbol, nullptr);
+  symbol = nullptr;
+  EXPECT_TRUE(OrtGetSymbolFromLibrary(genie_handle, "OrtGetApiBase", &symbol).IsOK());
+  EXPECT_NE(symbol, nullptr);
+  factory.UnloadBackendLibraries();
+  EXPECT_TRUE(qnn_lifetime.expired());
+  EXPECT_TRUE(genie_lifetime.expired());
+  factory.UnloadBackendLibraries();
 }
 
-// ValidateCompiledModelCompatibilityInfoImpl temp-EP path:
-// factory->qnn_ep_ is nullptr initially; passing an NPU device causes
-// backend_type="htp" to be determined and CreateSessionOptions +
-// AddSessionConfigEntry to fire before std::make_unique<QnnEp> for the temp
-// EP. Covers lines 393-421 of qnn_provider_factory.cc.
-TEST_F(QnnUnit_ProviderFactoryHtpTest,
-       ValidateCompatibilityInfo_NpuNoQnnEp_WiresHtpBackendType) {
+TEST_F(QnnUnit_ProviderFactoryTest, BackendLibraries_ActiveManagerSurvivesFactoryRelease) {
   FactoryStubContext ctx;
   UseFactoryStubs use(ctx);
-
-  // ValidateCompiledModelCompatibilityInfoImpl requires HasDefaultLogger().
-  auto* fake_logger = reinterpret_cast<OrtLogger*>(kFakeToken);
-  ScopedDefaultLoggerOverride logger_scope(fake_logger);
-  QnnEpFactory factory("QNNExecutionProvider", ctx.MakeApiPtrs());
-
-  OrtHardwareDevice* npu = MakeFakeHwDevice(23);
-  ctx.device_type_map[npu] = OrtHardwareDeviceType_NPU;
-  ctx.device_vendor_map[npu] = kQualcommVendorId;
-
-  const OrtHardwareDevice* devices[] = {npu};
-  OrtCompiledModelCompatibility compat = OrtCompiledModelCompatibility_EP_NOT_APPLICABLE;
-  OrtStatus* status = factory.ValidateCompiledModelCompatibilityInfo(
-      &factory, devices, 1, "1:2.0.0:1.22.0:3.0.0:73:0", &compat);
-
-  bool added_htp_backend_type = false;
-  for (const auto& kv : ctx.added_config_entries) {
-    if (kv.first.find("backend_type") != std::string::npos && kv.second == "htp") {
-      added_htp_backend_type = true;
-      break;
-    }
+  const Ort::Logger logger = MakeNullLogger();
+  qnn::QnnBackendManagerConfig config{};
+  auto manager = qnn::QnnBackendManager::Create(config, ctx.MakeApiPtrs(), logger);
+  const std::weak_ptr<void> lifetime = manager->GetBackendLibraryLifetime();
+  {
+    QnnEpFactory factory("ep", ctx.MakeApiPtrs());
+    factory.RegisterQnnBackendManager(manager);
+    factory.UnloadBackendLibraries();
+    EXPECT_FALSE(lifetime.expired());
   }
-  EXPECT_TRUE(added_htp_backend_type)
-      << "Validate should have added backend_type=htp before temp-EP construction";
-
-  if (status != nullptr) ctx.stub_ort_api.ReleaseStatus(status);
-}
-
-// GetHardwareDeviceIncompatibilityDetailsImpl temp-EP path: NPU/Qualcomm
-// device passes the type/vendor gate, then CreateSessionOptions +
-// AddSessionConfigEntry("backend_type","htp") fire, then temp-EP
-// construction is attempted. Covers lines 473-500.
-TEST_F(QnnUnit_ProviderFactoryHtpTest,
-       GetHardwareDeviceIncompatibilityDetails_NpuQualcomm_WiresHtpBackendType) {
-  FactoryStubContext ctx;
-  UseFactoryStubs use(ctx);
-  auto* fake_logger = reinterpret_cast<OrtLogger*>(kFakeToken);
-  ScopedDefaultLoggerOverride logger_scope(fake_logger);
-  QnnEpFactory factory("QNNExecutionProvider", ctx.MakeApiPtrs());
-
-  OrtHardwareDevice* npu = MakeFakeHwDevice(24);
-  ctx.device_type_map[npu] = OrtHardwareDeviceType_NPU;
-  ctx.device_vendor_map[npu] = kQualcommVendorId;
-
-  auto* fake_details = reinterpret_cast<OrtDeviceEpIncompatibilityDetails*>(kFakeToken);
-  OrtStatus* status = factory.GetHardwareDeviceIncompatibilityDetails(
-      &factory, npu, fake_details);
-
-  bool added_htp_backend_type = false;
-  for (const auto& kv : ctx.added_config_entries) {
-    if (kv.first.find("backend_type") != std::string::npos && kv.second == "htp") {
-      added_htp_backend_type = true;
-      break;
-    }
-  }
-  EXPECT_TRUE(added_htp_backend_type)
-      << "Incompatibility should have added backend_type=htp before temp-EP construction";
-
-  if (status != nullptr) ctx.stub_ort_api.ReleaseStatus(status);
+  EXPECT_FALSE(lifetime.expired());
+  manager.reset();
+  EXPECT_TRUE(lifetime.expired());
 }
 
 }  // namespace test

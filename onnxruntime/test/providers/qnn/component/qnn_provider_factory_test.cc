@@ -1451,7 +1451,7 @@ TEST_F(QnnUnit_ProviderFactoryTest, GetSupportedDevices_EnvironmentErrorPropagat
   size_t count = 99;
   Ort::Status status(factory.GetSupportedDevices(&factory, nullptr, 0, output, 2, &count));
   ASSERT_FALSE(status.IsOK());
-  EXPECT_STREQ(status.GetErrorMessage(), "stub environment failure");
+  EXPECT_EQ(status.GetErrorMessage(), "stub environment failure");
   EXPECT_EQ(count, 0u);
   EXPECT_TRUE(ctx.created_ep_devices.empty());
 }
@@ -1599,7 +1599,7 @@ TEST_F(QnnUnit_ProviderFactoryTest, IncompatibilityDetails_CpuConfigFailureRelea
   Ort::Status status(factory.GetHardwareDeviceIncompatibilityDetails(
       &factory, ctx.AddDevice(OrtHardwareDeviceType_CPU), reinterpret_cast<OrtDeviceEpIncompatibilityDetails*>(kFakeToken)));
   ASSERT_FALSE(status.IsOK());
-  EXPECT_STREQ(status.GetErrorMessage(), "CPU config failure");
+  EXPECT_EQ(status.GetErrorMessage(), "CPU config failure");
   EXPECT_EQ(ctx.create_session_options_calls, 1);
   EXPECT_EQ(ctx.release_session_options_calls, 1);
 }

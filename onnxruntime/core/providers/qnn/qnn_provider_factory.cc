@@ -448,7 +448,7 @@ OrtStatus* ORT_API_CALL QnnEpFactory::GetSupportedDevicesImpl(OrtEpFactory* this
         FuncDeleter<OrtHardwareDevice>{factory->ep_api.ReleaseHardwareDevice}));
 
     RETURN_IF_NOT_NULL(create_ep_device(factory->synthesized_hw_devices_.back().get(),
-                                       configured_target.empty() ? discovered_target : configured_target));
+                                        configured_target.empty() ? discovered_target : configured_target));
   }
 #endif
 

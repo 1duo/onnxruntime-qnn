@@ -251,7 +251,7 @@ class FactoryStubContext {
     };
     stub_ort_api.ReleaseKeyValuePairs = [](OrtKeyValuePairs*) noexcept {};
     stub_ort_api.GetKeyValuePairs = [](const OrtKeyValuePairs*, const char* const** keys,
-                                      const char* const** values, size_t* num_entries) noexcept {
+                                       const char* const** values, size_t* num_entries) noexcept {
       static const char* metadata_keys[] = {kOrtHardwareDevice_MetadataKey_IsVirtual};
       static const char* metadata_values[] = {"1"};
       *keys = metadata_keys;
@@ -1042,7 +1042,6 @@ TEST_F(QnnUnit_ProviderFactoryTest,
   OrtStatus* status = factory.GetSupportedDevices(&factory, nullptr, 0, ep_devices, 4, &num);
   ASSERT_EQ(status, nullptr);
   EXPECT_EQ(num, 1u);  // Preserve the generic discovery path from #896.
-
 }
 
 #endif  // defined(_WIN32) && QNN_ARCH_ARM64 && QNN API >= 2.40

@@ -136,6 +136,10 @@ class QnnUnit_GpuBackendConfigTest : public ::testing::Test {
       for (size_t i = 0; configs && configs[i]; ++i) gpu_capture->global_configs.push_back(*configs[i]);
       return gpu_capture->global_result;
     };
+    api.errorGetMessage = [](Qnn_ErrorHandle_t, const char** message) -> Qnn_ErrorHandle_t {
+      *message = "stub error";
+      return QNN_SUCCESS;
+    };
     api.backendCreate = [](Qnn_LogHandle_t, const QnnBackend_Config_t** configs,
                            Qnn_BackendHandle_t* backend) -> Qnn_ErrorHandle_t {
       ++gpu_capture->backend_calls;

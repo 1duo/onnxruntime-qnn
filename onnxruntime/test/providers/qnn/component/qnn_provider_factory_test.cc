@@ -2,8 +2,9 @@
 // SPDX-License-Identifier: MIT
 //
 // Component tests for factory enumeration, backend selection, compatibility
-// probes, and resource ownership. QnnEp construction is lazy, so default
-// selection tests do not need a QNN backend library or an ORT session.
+// probes, data-transfer creation, and resource ownership. QnnEp construction
+// is lazy, so default selection tests do not need a QNN backend library or an
+// ORT session.
 
 #if !defined(ORT_MINIMAL_BUILD) && QNN_EP_INTERNAL_SYMBOL_ACCESS
 
@@ -534,13 +535,18 @@ TEST_F(QnnUnit_ProviderFactoryTest, IsStreamAware_ReturnsFalse) {
   EXPECT_FALSE(factory.IsStreamAware(&factory));
 }
 
-TEST_F(QnnUnit_ProviderFactoryTest, CreateDataTransfer_SetsNullAndReturnsOk) {
+TEST_F(QnnUnit_ProviderFactoryTest, CreateDataTransfer_ReturnsInitializedTransfer) {
   FactoryStubContext ctx;
   UseFactoryStubs use(ctx);
   QnnEpFactory factory("ep", ctx.MakeApiPtrs());
-  OrtDataTransferImpl* transfer = reinterpret_cast<OrtDataTransferImpl*>(0xDEAD);
+  OrtDataTransferImpl* transfer = nullptr;
   EXPECT_EQ(factory.CreateDataTransfer(&factory, &transfer), nullptr);
-  EXPECT_EQ(transfer, nullptr);
+  ASSERT_NE(transfer, nullptr);
+  EXPECT_EQ(transfer->ort_version_supported, ORT_API_VERSION);
+  EXPECT_NE(transfer->CanCopy, nullptr);
+  EXPECT_NE(transfer->CopyTensors, nullptr);
+  EXPECT_NE(transfer->Release, nullptr);
+  transfer->Release(transfer);
 }
 
 TEST_F(QnnUnit_ProviderFactoryTest, CreateAllocator_HostAccessible_DoesNotLoadRpcMem) {

@@ -270,7 +270,7 @@ OrtStatus* ORT_API_CALL QnnEpFactory::GetSupportedDevicesImpl(OrtEpFactory* this
     factory->ort_api.CreateKeyValuePairs(&ep_options);
     auto release_ep_options = gsl::finally([&factory, &ep_options] { factory->ort_api.ReleaseKeyValuePairs(ep_options); });
 
-    if (is_virtual) {
+    if (is_virtual && soc_model != QNN_SOC_MODEL_UNKNOWN) {
       factory->ort_api.AddKeyValuePair(ep_options, "soc_model", std::to_string(soc_model).c_str());
     }
 

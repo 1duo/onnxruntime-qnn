@@ -465,6 +465,7 @@ OrtStatus* ORT_API_CALL QnnEpFactory::CreateEpImpl(OrtEpFactory* this_ptr,
                                                    _Out_ OrtEp** ep) noexcept {
   auto* factory = static_cast<QnnEpFactory*>(this_ptr);
   *ep = nullptr;
+  (void)ep_metadata;  // Used only by the Windows ARM64 AOT path below.
 
   // Check if logger is nullptr and get default logger if available
   if (logger == nullptr) {

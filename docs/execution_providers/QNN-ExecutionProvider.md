@@ -241,8 +241,13 @@ Warning: Enabling HTP Monolithic LSTM may improve session creation time, but thi
 
 |`"enable_block_quant_weight_optimization"`|Description|
 |---|---|
-|`"0"`|Default. Disabled. Block-quantized models use the standard compatibility path.|
-|`"1"`|Enabled. Uses an optimized path for block-quantized weights when supported. If the optimized path is not available, QNN EP falls back to the standard compatibility path.|
+|'0'|Default. Disabled. Block-quantized models use the standard compatibility path.|
+|'1'|Enabled. Uses an optimized path for block-quantized weights when supported. If the optimized path is not available, QNN EP falls back to the standard compatibility path.|
+
+|`"use_native_matmul"`|Description|
+|---|---|
+|`"0"`|Default. MatMul, Gemm, and QLinearMatMul operators are translated to QNN FullyConnected (weight transposed from [K,N] to [N,K] at session creation time).|
+|`"1"`|Enabled. MatMul, Gemm, and QLinearMatMul operators are lowered to native QNN MatMul, eliminating host-side weight transposition. Reduces session creation time and peak host memory for large GenAI/MoE models.|
 
 |`"enable_htp_shared_memory_allocator"`|Description|
 |---|---|
@@ -798,6 +803,7 @@ QNN EP recognizes the following multi-op patterns and fuses them into a single Q
 | `ReduceMean → Sub → Pow(2) → ReduceMean → Add(ε) → Sqrt → Div → Mul(γ) → Add(β)` | `QNN_OP_LAYER_NORM` | Matches the manual LayerNorm decomposition. Gamma and beta must be constants. |
 | `Mul(scalar constant) → Softmax` | `QNN_OP_SOFTMAX` | The scalar multiplier is folded into the beta parameter of QNN's Softmax. |
 | `ReduceL2 → Add(ε) → Div(x, .)` | `QNN_OP_L2_NORM` | Avoids fp16 overflow in the ReduceL2→Sqrt decomposition by using HTP's native L2Norm kernel. Epsilon must be a constant scalar. |
+| `SequenceConstruct(t₀..tₙ₋₁) → SequenceAt(seq, pos)` | `QNN_OP_RESHAPE × N + QNN_OP_CONCAT + QNN_OP_GATHER` | Requires homogeneous element shapes. String/complex element types fall back to CPU EP. Negative `position` values are normalized at compile time (static) or via `QNN_OP_ELEMENT_WISE_ADD + QNN_OP_ELEMENT_WISE_SELECT` (dynamic). |
 | `Reshape(ND→2D) → Gemm` | `QNN_OP_FULLY_CONNECTED` | Input Reshape must not be shared; Gemm: transA=0, transB=0, alpha=1, beta=1; weight must be a constant; input rank ≤ 4. CPU and HTP backends only. |
 | `Reshape(ND→2D) → Gemm → Reshape(2D→MD)` | `QNN_OP_FULLY_CONNECTED` + `QNN_OP_RESHAPE` | 3-node variant; quantized weights supported. |
 | `Reshape(ND→2D) → Gemm → Reshape(2D→MD) → Reshape(MD→PD)` | `QNN_OP_FULLY_CONNECTED` + `QNN_OP_RESHAPE` | 4-node variant; two consecutive output Reshapes. |
@@ -812,7 +818,7 @@ QNN EP recognizes the following multi-op patterns and fuses them into a single Q
 | `Reshape(5D→6D) → Transpose → Reshape(6D→5D)` (unit dim) | `QNN_OP_RESHAPE + QNN_OP_TRANSPOSE` | Unit dimension must appear at the same index in the rank-6 intermediate. Does not apply to SpaceToDepth decompositions. |
 | `Gather(rank-5, axis=4) → Transpose → Reshape` | Multi-node QNN subgraph | Constant rank-2 indices (row-major or column-major). |
 | `Transpose → Reshape → Transpose` | `QNN_OP_RESHAPE` | Fires when the combined transformation reduces to a pure reshape (dimension-merging only, no reordering). Intermediate QDQ nodes are permitted. |
-| `Reshape → [Q → DQ]? → Transpose` | `QNN_OP_TRANSPOSE` or noop `QNN_OP_RESHAPE` | Fires when Reshape is equivalent to a permutation (same rank, non-1 dims in same relative order). Composes the reshape-implied perm with the Transpose perm; emits identity Reshape if composed perm is identity, or a single Transpose otherwise. |
+| `Reshape → [Q → DQ]? → Transpose` | `QNN_OP_TRANSPOSE` or `QNN_OP_RESHAPE` | Fires when Reshape is equivalent to a permutation (same rank, non-1 dims in same relative order). Composes the reshape-implied perm with the Transpose perm; emits a noop Reshape if the composed perm is identity, a Reshape if it only moves size-1 dimensions and changes shape, or a single Transpose otherwise. |
 
 ### Miscellaneous fusions
 

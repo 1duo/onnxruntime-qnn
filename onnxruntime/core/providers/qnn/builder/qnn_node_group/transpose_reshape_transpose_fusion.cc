@@ -37,11 +37,11 @@ std::optional<std::vector<int64_t>> GetTransposePerm(const OrtNodeUnit& transpos
   OrtNodeAttrHelper helper(transpose);
   std::vector<int64_t> perm;
   if (helper.HasAttr(kAttrTransposePerm)) {
-    const auto perm_attr = helper.GetInt64s(kAttrTransposePerm);
+    auto perm_attr = helper.GetInt64s(kAttrTransposePerm);
     if (!perm_attr.has_value()) {
       return std::nullopt;
     }
-    perm = *perm_attr;
+    perm = std::move(*perm_attr);
   } else {
     perm.resize(rank);
     for (size_t i = 0; i < rank; ++i) {

@@ -465,6 +465,19 @@ TEST_F(QnnHTPBackendTests, GatherNDOp_BoolInputOutput_HighRankIndices) {
       ExpectedEPNodeAssignment::All);
 }
 
+// Exercises the INT64 graph-output cast after restoring the ONNX shape for high-rank indices.
+TEST_F(QnnHTPBackendTests, GatherNDOp_Int64InputOutput_HighRankIndices) {
+  RunOpTest<int64_t, int64_t>(
+      "GatherND",
+      TestInputDef<int64_t>({1, 4}, false,
+                            {0, 1, 2, 3}),
+      TestInputDef<int64_t>({1, 1, 1, 2, 2}, true,
+                            {0, 0, 0, 3}),
+      {},  // No attributes for GatherND
+      13,  // Opset version
+      ExpectedEPNodeAssignment::All);
+}
+
 // Flattening indices[:-1] is not semantics-preserving when batch_dims is non-zero. Verify that
 // high-rank indices with batch_dims > 0 remain on CPU instead of using the HTP reshape workaround.
 TEST_F(QnnHTPBackendTests, GatherNDOp_HighRankIndices_BatchDims1_FallsBack) {

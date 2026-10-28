@@ -12,6 +12,7 @@
 
 #include "core/providers/qnn/builder/op_builder_factory.h"
 #include "core/providers/qnn/builder/qnn_model_wrapper.h"
+#include "core/providers/qnn/common/qnn_graph_utils.h"
 #include "test/providers/qnn/infra/qnn_unit_test_utils.h"
 
 using namespace onnxruntime;

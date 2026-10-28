@@ -4,6 +4,7 @@
 #if !defined(ORT_MINIMAL_BUILD)
 
 #include <filesystem>
+#include <string>
 #include <vector>
 
 #include "test/providers/qnn/qnn_node_group/qnn_graph_checker.h"
@@ -171,6 +172,46 @@ TEST_F(QnnHTPBackendTests, TransposeReshapeTransposeFusion_DefaultPerms) {
 
   AssertOpInQnnGraph(json_qnn_graph_dir, "Reshape", 1);
   AssertOpInQnnGraph(json_qnn_graph_dir, "Transpose", 0);
+}
+
+// Verify that either Transpose can independently rely on ONNX's default reverse-order permutation.
+TEST_F(QnnHTPBackendTests, TransposeReshapeTransposeFusion_DefaultPermOnEitherTranspose) {
+  SKIP_HTP_TEST_ON_ARCH_LESS_THAN_OR_EQUAL_TO(QNN_HTP_DEVICE_ARCH_V68);
+
+  struct DefaultPermCase {
+    const char* name;
+    bool omit_perm1;
+    bool omit_perm2;
+  };
+  const DefaultPermCase test_cases[] = {
+      {"First", true, false},
+      {"Second", false, true},
+  };
+
+  const std::vector<int64_t> input_shape{2, 3, 4};
+  const auto input_def = TestInputDef<float>(input_shape, false, -1.0f, 1.0f);
+  const std::vector<int64_t> reverse_perm{2, 1, 0};
+
+  for (const auto& test_case : test_cases) {
+    const std::filesystem::path json_qnn_graph_dir =
+        std::string("TransposeReshapeTransposeFusion_DefaultPerm") + test_case.name;
+    std::filesystem::remove_all(json_qnn_graph_dir);
+    ASSERT_TRUE(std::filesystem::create_directory(json_qnn_graph_dir));
+    auto cleanup = gsl::finally([&json_qnn_graph_dir]() { std::filesystem::remove_all(json_qnn_graph_dir); });
+
+    ProviderOptions provider_options = GetProviderOptions();
+    provider_options["dump_json_qnn_graph"] = "1";
+    provider_options["json_qnn_graph_dir"] = json_qnn_graph_dir.string();
+
+    RunQnnModelTest(BuildTransposeReshapeTransposeTestCase(
+                        input_def, reverse_perm, /*reshape_shape=*/{4, 3, 2}, reverse_perm,
+                        test_case.omit_perm1, test_case.omit_perm2),
+                    provider_options, 13,
+                    EPVerificationParams{ExpectedEPNodeAssignment::All, ElementwiseAbsoluteVerifier(1e-2f)});
+
+    AssertOpInQnnGraph(json_qnn_graph_dir, "Reshape", 1);
+    AssertOpInQnnGraph(json_qnn_graph_dir, "Transpose", 0);
+  }
 }
 
 TEST_F(QnnHTPBackendTests, TransposeReshapeTransposeFusion_NameCollision) {

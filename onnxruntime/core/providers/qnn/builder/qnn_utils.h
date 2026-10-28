@@ -744,20 +744,19 @@ Ort::Status TwoDimensionTranspose(size_t rows,
                                   gsl::span<const uint8_t> input_buffer,
                                   gsl::span<uint8_t> output_buffer);
 
+Ort::Status ValidateTwoDimensionTransposeInput(const std::vector<uint32_t>& data_shape,
+                                               size_t data_size);
+
 template <typename T>
 Ort::Status TwoDimensionTranspose(const std::vector<T>& data,
                                   const std::vector<uint32_t>& data_shape,
                                   /* out */ std::vector<T>& transposed_data,
                                   const Ort::Logger& logger,
                                   bool skip_output_data_copy = false) {
-  RETURN_IF_NOT(data_shape.size() == 2, "Expected shape of rank 2");
+  RETURN_IF_ERROR(ValidateTwoDimensionTransposeInput(data_shape, data.size()));
   const size_t rows = data_shape[0];
   const size_t cols = data_shape[1];
-  RETURN_IF(rows != 0 && cols > std::numeric_limits<size_t>::max() / rows,
-            "Transpose shape element count overflows size_t");
   const size_t element_count = rows * cols;
-  RETURN_IF_NOT(data.size() == element_count,
-                "Transpose data size does not match rows * cols");
   transposed_data.resize(element_count, 0);
 
   if (skip_output_data_copy) {

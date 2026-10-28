@@ -1674,6 +1674,20 @@ Ort::Status TwoDimensionTranspose(size_t rows,
   return Ort::Status();
 }
 
+Ort::Status ValidateTwoDimensionTransposeInput(const std::vector<uint32_t>& data_shape,
+                                               size_t data_size) {
+  RETURN_IF_NOT(data_shape.size() == 2, "Expected shape of rank 2");
+
+  const size_t rows = data_shape[0];
+  const size_t cols = data_shape[1];
+  RETURN_IF(rows != 0 && cols > std::numeric_limits<size_t>::max() / rows,
+            "Transpose shape element count overflows size_t");
+  RETURN_IF_NOT(data_size == rows * cols,
+                "Transpose data size does not match rows * cols");
+
+  return Ort::Status();
+}
+
 Ort::Status TwoDimensionTranspose(const QnnModelWrapper& qnn_model_wrapper,
                                   std::vector<uint32_t>& data_shape,
                                   const OrtValueInfo* initializer,

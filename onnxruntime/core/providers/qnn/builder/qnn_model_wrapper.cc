@@ -14,6 +14,7 @@
 
 #include "core/providers/qnn/builder/op_tracing/qnn_op_tracing.h"
 #include "core/providers/qnn/builder/qnn_backend_manager.h"
+#include "core/providers/qnn/builder/qnn_graph_emitter.h"
 #include "core/providers/qnn/builder/qnn_utils.h"
 #include "core/providers/qnn/common/qnn_graph_utils.h"
 #include "core/providers/qnn/ort_api.h"
@@ -30,10 +31,12 @@ QnnModelWrapper::QnnModelWrapper(const OrtGraph& ort_graph,
                                  const ModelSettings& model_settings,
                                  std::unordered_map<std::string, std::string>* tensor_name_overrides,
                                  OpTraceCollector* op_trace_collector,
-                                 bool is_post_layout_transform)
+                                 bool is_post_layout_transform,
+                                 QnnGraphEmitter* graph_emitter)
     : ort_graph_(ort_graph),
       logger_(logger),
       qnn_backend_manager_(qnn_backend_manager),
+      graph_emitter_(graph_emitter),
       graph_inputs_(graph_inputs),
       graph_outputs_(graph_outputs),
       model_settings_(model_settings),
@@ -41,11 +44,17 @@ QnnModelWrapper::QnnModelWrapper(const OrtGraph& ort_graph,
       tensor_name_overrides_(tensor_name_overrides),
       op_trace_collector_(op_trace_collector),
       is_post_layout_transform_(is_post_layout_transform) {
+  if (graph_emitter_ == nullptr) {
+    owned_graph_emitter_ = std::make_unique<QnnGraphEmitter>(qnn_backend_manager_);
+    graph_emitter_ = owned_graph_emitter_.get();
+  }
   // Invariant: validator interface and handle must both be set or both be null.
   // They are populated together by QnnBackendManager::LoadQnnSerializerBackend() (QnnIr flow).
   assert((qnn_backend_manager_.GetQnnValidatorBackendHandle() == nullptr) ==
          (qnn_backend_manager_.GetQnnValidatorInterface().backendValidateOpConfig == nullptr));
 }
+
+QnnModelWrapper::~QnnModelWrapper() = default;
 
 QnnHtpDevice_Arch_t QnnModelWrapper::GetHtpArch() const {
   return qnn_backend_manager_.GetHtpArch();
@@ -63,32 +72,17 @@ bool QnnModelWrapper::CreateQnnGraph(const Qnn_ContextHandle_t& context,
     ORT_CXX_LOG(logger_, ORT_LOGGING_LEVEL_ERROR, ("Graph" + graph_name + " already initialized.").c_str());
     return false;
   }
-  if (context == nullptr) {
-    ORT_CXX_LOG(logger_, ORT_LOGGING_LEVEL_ERROR, "Invalid Qnn context.");
+  graph_emitter_->SetCreateInfo(context, graph_configs);
+  const Ort::Status status = graph_emitter_->CreateGraph(graph_name.c_str());
+  if (!status.IsOK()) {
+    ORT_CXX_LOG(logger_, ORT_LOGGING_LEVEL_ERROR, status.GetErrorMessage().c_str());
     return false;
   }
-  if (graph_name.length() == 0) {
-    ORT_CXX_LOG(logger_, ORT_LOGGING_LEVEL_ERROR, "Empty graph name.");
-    return false;
-  }
 
-  const auto& qnn_interface = qnn_backend_manager_.GetQnnInterface();
-  auto rt = qnn_interface.graphCreate(context, graph_name.c_str(), graph_configs, &graph_);
-  if (rt != QNN_GRAPH_NO_ERROR || graph_ == nullptr) {
-    rt = qnn_interface.graphRetrieve(context, graph_name.c_str(), &graph_);
-    if (rt != QNN_GRAPH_NO_ERROR || graph_ == nullptr) {
-      ORT_CXX_LOG(logger_, ORT_LOGGING_LEVEL_ERROR,
-                  ("Failed to create Qnn graph: " + graph_name + ". " +
-                   utils::FormatQnnError(qnn_interface, rt))
-                      .c_str());
-      return false;
-    }
-  }
-
-  ORT_CXX_LOG(logger_, ORT_LOGGING_LEVEL_VERBOSE, ("Created Qnn graph: " + graph_name).c_str());
-
+  graph_ = graph_emitter_->Graph();
   graph_name_ = graph_name;
-  graph_context_ = context;
+  graph_context_ = graph_emitter_->Context();
+  ORT_CXX_LOG(logger_, ORT_LOGGING_LEVEL_VERBOSE, ("Created Qnn graph: " + graph_name).c_str());
   return true;
 }
 

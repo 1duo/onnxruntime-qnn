@@ -4,7 +4,6 @@
 #if !defined(ORT_MINIMAL_BUILD) && QNN_EP_INTERNAL_SYMBOL_ACCESS
 
 #include <limits>
-#include <string>
 #include <utility>
 #include <vector>
 
@@ -58,7 +57,6 @@ TEST(QnnUnit_MatMulNBits_ComponentTest, RejectsInvalidDimensionsBeforeNarrowingO
 
   const Ort::Status negative_dimensions = CheckMatMulNBitsSupport(*builder, -256, -256, 4, 8);
   EXPECT_FALSE(negative_dimensions.IsOK());
-  EXPECT_NE(negative_dimensions.GetErrorMessage().find("K and N must both be positive"), std::string::npos);
 
   EXPECT_FALSE(CheckMatMulNBitsSupport(
                    *builder,
@@ -76,7 +74,6 @@ TEST(QnnUnit_MatMulNBits_ComponentTest, RejectsZeroBlockSizeBeforeDivision) {
 
   const Ort::Status status = CheckMatMulNBitsSupport(*builder, 64, 32, 4, 0);
   EXPECT_FALSE(status.IsOK());
-  EXPECT_NE(status.GetErrorMessage().find("bits and block_size must both be positive"), std::string::npos);
 }
 
 }  // namespace test

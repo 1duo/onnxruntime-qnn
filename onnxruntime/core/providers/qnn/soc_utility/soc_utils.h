@@ -26,6 +26,10 @@ uint32_t MapSocModelFromSocName(std::string_view soc_name);
 // Returns 0 (QNN_HTP_DEVICE_ARCH_NONE) if not found.
 uint32_t MapHtpArchFromSocModel(uint32_t soc_model);
 
+// Resolves a platform SoC ID to the corresponding Qnn_SocModel_t integer value.
+// Returns 0 (QNN_SOC_MODEL_UNKNOWN) if not found.
+uint32_t MapSocModelFromSocId(int soc_id);
+
 // Parses the htp_arch session option. Empty/"0" means automatic architecture;
 // unsupported or non-canonical values return nullopt.
 std::optional<uint32_t> ParseHtpArchitecture(std::string_view architecture);

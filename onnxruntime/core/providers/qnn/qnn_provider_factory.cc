@@ -15,7 +15,6 @@
 #include <iostream>
 #include <optional>
 #include <string_view>
-#include <type_traits>
 #include <utility>
 
 #include "QnnCommon.h"
@@ -33,58 +32,22 @@
 #include "qnn_ep_min_ort_api_version.h"
 
 #ifdef _WIN32
-#include <windows.h>
 #include "core/providers/qnn/qnn_external_resource_importer.h"
 #endif
 
-#if defined(_WIN32) && QNN_ARCH_ARM64 && \
-    (QNN_API_VERSION_MAJOR > 2 || (QNN_API_VERSION_MAJOR == 2 && QNN_API_VERSION_MINOR >= 40))
-#include "QnnInterface.h"
-#include "HTP/QnnHtpCommon.h"
-#include "HTP/QnnHtpDevice.h"
+namespace {
 
-// Only used when ORT identifies one physical Qualcomm NPU. QNN backend device
-// IDs are not DXCore IDs; decline ambiguous mappings instead of guessing.
-static std::string DiscoverSingleHtpTarget() {
-  const auto location = onnxruntime::GetDynamicLibraryLocationByAddress(
-      reinterpret_cast<const void*>(&DiscoverSingleHtpTarget));
-  if (location.empty()) return {};
-  const auto path = std::filesystem::path(location).parent_path() / L"QnnHtp.dll";
-  const auto release_library = [](HMODULE module) { if (module) FreeLibrary(module); };
-  std::unique_ptr<std::remove_pointer_t<HMODULE>, decltype(release_library)> library(
-      LoadLibraryExW(path.c_str(), nullptr, LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR | LOAD_LIBRARY_SEARCH_DEFAULT_DIRS),
-      release_library);
-  if (!library) return {};
-  auto get_providers = reinterpret_cast<decltype(&QnnInterface_getProviders)>(
-      GetProcAddress(library.get(), "QnnInterface_getProviders"));
-  const QnnInterface_t** providers = nullptr;
-  uint32_t count = 0;
-  if (!get_providers || get_providers(&providers, &count) != QNN_SUCCESS || !providers) return {};
-  for (uint32_t i = 0; i < count; ++i) {
-    if (!providers[i] || providers[i]->backendId != QNN_BACKEND_ID_HTP) continue;
-    const auto& version = providers[i]->apiVersion.coreApiVersion;
-    if (version.major != QNN_API_VERSION_MAJOR || version.minor < QNN_API_VERSION_MINOR) continue;
-    const auto& api = providers[i]->QNN_INTERFACE_VER_NAME;
-    if (!api.deviceGetPlatformInfo || !api.deviceFreePlatformInfo) continue;
-    const QnnDevice_PlatformInfo_t* info = nullptr;
-    const auto release_info = [&api](const QnnDevice_PlatformInfo_t* value) {
-      if (value) api.deviceFreePlatformInfo(nullptr, value);
-    };
-    const auto result = api.deviceGetPlatformInfo(nullptr, &info);
-    std::unique_ptr<const QnnDevice_PlatformInfo_t, decltype(release_info)> owned_info(info, release_info);
-    if (result != QNN_SUCCESS || !info || info->version != QNN_DEVICE_PLATFORM_INFO_VERSION_1 ||
-        info->v1.numHwDevices != 1 || !info->v1.hwDevices) continue;
-    const auto& device = info->v1.hwDevices[0];
-    if (device.version != QNN_DEVICE_HARDWARE_DEVICE_INFO_VERSION_1) continue;
-    const auto* extension = reinterpret_cast<const QnnHtpDevice_DeviceInfoExtension_t*>(device.v1.deviceInfoExtension);
-    if (extension && extension->devType == QNN_HTP_DEVICE_TYPE_ON_CHIP) {
-      const auto model = extension->onChipDevice.socModel;
-      return model != 0 ? std::to_string(model) : std::string{};
-    }
+// Chromium transports the DXCore device ID as an unprefixed hexadecimal uint32.
+// Also accept the conventional 0x prefix, while rejecting partial and overflow parses.
+bool ParseHardwareDeviceId(std::string_view text, uint32_t& device_id) {
+  if (text.size() >= 2 && text[0] == '0' && (text[1] == 'x' || text[1] == 'X')) {
+    text.remove_prefix(2);
   }
-  return {};
+  const auto result = std::from_chars(text.data(), text.data() + text.size(), device_id, 16);
+  return !text.empty() && result.ec == std::errc{} && result.ptr == text.data() + text.size();
 }
-#endif
+
+}  // namespace
 
 // We allow `backend_type` (e.g., `htp`) or `backend_path` in relative path (e.g., `QnnHtp.dll`) for configurations,
 // and QnnBackendManager will later find the appropriate library and load it relative to the OnnxRuntime library.
@@ -248,8 +211,7 @@ OrtStatus* ORT_API_CALL QnnEpFactory::GetSupportedDevicesImpl(OrtEpFactory* this
 
   // Read the environment before advertising devices. A compiler can describe its
   // target here even when ORT's hardware discovery cannot access the NPU.
-#if defined(_WIN32) && QNN_ARCH_ARM64 && \
-    (QNN_API_VERSION_MAJOR > 2 || (QNN_API_VERSION_MAJOR == 2 && QNN_API_VERSION_MINOR >= 40))
+#if defined(QNN_HTP_CROSS_DEVICE_PREPARE_AVAILABLE)
   bool allow_virtual_devices = false;
   std::optional<uint32_t> configured_npu_device_id;
   std::string configured_target;
@@ -259,19 +221,14 @@ OrtStatus* ORT_API_CALL QnnEpFactory::GetSupportedDevicesImpl(OrtEpFactory* this
     std::unique_ptr<OrtKeyValuePairs, decltype(factory->ort_api.ReleaseKeyValuePairs)> entries(
         env_config, factory->ort_api.ReleaseKeyValuePairs);
     if (entries) {
+      // ORT sets allow_virtual_devices="1" only in processes allowed to advertise
+      // compile-only devices. Other values leave virtual-device synthesis disabled.
       const char* allow = factory->ort_api.GetKeyValue(entries.get(), "allow_virtual_devices");
       allow_virtual_devices = allow != nullptr && std::string_view(allow) == "1";
       const std::string key = "ep_factory." + factory->ep_name_ + ".qnn_hardware_device_id";
       if (const char* value = factory->ort_api.GetKeyValue(entries.get(), key.c_str())) {
-        // Chromium writes an unprefixed hexadecimal ID (e.g. "41304430").
-        // Accept an explicit hex prefix too, but reject partial/overflow parses.
-        std::string_view text(value);
-        if (text.size() >= 2 && text[0] == '0' && (text[1] == 'x' || text[1] == 'X')) {
-          text.remove_prefix(2);
-        }
         uint32_t parsed = 0;
-        const auto result = std::from_chars(text.data(), text.data() + text.size(), parsed, 16);
-        if (text.empty() || result.ec != std::errc{} || result.ptr != text.data() + text.size()) {
+        if (!ParseHardwareDeviceId(value, parsed)) {
           return factory->ort_api.CreateStatus(
               ORT_INVALID_ARGUMENT, (key + " must be a hexadecimal uint32 hardware device ID.").c_str());
         }
@@ -279,6 +236,8 @@ OrtStatus* ORT_API_CALL QnnEpFactory::GetSupportedDevicesImpl(OrtEpFactory* this
       }
       const std::string target_key = "ep_factory." + factory->ep_name_ + ".qnn_target_architecture";
       if (const char* value = factory->ort_api.GetKeyValue(entries.get(), target_key.c_str())) {
+        // This value is a numeric QNN SoC model, not an HTP architecture. The
+        // selected virtual device later maps it to the corresponding htp_arch.
         if (!qnn::soc::ParseSocModelTarget(value)) {
           return factory->ort_api.CreateStatus(
               ORT_INVALID_ARGUMENT, (target_key + " must be a nonzero decimal QNN SoC model, e.g. 60.").c_str());
@@ -355,15 +314,13 @@ OrtStatus* ORT_API_CALL QnnEpFactory::GetSupportedDevicesImpl(OrtEpFactory* this
   bool has_npu_hw_device = false;
   uint32_t npu_device_id = 0;  // DXCore device_id of the real NPU, propagated to virtual NPU for WebNN matching.
   std::string discovered_target;
-#if defined(_WIN32) && QNN_ARCH_ARM64 && \
-    (QNN_API_VERSION_MAJOR > 2 || (QNN_API_VERSION_MAJOR == 2 && QNN_API_VERSION_MINOR >= 40))
-  size_t physical_npu_count = 0;
-  for (size_t i = 0; i < num_devices; ++i) {
-    if (factory->ort_api.HardwareDevice_Type(devices[i]) == OrtHardwareDeviceType_NPU &&
-        factory->ort_api.HardwareDevice_VendorId(devices[i]) == factory->vendor_id_) ++physical_npu_count;
+#if defined(QNN_HTP_CROSS_DEVICE_PREPARE_AVAILABLE)
+  // Device discovery runs before the caller chooses the QNN GPU or NPU backend.
+  // Derive the common compiler target without loading either backend library.
+  if (configured_target.empty()) {
+    const uint32_t soc_model = qnn::soc::MapSocModelFromSocId(qnn::soc::GetSocId());
+    if (soc_model != 0) discovered_target = std::to_string(soc_model);
   }
-  // A supplied compilation target must not depend on driver access in a sandbox.
-  if (physical_npu_count == 1 && configured_target.empty()) discovered_target = DiscoverSingleHtpTarget();
 #endif
 
   // Phase 1: Claim ORT Core hardware devices (from DXCore/SetupAPI).
@@ -386,8 +343,7 @@ OrtStatus* ORT_API_CALL QnnEpFactory::GetSupportedDevicesImpl(OrtEpFactory* this
 
   // Explicit compiler target identity takes precedence over discovery. Zero is
   // a valid supplied identity, so presence is tracked separately from its value.
-#if defined(_WIN32) && QNN_ARCH_ARM64 && \
-    (QNN_API_VERSION_MAJOR > 2 || (QNN_API_VERSION_MAJOR == 2 && QNN_API_VERSION_MINOR >= 40))
+#if defined(QNN_HTP_CROSS_DEVICE_PREPARE_AVAILABLE)
   if (configured_npu_device_id.has_value()) {
     if (npu_device_id != *configured_npu_device_id) discovered_target.clear();
     npu_device_id = *configured_npu_device_id;
@@ -395,8 +351,7 @@ OrtStatus* ORT_API_CALL QnnEpFactory::GetSupportedDevicesImpl(OrtEpFactory* this
 #endif
 
   bool use_supplied_virtual_device = false;
-#if defined(_WIN32) && QNN_ARCH_ARM64 && \
-    (QNN_API_VERSION_MAJOR > 2 || (QNN_API_VERSION_MAJOR == 2 && QNN_API_VERSION_MINOR >= 40))
+#if defined(QNN_HTP_CROSS_DEVICE_PREPARE_AVAILABLE)
   use_supplied_virtual_device = allow_virtual_devices && configured_npu_device_id.has_value();
 #endif
 
@@ -438,8 +393,7 @@ OrtStatus* ORT_API_CALL QnnEpFactory::GetSupportedDevicesImpl(OrtEpFactory* this
   // The supplied identity also enables this path without hardware rediscovery.
   // Selecting this device auto-configures cross_device_prepare + prepare_only in CreateEpImpl.
   // Cross device prepare requires Windows ARM64 + QAIRT >= 2.51 (QNN API 2.40).
-#if defined(_WIN32) && QNN_ARCH_ARM64 && \
-    (QNN_API_VERSION_MAJOR > 2 || (QNN_API_VERSION_MAJOR == 2 && QNN_API_VERSION_MINOR >= 40))
+#if defined(QNN_HTP_CROSS_DEVICE_PREPARE_AVAILABLE)
   if (allow_virtual_devices && num_ep_devices < max_ep_devices &&
       (has_npu_hw_device || configured_npu_device_id.has_value())) {
     OrtHardwareDevice* virtual_npu = nullptr;
@@ -565,8 +519,7 @@ OrtStatus* ORT_API_CALL QnnEpFactory::CreateEpImpl(OrtEpFactory* this_ptr,
 
   // Auto-configure lockdown AOT when a virtual device is selected.
   // Injects cross_device_prepare, prepare_only, and context_enable as defaults (skipped if user already set them).
-#if defined(_WIN32) && QNN_ARCH_ARM64 && \
-    (QNN_API_VERSION_MAJOR > 2 || (QNN_API_VERSION_MAJOR == 2 && QNN_API_VERSION_MINOR >= 40))
+#if defined(QNN_HTP_CROSS_DEVICE_PREPARE_AVAILABLE)
   {
     bool has_virtual_device = false;
     std::optional<uint32_t> target_soc;

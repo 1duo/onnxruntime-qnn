@@ -804,7 +804,7 @@ Ort::Status TwoDimensionTranspose(size_t rows,
                                   gsl::span<const uint8_t> input_buffer,
                                   gsl::span<uint8_t> output_buffer);
 
-Ort::Status ValidateTwoDimensionTransposeInput(const std::vector<uint32_t>& data_shape,
+Ort::Status ValidateTwoDimensionTransposeInput(gsl::span<const uint32_t> data_shape,
                                                size_t data_size);
 
 template <typename T>

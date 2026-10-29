@@ -1674,7 +1674,7 @@ Ort::Status TwoDimensionTranspose(size_t rows,
   return Ort::Status();
 }
 
-Ort::Status ValidateTwoDimensionTransposeInput(const std::vector<uint32_t>& data_shape,
+Ort::Status ValidateTwoDimensionTransposeInput(gsl::span<const uint32_t> data_shape,
                                                size_t data_size) {
   RETURN_IF_NOT(data_shape.size() == 2, "Expected shape of rank 2");
 

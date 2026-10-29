@@ -127,20 +127,26 @@ const std::unordered_set<int64_t> kGpuSupportedBlockSize{32};
 const std::unordered_map<int64_t, int64_t> kHtpSupportedBitsAndBlockSizeMultipliers{{2, 16}, {4, 8}, {8, 4}};
 
 Ort::Status ValidateMatMulNBitsDimensions(int64_t K, int64_t N) {
-  RETURN_IF(K <= 0 || N <= 0, "MatMulNBits K and N must both be positive.");
-  RETURN_IF(K > static_cast<int64_t>(std::numeric_limits<uint32_t>::max()) ||
-                N > static_cast<int64_t>(std::numeric_limits<uint32_t>::max()),
-            "MatMulNBits K and N must fit in uint32.");
-  RETURN_IF(N > std::numeric_limits<int64_t>::max() / K,
-            "MatMulNBits K * N overflows int64.");
+  if (K <= 0 || N <= 0) {
+    return Ort::Status("MatMulNBits K and N must both be positive.", ORT_INVALID_ARGUMENT);
+  }
+  if (K > static_cast<int64_t>(std::numeric_limits<uint32_t>::max()) ||
+      N > static_cast<int64_t>(std::numeric_limits<uint32_t>::max())) {
+    return Ort::Status("MatMulNBits K and N must fit in uint32.", ORT_INVALID_ARGUMENT);
+  }
+  if (N > std::numeric_limits<int64_t>::max() / K) {
+    return Ort::Status("MatMulNBits K * N overflows int64.", ORT_INVALID_ARGUMENT);
+  }
   return Ort::Status();
 }
 
 Ort::Status ValidateMatMulNBitsBlockAttributes(int64_t bits, int64_t block_size) {
-  RETURN_IF(bits <= 0 || block_size <= 0,
-            "MatMulNBits bits and block_size must both be positive.");
-  RETURN_IF(block_size > static_cast<int64_t>(std::numeric_limits<uint32_t>::max()),
-            "MatMulNBits block_size must fit in uint32.");
+  if (bits <= 0 || block_size <= 0) {
+    return Ort::Status("MatMulNBits bits and block_size must both be positive.", ORT_INVALID_ARGUMENT);
+  }
+  if (block_size > static_cast<int64_t>(std::numeric_limits<uint32_t>::max())) {
+    return Ort::Status("MatMulNBits block_size must fit in uint32.", ORT_INVALID_ARGUMENT);
+  }
   return Ort::Status();
 }
 

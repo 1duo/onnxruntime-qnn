@@ -49,31 +49,32 @@ Ort::Status CheckMatMulNBitsSupport(const IOpBuilder& builder,
   return builder.IsOpSupported(*wrapper, node_unit, ctx.ort_logger);
 }
 
+void ExpectInvalidArgument(const IOpBuilder& builder,
+                           int64_t K, int64_t N, int64_t bits, int64_t block_size) {
+  const Ort::Status status = CheckMatMulNBitsSupport(builder, K, N, bits, block_size);
+  EXPECT_EQ(status.GetErrorCode(), ORT_INVALID_ARGUMENT);
+}
+
 }  // namespace
 
 TEST(QnnUnit_MatMulNBits_ComponentTest, RejectsInvalidDimensionsBeforeNarrowingOrTranspose) {
   const IOpBuilder* builder = GetOpBuilder("MatMulNBits");
   ASSERT_NE(builder, nullptr);
 
-  const Ort::Status negative_dimensions = CheckMatMulNBitsSupport(*builder, -256, -256, 4, 8);
-  EXPECT_FALSE(negative_dimensions.IsOK());
-
-  EXPECT_FALSE(CheckMatMulNBitsSupport(
-                   *builder,
-                   static_cast<int64_t>(std::numeric_limits<uint32_t>::max()) + 1, 32, 4, 8)
-                   .IsOK());
-  EXPECT_FALSE(CheckMatMulNBitsSupport(
-                   *builder,
-                   64, static_cast<int64_t>(std::numeric_limits<uint32_t>::max()) + 1, 4, 8)
-                   .IsOK());
+  constexpr int64_t max_uint32 = std::numeric_limits<uint32_t>::max();
+  ExpectInvalidArgument(*builder, -256, -256, 4, 8);
+  ExpectInvalidArgument(*builder, 0, 32, 4, 8);
+  ExpectInvalidArgument(*builder, 64, 0, 4, 8);
+  ExpectInvalidArgument(*builder, max_uint32 + 1, 32, 4, 8);
+  ExpectInvalidArgument(*builder, 64, max_uint32 + 1, 4, 8);
+  ExpectInvalidArgument(*builder, max_uint32, max_uint32, 4, 8);
 }
 
 TEST(QnnUnit_MatMulNBits_ComponentTest, RejectsZeroBlockSizeBeforeDivision) {
   const IOpBuilder* builder = GetOpBuilder("MatMulNBits");
   ASSERT_NE(builder, nullptr);
 
-  const Ort::Status status = CheckMatMulNBitsSupport(*builder, 64, 32, 4, 0);
-  EXPECT_FALSE(status.IsOK());
+  ExpectInvalidArgument(*builder, 64, 32, 4, 0);
 }
 
 }  // namespace test

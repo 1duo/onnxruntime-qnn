@@ -756,7 +756,7 @@ class QnnBackendManager : public std::enable_shared_from_this<QnnBackendManager>
   // The QnnContextHandleRecord has ownership of the Qnn_ContextHandle_t.
   // Note: Using shared_ptr<QnnContextHandleRecord> so that we can refer to it with a weak_ptr from a
   // HtpSharedMemoryAllocator allocation cleanup callback.
-  std::unordered_map<Qnn_ContextHandle_t, std::shared_ptr<QnnContextHandleRecord>> context_map_;
+  std::unordered_map<Qnn_ContextHandle_t, std::shared_ptr<QnnContextHandleRecord>> context_handle_record_map_;
 
   // Serializes the check → release → create → register sequence in RecoverFromSSR().
   // In weight-sharing scenarios multiple QnnModel instances may detect an SSR event
@@ -769,7 +769,7 @@ class QnnBackendManager : public std::enable_shared_from_this<QnnBackendManager>
   std::mutex ep_context_handle_map_mutex_;
   std::unordered_map<std::string, Qnn_ContextHandle_t> ep_context_handle_map_;
 
-  // Vector of Qnn_ContextHandle_t. The context handles are owned by context_map_.
+  // Vector of Qnn_ContextHandle_t. The context handles are owned by context_handle_record_map_.
   std::vector<Qnn_ContextHandle_t> contexts_;
 
   bool backend_lib_loaded_ = false;

@@ -1884,7 +1884,7 @@ Ort::Status QnnBackendManager::ReleaseContext() {
   {
     std::lock_guard<std::mutex> lock(context_map_mutex_);
     contexts_.clear();
-    context_map_.clear();
+    context_handle_record_map_.clear();
   }
 
   context_created_ = false;
@@ -2950,7 +2950,7 @@ Ort::Status QnnBackendManager::AddQnnContextHandle(Qnn_ContextHandle_t raw_conte
   context_handle_record->mem_handles = std::move(mem_handle_manager);
 
   const std::lock_guard<std::mutex> lock(context_map_mutex_);
-  const bool inserted = context_map_.try_emplace(raw_context_handle, std::move(context_handle_record)).second;
+  const bool inserted = context_handle_record_map_.try_emplace(raw_context_handle, std::move(context_handle_record)).second;
   RETURN_IF_NOT(inserted, "QNN context was already added.");
 
   contexts_.push_back(raw_context_handle);
@@ -2961,8 +2961,8 @@ Ort::Status QnnBackendManager::AddQnnContextHandle(Qnn_ContextHandle_t raw_conte
 QnnBackendManager::ContextHandleLease QnnBackendManager::GetContextHandleLease(
     Qnn_ContextHandle_t context_handle) const {
   const std::lock_guard<std::mutex> lock(context_map_mutex_);
-  const auto it = context_map_.find(context_handle);
-  if (it == context_map_.end()) {
+  const auto it = context_handle_record_map_.find(context_handle);
+  if (it == context_handle_record_map_.end()) {
     return {};
   }
   return ContextHandleLease{it->second};
@@ -3200,7 +3200,7 @@ void QnnBackendManager::ReleaseSpecificContextHandle(Qnn_ContextHandle_t old_con
     contexts_.erase(std::remove(contexts_.begin(), contexts_.end(), old_context), contexts_.end());
 
     // The context is freed after the last active lease releases its shared ownership.
-    context_map_.erase(old_context);
+    context_handle_record_map_.erase(old_context);
   }
 }
 

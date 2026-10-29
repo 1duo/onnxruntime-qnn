@@ -1,14 +1,14 @@
-// Copyright (c) Qualcomm Innovation Center, Inc. All rights reserved.
+// Copyright (c) Qualcomm Technologies, Inc. and/or its subsidiaries.
 // SPDX-License-Identifier: MIT
 
 #include "core/providers/qnn/builder/qnn_graph_emitter.h"
 
-#include "core/providers/qnn/builder/qnn_backend_manager.h"
 #include "core/providers/qnn/builder/qnn_utils.h"
 
 namespace onnxruntime::qnn {
 
-QnnGraphEmitter::QnnGraphEmitter(const QnnBackendManager& manager) : manager_(manager) {}
+QnnGraphEmitter::QnnGraphEmitter(const QNN_INTERFACE_VER_TYPE& qnn_interface)
+    : qnn_interface_(qnn_interface) {}
 
 void QnnGraphEmitter::SetCreateInfo(Qnn_ContextHandle_t context,
                                     const QnnGraph_Config_t** graph_configs) {
@@ -23,13 +23,12 @@ Ort::Status QnnGraphEmitter::CreateGraph(const char* name) {
   RETURN_IF(name == nullptr || name[0] == '\0', "Empty graph name.");
   RETURN_IF(graph_ != nullptr, "A QNN emitter already owns a graph.");
 
-  const auto& qnn_interface = manager_.GetQnnInterface();
-  auto status = qnn_interface.graphCreate(context_, name, graph_configs_, &graph_);
+  auto status = qnn_interface_.graphCreate(context_, name, graph_configs_, &graph_);
   if (status != QNN_GRAPH_NO_ERROR || graph_ == nullptr) {
-    status = RetrieveGraphHandle(qnn_interface, context_, name, &graph_);
+    status = RetrieveGraphHandle(qnn_interface_, context_, name, &graph_);
     if (status != QNN_GRAPH_NO_ERROR || graph_ == nullptr) {
       return MAKE_EP_FAIL(("Failed to create Qnn graph: " + std::string{name} + ". " +
-                           utils::FormatQnnError(qnn_interface, status))
+                           utils::FormatQnnError(qnn_interface_, status))
                               .c_str());
     }
   }
@@ -43,11 +42,10 @@ Ort::Status QnnGraphEmitter::RetrieveGraph(Qnn_ContextHandle_t context, const st
   RETURN_IF(name.empty(), "Empty QNN graph name.");
 
   Qnn_GraphHandle_t graph = nullptr;
-  const auto& qnn_interface = manager_.GetQnnInterface();
-  const auto status = RetrieveGraphHandle(qnn_interface, context, name.c_str(), &graph);
+  const auto status = RetrieveGraphHandle(qnn_interface_, context, name.c_str(), &graph);
   RETURN_IF(status != QNN_GRAPH_NO_ERROR || graph == nullptr,
             ("Failed to retrieve QNN graph: " + name + ". " +
-             utils::FormatQnnError(qnn_interface, status))
+             utils::FormatQnnError(qnn_interface_, status))
                 .c_str());
 
   context_ = context;
@@ -59,10 +57,9 @@ Ort::Status QnnGraphEmitter::RetrieveGraph(Qnn_ContextHandle_t context, const st
 
 Ort::Status QnnGraphEmitter::Finalize(Qnn_ProfileHandle_t profile) {
   RETURN_IF(graph_ == nullptr, "QNN graph is not initialized.");
-  const auto& qnn_interface = manager_.GetQnnInterface();
-  const auto status = qnn_interface.graphFinalize(graph_, profile, nullptr);
+  const auto status = qnn_interface_.graphFinalize(graph_, profile, nullptr);
   RETURN_IF(status != QNN_GRAPH_NO_ERROR,
-            ("Failed to finalize QNN graph. " + utils::FormatQnnError(qnn_interface, status)).c_str());
+            ("Failed to finalize QNN graph. " + utils::FormatQnnError(qnn_interface_, status)).c_str());
   return Ort::Status();
 }
 
@@ -72,18 +69,17 @@ Qnn_ErrorHandle_t QnnGraphEmitter::Execute(Qnn_Tensor_t* inputs, uint32_t num_in
   if (graph_ == nullptr) {
     return QNN_COMMON_ERROR_INVALID_ARGUMENT;
   }
-  return manager_.GetQnnInterface().graphExecute(graph_, inputs, num_inputs, outputs, num_outputs, profile, signal);
+  return qnn_interface_.graphExecute(graph_, inputs, num_inputs, outputs, num_outputs, profile, signal);
 }
 
 Ort::Status QnnGraphEmitter::SetConfig(const QnnGraph_Config_t** graph_configs) {
   RETURN_IF(graph_ == nullptr, "QNN graph is not initialized.");
-  const auto& qnn_interface = manager_.GetQnnInterface();
-  RETURN_IF(qnn_interface.graphSetConfig == nullptr,
+  RETURN_IF(qnn_interface_.graphSetConfig == nullptr,
             "Invalid function pointer for graphSetConfig; cannot apply runtime graph configs.");
-  const auto status = qnn_interface.graphSetConfig(graph_, graph_configs);
+  const auto status = qnn_interface_.graphSetConfig(graph_, graph_configs);
   RETURN_IF(status != QNN_SUCCESS,
             ("Failed to apply runtime graph configs for graph: " + name_ + ". " +
-             utils::FormatQnnError(qnn_interface, status))
+             utils::FormatQnnError(qnn_interface_, status))
                 .c_str());
   return Ort::Status();
 }

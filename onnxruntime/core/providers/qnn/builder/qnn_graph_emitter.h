@@ -1,4 +1,4 @@
-// Copyright (c) Qualcomm Innovation Center, Inc. All rights reserved.
+// Copyright (c) Qualcomm Technologies, Inc. and/or its subsidiaries.
 // SPDX-License-Identifier: MIT
 
 #pragma once
@@ -11,14 +11,12 @@
 
 namespace onnxruntime::qnn {
 
-class QnnBackendManager;
-
 // Owns the QNN graph handle and confines QNN graph API dispatch to one class.
 // Backend, context, profiling, and memory lifecycles remain owned by
 // QnnBackendManager and QnnModel.
 class QnnGraphEmitter final {
  public:
-  explicit QnnGraphEmitter(const QnnBackendManager& manager);
+  explicit QnnGraphEmitter(const QNN_INTERFACE_VER_TYPE& qnn_interface);
 
   void SetCreateInfo(Qnn_ContextHandle_t context,
                      const QnnGraph_Config_t** graph_configs);
@@ -47,7 +45,7 @@ class QnnGraphEmitter final {
   Qnn_ContextHandle_t Context() const { return context_; }
 
  private:
-  const QnnBackendManager& manager_;
+  const QNN_INTERFACE_VER_TYPE& qnn_interface_;
   Qnn_ContextHandle_t context_ = nullptr;
   const QnnGraph_Config_t** graph_configs_ = nullptr;
   Qnn_GraphHandle_t graph_ = nullptr;

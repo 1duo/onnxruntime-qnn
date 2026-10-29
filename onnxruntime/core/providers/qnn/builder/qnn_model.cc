@@ -301,8 +301,7 @@ Ort::Status QnnModel::ComposeGraph(const QnnModelContext& context) {
                                                       *context.model_settings,
                                                       context.tensor_name_overrides,
                                                       trace_collector.get(),
-                                                      /*is_post_layout_transform=*/true,
-                                                      qnn_graph_emitter_.get());
+                                                      /*is_post_layout_transform=*/true);
 
   qnn::profile::ProfilingInfo profiling_info;
   QnnProfilingScope profiling_scope;
@@ -313,7 +312,8 @@ Ort::Status QnnModel::ComposeGraph(const QnnModelContext& context) {
       ProfilingMethodType::COMPOSE_GRAPHS,
       profiling_scope));
 
-  bool rt = qnn_model_wrapper.CreateQnnGraph(qnn_backend_manager_->GetQnnContext(), graph_name, context.graph_configs);
+  bool rt = qnn_model_wrapper.CreateQnnGraph(*qnn_graph_emitter_, qnn_backend_manager_->GetQnnContext(),
+                                             graph_name, context.graph_configs);
 
   RETURN_IF_NOT(rt, "Failed to initialize qnn_model_wrapper.");
 

@@ -52,7 +52,7 @@ class QnnModel {
   QnnModel(QnnBackendManager* qnn_backend_manager,
            const ApiPtrs& api_ptrs)
       : qnn_backend_manager_(qnn_backend_manager),
-        qnn_graph_emitter_(std::make_unique<QnnGraphEmitter>(*qnn_backend_manager)),
+        qnn_graph_emitter_(std::make_unique<QnnGraphEmitter>(qnn_backend_manager->GetQnnInterface())),
         api_ptrs_(api_ptrs) {
     qnn_backend_type_ = qnn_backend_manager_->GetQnnBackendType();
   }

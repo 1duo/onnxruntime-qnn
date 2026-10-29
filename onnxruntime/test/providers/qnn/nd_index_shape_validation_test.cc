@@ -62,12 +62,46 @@ TEST_F(QnnHTPBackendTests, GatherNDRejectsNegativeBatchDims) {
   });
 }
 
-TEST_F(QnnHTPBackendTests, GatherNDRejectsBatchDimsPlusIndexDepthPastDataRank) {
+TEST_F(QnnHTPBackendTests, GatherNDRejectsBatchDimsAtIndicesRank) {
   VerifyMalformedNdIndexShapeIsRejected([](ModelTestBuilder& builder) {
-    builder.MakeInput<float>("data", {2, 2}, {1.0f, 2.0f, 3.0f, 4.0f});
-    builder.MakeInitializer<int64_t>("indices", {1, 1, 1}, {0});
+    builder.MakeInput<float>("data", {2, 2, 2},
+                             {1.0f, 2.0f, 3.0f, 4.0f, 5.0f, 6.0f, 7.0f, 8.0f});
+    builder.MakeInitializer<int64_t>("indices", {1, 1}, {0});
     builder.AddNode("gathernd", "GatherND", {"data", "indices"}, {"Y"}, kOnnxDomain,
                     {test::MakeAttribute("batch_dims", static_cast<int64_t>(2))});
+    builder.MakeOutput("Y");
+  });
+}
+
+// HTP supports dynamic INT64 GatherND indices. Keep this input dynamic so the
+// rejection also covers the non-initializer path through ProcessGatherNDIndices.
+TEST_F(QnnHTPBackendTests, GatherNDRejectsDynamicIndicesWithBatchDimsAtIndicesRank) {
+  VerifyMalformedNdIndexShapeIsRejected([](ModelTestBuilder& builder) {
+    builder.MakeInput<float>("data", {2, 2, 2},
+                             {1.0f, 2.0f, 3.0f, 4.0f, 5.0f, 6.0f, 7.0f, 8.0f});
+    builder.MakeInput<int64_t>("indices", {1, 1}, {0});
+    builder.AddNode("gathernd", "GatherND", {"data", "indices"}, {"Y"}, kOnnxDomain,
+                    {test::MakeAttribute("batch_dims", static_cast<int64_t>(2))});
+    builder.MakeOutput("Y");
+  });
+}
+
+TEST_F(QnnHTPBackendTests, ScatterNDRejectsRankZeroIndices) {
+  VerifyMalformedNdIndexShapeIsRejected([](ModelTestBuilder& builder) {
+    builder.MakeInput<float>("data", {2}, {1.0f, 2.0f});
+    builder.MakeInitializer<int64_t>("indices", {}, {0});
+    builder.MakeInitializer<float>("updates", {2}, {3.0f, 4.0f});
+    builder.AddNode("scatternd", "ScatterND", {"data", "indices", "updates"}, {"Y"}, kOnnxDomain);
+    builder.MakeOutput("Y");
+  });
+}
+
+TEST_F(QnnHTPBackendTests, ScatterNDRejectsZeroIndexDepth) {
+  VerifyMalformedNdIndexShapeIsRejected([](ModelTestBuilder& builder) {
+    builder.MakeInput<float>("data", {2}, {1.0f, 2.0f});
+    builder.MakeInitializer<int64_t>("indices", {1, 0}, {});
+    builder.MakeInitializer<float>("updates", {1, 2}, {3.0f, 4.0f});
+    builder.AddNode("scatternd", "ScatterND", {"data", "indices", "updates"}, {"Y"}, kOnnxDomain);
     builder.MakeOutput("Y");
   });
 }

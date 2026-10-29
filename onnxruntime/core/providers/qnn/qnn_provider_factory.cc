@@ -35,6 +35,7 @@
 #include "core/providers/qnn/qnn_external_resource_importer.h"
 #endif
 
+#if defined(QNN_HTP_CROSS_DEVICE_PREPARE_AVAILABLE)
 namespace {
 
 // Chromium transports the DXCore device ID as an unprefixed hexadecimal uint32.
@@ -48,6 +49,7 @@ bool ParseHardwareDeviceId(std::string_view text, uint32_t& device_id) {
 }
 
 }  // namespace
+#endif  // QNN_HTP_CROSS_DEVICE_PREPARE_AVAILABLE
 
 // We allow `backend_type` (e.g., `htp`) or `backend_path` in relative path (e.g., `QnnHtp.dll`) for configurations,
 // and QnnBackendManager will later find the appropriate library and load it relative to the OnnxRuntime library.

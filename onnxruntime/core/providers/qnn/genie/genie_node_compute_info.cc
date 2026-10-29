@@ -68,8 +68,14 @@ OrtStatus* GenieNodeComputeInfo::CreateStateImpl(OrtNodeComputeInfo* this_ptr,
           if (filename.rfind("tmp", 0) == 0 &&
               filename.size() >= 5 &&
               filename.compare(filename.size() - 5, 5, ".json") == 0) {
-            extension_path = entry.path().string();
-            break;
+            if (extension_path.empty()) {
+              extension_path = entry.path().string();
+            } else {
+              ORT_CXX_LOG(ep.logger_, ORT_LOGGING_LEVEL_WARNING,
+                          ("Multiple HTP backend extension files found; using '" + extension_path +
+                           "'. Ignoring '" + entry.path().string() + "'.")
+                              .c_str());
+            }
           }
         }
       }
@@ -120,6 +126,10 @@ OrtStatus* GenieNodeComputeInfo::CreateStateImpl(OrtNodeComputeInfo* this_ptr,
   Genie_Status_t create_status = st->api->NodeConfig_createFromDlc(genie_dlc_handle, kUseCaseLmExecutor, config_str, &cfg);
   if (create_status == GENIE_STATUS_ERROR_INVALID_ARGUMENT) {
     use_case = kUseCaseDefault;
+    ORT_CXX_LOG(ep.logger_, ORT_LOGGING_LEVEL_INFO,
+                ("Genie 'lm-executor' use case invalid inside DLC (status: " +
+                 std::to_string(create_status) + "); falling back to 'default'.")
+                    .c_str());
     create_status = st->api->NodeConfig_createFromDlc(genie_dlc_handle, kUseCaseDefault, config_str, &cfg);
   }
   if (create_status != GENIE_STATUS_SUCCESS) {
@@ -129,7 +139,7 @@ OrtStatus* GenieNodeComputeInfo::CreateStateImpl(OrtNodeComputeInfo* this_ptr,
                                        .c_str());
   }
   ORT_CXX_LOG(ep.logger_, ORT_LOGGING_LEVEL_VERBOSE,
-              (std::string("Genie: selected use case '") + use_case + "'").c_str());
+              (std::string("Genie selected use case '") + use_case + "'").c_str());
   st->config = cfg;
 #endif  // GENIE_API_VERSION_MAJOR > 1 || GENIE_API_VERSION_MINOR >= 17
 

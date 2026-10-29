@@ -360,13 +360,13 @@ Ort::Status BaseOpBuilder::ProcessOutputs(QnnModelWrapper& qnn_model_wrapper,
 }
 
 Ort::Status BaseOpBuilder::ProcessOutputsAcrossPrecision(QnnModelWrapper& qnn_model_wrapper,
-                                                        const OrtNodeUnit& node_unit,
-                                                        std::vector<std::string>&& input_names,
-                                                        std::vector<std::string>&& param_tensor_names,
-                                                        const Ort::Logger& logger,
-                                                        bool do_op_validation,
-                                                        const std::string& qnn_op_type,
-                                                        Qnn_DataType_t activation_qnn_data_type) const {
+                                                         const OrtNodeUnit& node_unit,
+                                                         std::vector<std::string>&& input_names,
+                                                         std::vector<std::string>&& param_tensor_names,
+                                                         const Ort::Logger& logger,
+                                                         bool do_op_validation,
+                                                         const std::string& qnn_op_type,
+                                                         Qnn_DataType_t activation_qnn_data_type) const {
   const auto& outputs = node_unit.Outputs();
 
   // Only a single-output node can be bridged: the Convert would otherwise have to be replicated per

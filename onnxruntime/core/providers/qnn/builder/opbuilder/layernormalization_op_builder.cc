@@ -65,7 +65,9 @@ class LayerNormalizationOpBuilder : public BaseOpBuilder {
   // Which lowering this node takes. Single is one QNN LayerNorm; Flattened is Reshape -> LayerNorm
   // (last axis) -> Reshape for a multi-axis node on HTP; Decomposed externalizes a misaligned scale
   // and/or bias as a following Mul/Add. Single and Flattened consume the node's scale/bias as-is.
-  enum class Lowering { kSingle, kFlattened, kDecomposed };
+  enum class Lowering { kSingle,
+                        kFlattened,
+                        kDecomposed };
 
   // The single source of truth for the lowering decision and for the axis/shape facts it depends
   // on, so IsOpSupported and ProcessAttributesAndOutputs cannot disagree about which path a node

@@ -370,7 +370,7 @@ static GetTestQDQModelFn<OutputQType> BuildQDQGemmPerChannelTestCase(
                                        weight_scales, weight_zero_points, /*axis=*/1);
     builder.MakeInitializer<WeightQType>("B_q", weight_shape, quantized_weights);
     builder.AddDequantizeLinearNode<WeightQType>("B_dq", "B_q", weight_scales, weight_zero_points, "B",
-                                                {test::MakeAttribute("axis", static_cast<int64_t>(1))});
+                                                 {test::MakeAttribute("axis", static_cast<int64_t>(1))});
 
     std::vector<std::string> gemm_inputs{a_qdq, "B"};
 

@@ -300,7 +300,7 @@ Ort::Status GemmOpBuilder::ProcessInputs(QnnModelWrapper& qnn_model_wrapper,
                          !utils::IsNarrowingQuantOutput(act_qnn_data_type, output_qnn_data_type);
     if (activation_widened) {
       RETURN_IF_ERROR(utils::ConvertActivationToOutputPrecision(qnn_model_wrapper, input_names,
-                                                               output_qnn_data_type, do_op_validation));
+                                                                output_qnn_data_type, do_op_validation));
     }
   }
 

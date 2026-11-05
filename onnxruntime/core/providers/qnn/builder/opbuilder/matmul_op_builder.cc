@@ -323,6 +323,19 @@ Ort::Status MatMulOpBuilder::ProcessInputsForQnnMatMul(QnnModelWrapper& qnn_mode
   RETURN_IF_ERROR(ProcessInput0(qnn_model_wrapper, input_info_0, org_input_0_name, input_names,
                                 logger, do_op_validation, /*use_fully_connected=*/false));
 
+  // HTP's MatMul requires input[0] (activation) to be at least as wide as input[1]: a narrower
+  // input[0] paired with a wider input[1] (e.g. u8 activation, u16 input[1]) is not a supported
+  // combination. Reuse the same activation-widening Convert that Conv/Gemm insert ahead of the op
+  // when their activation is narrower than their declared output; here the target is input[1]'s
+  // precision instead, since that's the width MatMul's inputs must agree on. No-op if input[0] is
+  // already as wide as input[1].
+  Qnn_DataType_t activation_qnn_data_type = input_info_0.qnn_data_type;
+  if (IsNpuBackend(qnn_model_wrapper.GetQnnBackendType())) {
+    RETURN_IF_ERROR(utils::ConvertActivationToOutputPrecision(qnn_model_wrapper, input_names,
+                                                              input_info_1.qnn_data_type, do_op_validation));
+    activation_qnn_data_type = qnn_model_wrapper.GetQnnTensorWrapper(input_names[0]).GetTensorDataType();
+  }
+
   // Process input 1.
   const std::string& org_input_1_name = inputs[1].name;
   std::string input_1_name = org_input_1_name;
@@ -389,8 +402,8 @@ Ort::Status MatMulOpBuilder::ProcessInputsForQnnMatMul(QnnModelWrapper& qnn_mode
   //     input_1_uint16 --> Convert(int16_sym) --+
   if (IsNpuBackend(qnn_model_wrapper.GetQnnBackendType()) &&
       !input_info_0.is_initializer &&
-      input_info_0.qnn_data_type == input_info_1.qnn_data_type &&
-      input_info_0.qnn_data_type == QNN_DATATYPE_UFIXED_POINT_16) {
+      activation_qnn_data_type == input_info_1.qnn_data_type &&
+      activation_qnn_data_type == QNN_DATATYPE_UFIXED_POINT_16) {
     RETURN_IF_NOT(input_info_1.quant_param.IsPerTensor(),
                   "MatMul's activation inputs only support per-tensor quantization");
     const Qnn_QuantizeParams_t& quant_param = input_info_1.quant_param.Get();

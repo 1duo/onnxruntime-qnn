@@ -886,7 +886,8 @@ static void RunDynamicInput1QuantErrorTest(const char* test_name,
 // A mismatched activation/output precision stays in one node unit via a Convert.
 template <typename ActivationQType, typename WeightQType, typename OutputQType>
 static void RunMixedPrecisionOutputTest(const char* test_name, bool weight_is_initializer,
-                                        Qnn_DataType_t expected_convert_type) {
+                                        Qnn_DataType_t expected_convert_type,
+                                        size_t expected_convert_count = 1) {
   namespace fs = std::filesystem;
   const fs::path graph_dir = fs::temp_directory_path() / (std::string("MatMulOp_QDQ_MixedPrecisionOutput_") + test_name);
   fs::remove_all(graph_dir);
@@ -906,8 +907,11 @@ static void RunMixedPrecisionOutputTest(const char* test_name, bool weight_is_in
   if (::testing::Test::IsSkipped()) {
     return;
   }
-  AssertOpInQnnGraph(graph_dir, "Convert", 1);
-  AssertConvertOutputDataType(graph_dir, expected_convert_type);
+  AssertOpInQnnGraph(graph_dir, "Convert", expected_convert_count);
+  // AssertConvertOutputDataType only supports a single Convert node in the graph.
+  if (expected_convert_count == 1) {
+    AssertConvertOutputDataType(graph_dir, expected_convert_type);
+  }
 }
 
 TEST_F(QnnHTPBackendTests, MatMulOp_QDQ_U16ActivationU8Output_StaticWeight) {
@@ -948,6 +952,17 @@ TEST_F(QnnHTPBackendTests, MatMulOp_QDQ_S8ActivationS16Output_StaticWeight) {
 TEST_F(QnnHTPBackendTests, MatMulOp_QDQ_U8ActivationU16Output_U16Weight_DynamicInput1) {
   RunMixedPrecisionOutputTest<uint8_t, uint16_t, uint16_t>("u8_u16w_u16_dynamic", /*weight_is_initializer=*/false,
                                                            QNN_DATATYPE_UFIXED_POINT_16);
+}
+
+// Regression test for a u8 activation paired with a wider dynamic u16 input[1]: HTP's MatMul requires
+// input[0] to be at least as wide as input[1], so input[0] must be Converted up to u16 before the op
+// (in addition to the usual Converted-down-to-u8 after, since the declared output is narrower than
+// input[1]). Without this Convert, QNN's context-binary-generator rejects the graph with "Unsupported
+// input/output datatypes requested for the HTP Op 'MatMul'".
+TEST_F(QnnHTPBackendTests, MatMulOp_QDQ_U8ActivationU8Output_U16Weight_DynamicInput1) {
+  RunMixedPrecisionOutputTest<uint8_t, uint16_t, uint8_t>("u8_u16w_u8_dynamic", /*weight_is_initializer=*/false,
+                                                          QNN_DATATYPE_UFIXED_POINT_8,
+                                                          /*expected_convert_count=*/2);
 }
 
 TEST_F(QnnHTPBackendTests, MatMulOp_QDQ_U8ActivationS8Output_StaticWeight) {

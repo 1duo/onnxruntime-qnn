@@ -8,6 +8,7 @@
 #   - Any gtest assertion failure ([  FAILED  ])                → exit 1
 #   - Any Direct leak (post-suppression)                        → exit 1
 #   - Only Indirect leaks remain (any source)                   → exit 0
+#   - LSan tracer crash during the post-test scan, all tests OK → exit 0
 #   - Anything else (segfault before gtest XML, ...)            → exit 1
 #
 # Rationale: Indirect leaks frequently have <unknown module> stacks because
@@ -16,6 +17,14 @@
 # patterns. Rather than chase that, we trust the Direct-leak signal and
 # the suppression list in tools/ci_build/lsan_suppressions.txt to cover
 # known stripped backend libs. ORT-side leaks would show as Direct.
+#
+# LSan tracer crash: QAIRT backend libraries use guard pages (mprotect
+# PROT_NONE) for device memory. If a reachable chunk holds a pointer into a
+# guard page, LSan's tracer takes SIGSEGV while scanning that chunk and exits
+# with a fatal error before it can report anything (google/sanitizers#723).
+# That interaction is out of our control and is not an ORT defect, so accept
+# it only after gtest completed with every test passing. Real ASan errors,
+# gtest failures, and Direct leaks still fail above.
 #
 # Usage:
 #   asan_filter_leaks.sh <test_binary> [args...]
@@ -77,7 +86,21 @@ if grep -q "^Indirect leak" "$log_file"; then
     exit 0
 fi
 
-# 5. Anything else (segfault, etc.) - fail
+# 5. LSan died during the post-test scan before it could report a leak.
+#    See the header comment: this is a known guard-page interaction in the
+#    QAIRT backend libraries, not an ORT/test defect. Only accept it when the
+#    gtest run completed with all tests passing; otherwise fall through and
+#    fail as an unrecognized mode.
+if grep -q "LeakSanitizer has encountered a fatal error" "$log_file"; then
+    if grep -q "^\[  PASSED  \]" "$log_file" &&
+        ! grep -q "^\[  FAILED  \]" "$log_file"; then
+        echo "[asan-filter] WARNING: LSan tracer crashed during the post-test scan" >&2
+        echo "[asan-filter] (known QAIRT guard-page interaction); no ASan error or Direct leak -> PASS" >&2
+        exit 0
+    fi
+fi
+
+# 6. Anything else (segfault, etc.) - fail
 echo "[asan-filter] Unrecognized failure mode (binary exit=${binary_rc}) -> FAIL" >&2
 echo "[asan-filter] Last 30 lines of binary output:" >&2
 tail -n 30 "$log_file" >&2
